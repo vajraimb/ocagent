@@ -1,0 +1,22 @@
+opam-version: "2.0"
+synopsis: "Effect harness for one agent, three profiles, and journal replay"
+description: """
+ocagent-harness v0.1. Agent code only performs effects. Dev, Eval and Prod
+are handler stacks. A crash is recovered by replaying the journal, not by
+restoring a continuation.
+"""
+maintainer: "vajraimb"
+authors: "vajraimb"
+license: "MIT"
+homepage: "https://github.com/vajraimb/ocagent"
+bug-reports: "https://github.com/vajraimb/ocagent/issues"
+depends: [
+  "ocaml" {>= "5.3.0"}
+  "dune" {>= "3.7"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
+run-test: [
+  ["dune" "runtest" "-p" name "-j" jobs]
+]

@@ -1,0 +1,10 @@
+(lang dune 3.7)
+
+(name ocagent-harness)
+
+(package
+ (name ocagent-harness)
+ (synopsis "Effect harness for one agent, three profiles, and journal replay")
+ (depends
+  (ocaml
+   (>= 5.3))))

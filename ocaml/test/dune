@@ -1,0 +1,5 @@
+(test
+ (name test_harness)
+ (libraries ocagent-harness)
+ (deps
+  (file %{project_root}/lib/agent.ml)))

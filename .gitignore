@@ -8,3 +8,4 @@ dist/
 .env
 .env.*
 .node_modules.lock
+_build/
