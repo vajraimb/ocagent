@@ -6,3 +6,9 @@ type _ Effect.t +=
   | SandboxExec : { cmd : string; timeout_sec : float } -> (string, string) result Effect.t
   | EmitTrajectory : trajectory_event -> unit Effect.t
   | AskApproval : { action : string; risk_level : string } -> bool Effect.t
+  | Self : actor_id Effect.t
+  | Send : { to_ : actor_id; body : string } -> unit Effect.t
+  | Receive : actor_msg Effect.t
+  | Spawn : { name : string; max_restarts : int; body : unit -> unit } -> actor_id Effect.t
+  | Supervise :
+      { strategy : restart_strategy; max_restarts : int; children : child_spec list } -> unit Effect.t

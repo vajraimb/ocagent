@@ -15,7 +15,7 @@ let react ~model ~messages () =
     | ToolCallResponse calls ->
         let messages = ref (messages @ [ { role = Assistant; content = "调用工具" } ]) in
         List.iter
-          (fun call ->
+          (fun (call : tool_call) ->
             perform (EmitTrajectory (ToolStart (call.name, call.args_json)));
             let result = perform (CallTool { name = call.name; args_json = call.args_json }) in
             perform (EmitTrajectory (ToolEnd (call.name, result)));

@@ -2,4 +2,4 @@
  (name harness)
  (public_name dsh-ocaml.harness)
  (libraries core eio)
- (modules trajectory approval budget sandbox llm_provider))
+ (modules trajectory approval budget sandbox llm_provider actor))

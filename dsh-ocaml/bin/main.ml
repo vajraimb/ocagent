@@ -43,6 +43,35 @@ let () =
             (match ran with Ok text -> String.trim text | Error text -> "error: " ^ text);
           Printf.printf "escape -> %s\n"
             (match escaped with Ok text -> "UNEXPECTED " ^ text | Error text -> text))
+  | "actors" ->
+      let report, mock =
+        Dsh_ocaml.Runtime.run_actors ~env
+          ~responses:
+            [
+              ToolCallResponse [ { id = "1"; name = "shell"; args_json = "echo from-worker" } ];
+              TextResponse "worker ok";
+            ]
+          ~agent_entry:(fun () ->
+            ignore
+              (Effect.perform
+                 (Core.Effects.Spawn
+                    {
+                      name = "worker";
+                      max_restarts = 1;
+                      body =
+                        (fun () ->
+                          let text =
+                            Core.Agent.react ~model:"deepseek-v4"
+                              ~messages:[ { role = User; content = "work" } ]
+                              ()
+                          in
+                          Effect.perform (Core.Effects.Send { to_ = "root"; body = text }));
+                    }));
+            (Effect.perform Core.Effects.Receive).body)
+          ()
+      in
+      Printf.printf "%s\ncommands: %s\n" report.value (String.concat " | " (List.rev mock.commands));
+      print_events report.events
   | "eval" | _ ->
       let responses =
         [

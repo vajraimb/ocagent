@@ -5,3 +5,7 @@
 (test
  (name test_sandbox)
  (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))
+
+(test
+ (name test_actor)
+ (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))

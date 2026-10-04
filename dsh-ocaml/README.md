@@ -25,6 +25,9 @@ dune runtest
 dune exec ./bin/main.exe eval
 dune exec ./bin/main.exe dry-run
 dune exec ./bin/main.exe sandbox
+dune exec ./bin/main.exe actors
 ```
 
-M1–M3 are in this tree. M4 (fiber actors, supervisor) is not.
+M1–M3 are the single-fiber handler stack. M4 adds actors.
+
+A new `Eio.Fiber` does not inherit effect handlers. `Spawn` and `Supervise` install the same stack again inside the child, then the child blocks on an `Eio.Stream` mailbox (`Send` / `Receive` / `Self`). Restart policy is on the supervisor, not the clock: `One_for_one`, `One_for_all`, `Rest_for_one`, and `max_restarts`. Past the budget the child raises `Restart_limit` and the parent supervisor sees a normal crash. Mailboxes survive a restart, so a message sent before the next `Receive` is kept. Evaluation still gives every attempt its own copy of the scripted model responses, and the trajectory has no timestamps.

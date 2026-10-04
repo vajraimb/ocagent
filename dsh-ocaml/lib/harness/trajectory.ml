@@ -70,6 +70,10 @@ let event_json = function
       Printf.sprintf {|{"event":"tool_end","name":%s,"result":%s}|} (json_string name) (result_json result)
   | ApprovalRequested action ->
       Printf.sprintf {|{"event":"approval","action":%s}|} (json_string action)
+  | ActorSpawn name -> Printf.sprintf {|{"event":"actor_spawn","name":%s}|} (json_string name)
+  | ActorCrash (name, error) ->
+      Printf.sprintf {|{"event":"actor_crash","name":%s,"error":%s}|} (json_string name) (json_string error)
+  | ActorRestart name -> Printf.sprintf {|{"event":"actor_restart","name":%s}|} (json_string name)
 
 let events_json events = String.concat "\n" (List.map event_json events) ^ "\n"
 
@@ -80,3 +84,6 @@ let describe = function
   | ToolEnd (name, Ok _) -> "tool_end " ^ name ^ " ok"
   | ToolEnd (name, Error _) -> "tool_end " ^ name ^ " error"
   | ApprovalRequested _ -> "approval"
+  | ActorSpawn name -> "actor_spawn " ^ name
+  | ActorCrash (name, _) -> "actor_crash " ^ name
+  | ActorRestart name -> "actor_restart " ^ name

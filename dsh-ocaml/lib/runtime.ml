@@ -97,3 +97,35 @@ let run_harness ~env ?(responses = []) ?(approvals = []) ?(max_steps = 16) ?(max
               ~fs:(Harness.Sandbox.eio_fs root) ~on_event ~max_steps ~max_tokens agent_entry)
   in
   (outcome, mock)
+
+type actor_outcome = {
+  value : string;
+  events : trajectory_event list;
+  crashes : (string * string) list;
+}
+
+let run_actors ~env ?(responses = []) ?(approvals = []) ?(max_steps = 16) ?(max_tokens = 8000) ~agent_entry
+    () =
+  ignore env;
+  Eio.Switch.run @@ fun sw ->
+  let events = ref [] in
+  let mock = Harness.Sandbox.empty_mock () in
+  let record ev = events := ev :: !events in
+  let world = Harness.Actor.create ~on_event:record () in
+  let fs = Harness.Sandbox.mock_fs mock in
+  let rec stack : 'a. sw:Eio.Switch.t -> self_id:string -> (unit -> 'a) -> 'a =
+   fun ~sw ~self_id f ->
+    Harness.Approval.with_scripted approvals (fun () ->
+        Harness.Llm_provider.with_mock_llm responses (fun () ->
+            Harness.Trajectory.with_trajectory ~on_event:record (fun () ->
+                Harness.Sandbox.with_mock_sandbox mock (fun () ->
+                    Harness.Sandbox.with_tools ~fs (fun () ->
+                        Harness.Approval.with_risk_approval (fun () ->
+                            Harness.Budget.with_budget ~max_steps ~max_tokens (fun () ->
+                                Harness.Actor.with_actor ~world ~sw ~self_id
+                                  ~rerun:(fun ~sw ~self_id body -> stack ~sw ~self_id body)
+                                  f)))))))
+  in
+  let value = stack ~sw ~self_id:"root" agent_entry in
+  ( { value; events = List.rev !events; crashes = List.rev !(world.crashes) }, mock )
+

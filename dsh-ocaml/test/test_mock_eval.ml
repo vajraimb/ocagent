@@ -24,6 +24,9 @@ let event_name = function
   | ToolEnd (name, Ok _) -> "tool_end:" ^ name ^ ":ok"
   | ToolEnd (name, Error _) -> "tool_end:" ^ name ^ ":err"
   | ApprovalRequested _ -> "approval"
+  | ActorSpawn name -> "actor_spawn:" ^ name
+  | ActorCrash (name, _) -> "actor_crash:" ^ name
+  | ActorRestart name -> "actor_restart:" ^ name
 
 let names events = List.map event_name events
 
