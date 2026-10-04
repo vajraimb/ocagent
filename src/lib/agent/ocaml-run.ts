@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prelude, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
+import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
 import { safePath, type DeskFile } from "./workspace.ts";
 
@@ -48,11 +49,42 @@ async function fileAt(name: string): Promise<string | null> {
   return null;
 }
 
-async function ocamlCommand(): Promise<{ bin: string; prefix: string[] } | null> {
+async function ensureLib(): Promise<string | null> {
+  const bundled = [
+    fileURLToPath(new URL("../../../assets/ocaml/lib", import.meta.url)),
+    path.join(process.cwd(), "assets/ocaml/lib"),
+  ];
+  for (const dir of bundled) {
+    if (await exists(path.join(dir, "stdlib.cmi"))) return dir;
+  }
+  const dest = path.join(tmpdir(), "ocagent-ocaml", "lib");
+  if (await exists(path.join(dest, "stdlib.cmi"))) return dest;
+  try {
+    const { useStorage } = await import("nitro/storage");
+    await mkdir(dest, { recursive: true });
+    for (const base of ["assets/ocaml", "assets/server"] as const) {
+      let found = false;
+      for (const name of STDLIB_FILES) {
+        const key = base === "assets/server" ? `ocaml/lib/${name}` : `lib/${name}`;
+        const raw = await useStorage(base).getItem(key);
+        const bytes = raw instanceof Uint8Array ? raw : Buffer.isBuffer(raw) ? raw : null;
+        if (!bytes) continue;
+        await writeFile(path.join(dest, name), bytes);
+        if (name === "stdlib.cmi") found = true;
+      }
+      if (found) return dest;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function ocamlCommand(): Promise<{ bin: string; prefix: string[]; lib: string | null } | null> {
   const run = await fileAt("ocamlrun");
   const image = await fileAt("ocaml");
-  if (run && image) return { bin: run, prefix: [image] };
-  if (await exists(SYSTEM_OCAML)) return { bin: SYSTEM_OCAML, prefix: [] };
+  if (run && image) return { bin: run, prefix: [image], lib: await ensureLib() };
+  if (await exists(SYSTEM_OCAML)) return { bin: SYSTEM_OCAML, prefix: [], lib: null };
   return null;
 }
 
@@ -80,6 +112,7 @@ export async function runOcaml(
   if (!source) return `没有 ${entry}`;
   const command = await ocamlCommand();
   if (!command) return "这台服务器没有 OCaml 运行器。";
+  if (command.prefix.length > 0 && !command.lib) return "标准库没有装上。";
   const harnesses = opts?.harnesses ?? [];
   const bridge = harnesses.some((id) => id === "net" || id === "search")
     ? await startBridge(opts?.apiKey, harnesses)
@@ -102,6 +135,10 @@ export async function runOcaml(
       OCAGENT_NODE: process.execPath,
       OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
     };
+    if (command.lib) {
+      extra.OCAMLLIB = command.lib;
+      extra.CAMLLIB = command.lib;
+    }
     if (bridge) {
       extra.OCAGENT_PORT = String(bridge.port);
       extra.OCAGENT_TOKEN = bridge.token;
