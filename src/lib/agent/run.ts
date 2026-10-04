@@ -124,7 +124,7 @@ function instructionsFor(harnesses: HarnessId[]): string {
   else lines.push("搜索 harness 没开，不要声称查过网页。");
   if (harnesses.includes("net")) lines.push("要看某个具体网址，用 http_get。");
   if (harnesses.includes("ocaml")) {
-    lines.push("写完 .ml 用 ocaml_run 跑。报错就改文件再跑。");
+    lines.push("写完 .ml 用 ocaml_run 跑。报错就改文件再跑。把 ocaml_run 的输出作为结果，不要改成手工验算，也不要说运行器对不上系统库。");
     const mods = [
       harnesses.includes("net") ? "Net.get" : "",
       harnesses.includes("search") ? "Search.query" : "",
