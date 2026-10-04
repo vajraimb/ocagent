@@ -171,3 +171,33 @@ let with_deepseek_http ~net ~model ~host ~port ~path ~api_key f =
                   continue k (parse_body (split_http raw)))
           | _ -> None);
     }
+
+let with_https_chat ~mgr ~endpoint ~model ~api_key f =
+  match_with f ()
+    {
+      retc = (fun x -> x);
+      exnc = raise;
+      effc =
+        (fun (type b) (eff : b Effect.t) ->
+          match eff with
+          | AskLLM { messages; model = requested } ->
+              Some
+                (fun (k : (b, _) continuation) ->
+                  let used = if requested = "" then model else requested in
+                  let body = request_body ~model:used messages in
+                  let reply =
+                    Net.request ~mgr ~timeout:60. ~meth:POST ~url:endpoint
+                      ~headers:
+                        [ ("Authorization", "Bearer " ^ api_key); ("Content-Type", "application/json") ]
+                      ~body ()
+                  in
+                  let response =
+                    match reply with
+                    | Error text -> TextResponse ("网络错误：" ^ text)
+                    | Ok { status; _ } when status < 200 || status >= 300 ->
+                        TextResponse (Printf.sprintf "HTTP %d" status)
+                    | Ok { body = raw; _ } -> parse_body raw
+                  in
+                  continue k response)
+          | _ -> None);
+    }

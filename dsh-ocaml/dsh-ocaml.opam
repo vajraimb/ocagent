@@ -2,8 +2,8 @@ opam-version: "2.0"
 synopsis: "Effect and Eio harness for an AI agent"
 description: """
 dsh-ocaml. The agent only performs effects. Approval, budget, trajectory,
-sandbox and the model client are handlers. Evaluation replays scripted
-answers and does not touch the network.
+sandbox and the model client are handlers. Fetch and web search are effects
+too. Evaluation replays scripted answers and does not touch the network.
 """
 maintainer: "vajraimb"
 authors: "vajraimb"

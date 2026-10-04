@@ -46,3 +46,23 @@ type trajectory_event =
   | ActorCrash of actor_id * string
   | ActorRestart of actor_id
 
+type http_method =
+  | GET
+  | POST
+
+type http_reply = {
+  status : int;
+  body : string;
+}
+
+type search_hit = {
+  title : string;
+  url : string;
+  snippet : string;
+}
+
+type search_answer = {
+  text : string;
+  hits : search_hit list;
+}
+

@@ -1,300 +1,204 @@
-# 用 OCaml Effect 构建 Agent 及其 Harness：讨论与实施 Spec v0.1
+OCaml 5 + Eio AI Agent Harness (dsh-ocaml) 实施规范
+本规范旨在基于 OCaml 5 的代数效应（Algebraic Effects）与 Eio 并发库，实现一套具备“Everything is a Plugin”特性的工业级 AI Agent 运行套件（Harness），全面对标 DeepSeek Harness 架构思想。
+1. 整体架构设计
+体系分为四层解耦架构：
++-------------------------------------------------------------------+
+| 4. Agent 核心层 (Pure Logic)                                       |
+|    - 纯逻辑 ReAct 递归循环                                          |
+|    - 只发出 Effect，不感知任何具体 I/O / API                        |
++-------------------------------------------------------------------+
+                               |  perform Effect
+                               v
++-------------------------------------------------------------------+
+| 3. Effect 协议接口层 (Core Effect Signatures)                       |
+|    - AskLLM | CallTool | SandboxExec | EmitTrajectory | AskApproval  |
++-------------------------------------------------------------------+
+                               |  handled by
+                               v
++-------------------------------------------------------------------+
+| 2. Handler 中间件插件栈 (Plugin Stack / Handlers)                   |
+|    - Trajectory Logger | Safety Approval | Budget Gate | LLM Router   |
++-------------------------------------------------------------------+
+                               |  executed in
+                               v
++-------------------------------------------------------------------+
+| 1. Eio 基础设施与能力控制层 (Capability-based Execution)           |
+|    - Direct-style HTTP/SSE | FS Capability Sandbox | Fiber Scheduler |
++-------------------------------------------------------------------+
 
-**关于这次结果的说明：** 这次多模型调用没有返回各个模型各自的结论，只返回了检索资料和你的项目记忆。所以下面没有"哪些模型同意、哪些不同意"的对比表，凭空编一张会误导你。下面的判断由我综合 OCaml 官方文档、Eio、Temporal 等资料得出，并对照了你的 BRIGADE、YiState 和 effect runtime 项目。
+1.1 设计原则
+ * 控制反转（IoC）： Agent 逻辑为纯逻辑，任何对外界的依赖（模型、工具、网络、文件系统）均通过 Effect.perform 声明。
+ * 能力隔离（Capability-based）： 基于 Eio 的 Capability 范式控制文件与网络权限，沙箱执行天然受限。
+ * 组合优于继承： 通过洋葱圈式的 Handler 嵌套组合 Harness 功能，支持零修改无缝切换 Mock 评测（Eval）与生产环境。
+2. 项目目录结构
+dsh-ocaml/
+├── dune-project
+├── dsh_ocaml.opam
+├── bin/
+│   └── main.ml               (* 启动入口及 CLI 参数解析 *)
+├── lib/
+│   ├── core/
+│   │   ├── types.ml          (* 基础类型定义：Message, Tool, Config *)
+│   │   ├── effects.ml        (* 核心代数效应协议定义 *)
+│   │   └── agent.ml          (* Agent 纯逻辑实现 *)
+│   ├── harness/
+│   │   ├── sandbox.ml        (* 基于 Eio 的受限文件/进程沙箱 Handler *)
+│   │   ├── llm_provider.ml   (* OpenAI / DeepSeek SSE 流式 HTTP Handler *)
+│   │   ├── trajectory.ml     (* 轨迹记录与 Trace 可观测 Handler *)
+│   │   ├── approval.ml       (* 安全与人工审批 Handler *)
+│   │   └── budget.ml         (* 步数与 Token 预算控制 Handler *)
+│   └── runtime.ml            (* Runtime Presets 组装工厂 *)
+└── test/
+    ├── test_mock_eval.ml     (* 离线确定性评测测试 *)
+    └── test_sandbox.ml      (* 沙箱隔离测试 *)
 
-***
+3. 核心效应协议与类型规约 (lib/core/)
+3.1 基础类型 (types.ml)
+type role = System | User | Assistant | ToolResult of string
 
-## 一、结论
+type message = {
+  role : role;
+  content : string;
+}
 
-方向是对的。"Effect 定义能力，Handler 实现环境"适合用来拆掉 Harness 里的胶水代码。但原文有一处根本错误，另有三处说得过满，写进 spec 之前要先改掉。
+type tool_call = {
+  id : string;
+  name : string;
+  args_json : string;
+}
 
-### 1. 根本错误：原生 continuation 不能持久化
+type llm_response =
+  | TextResponse of string
+  | ToolCallResponse of tool_call list
 
-原文第 3 点说"Handler 直接持久化 continuation，响应到达后 `continue k` 恢复"。在 OCaml 5 里这做不到：
+type trajectory_event =
+  | LLMStart of message list
+  | LLMEnd of llm_response
+  | ToolStart of string * string
+  | ToolEnd of string * (string, string) result
+  | ApprovalRequested of string
 
-- continuation 是堆上的一个对象，指向一段运行时栈（fiber）。捕获它时不复制栈帧，所以它不是可以序列化的普通数据。
-- `Marshal` 遇到函数值会失败，除非打开 `Closures` 标志；即使打开，也只能在同一个二进制里读回，处理不了运行时栈段。
-- continuation 只能恢复一次（one-shot）。第二次恢复会抛 `Continuation_already_resumed`，所以也不能"留一份备份"。
-
-因此 `continue k` 只适用于**进程还在**的短暂挂起，比如等几秒的审批或回调。**跨重启**的 durable execution 必须换一种做法：把每次 effect 的结果写进日志，重启后从头重放（event-sourced replay）。Temporal 就是这样做的：恢复时不还原内存快照，而是从头重跑 workflow，用记录下来的结果把代码带回原来的位置。
-
-好消息是，effect 做重放比命令式代码自然得多。只需要一个 Replay handler：日志里已有的 effect 直接返回记录的结果，没有的才真正执行。Agent 代码完全不用改。原文想要的"无需编写状态重构逻辑"，靠重放就能实现，只是理由不是"持久化 k"。
-
-### 2. 说得过满：没有静态的 effect 安全
-
-OCaml 编译器不检查每个 effect 是否都有 handler。漏装一个 handler，要到运行时、执行到那个 `perform` 时才抛 `Effect.Unhandled`。所以"一键切换 Dev / Eval / Prod"需要两个配套措施：
-
-- 每个 profile 都要有一个覆盖全部 effect 的 CI 测试。
-- 在最外层放一个兜底 handler，把 `Unhandled` 转成带类型的错误。
-
-更强的静态保证可以看 Jane Street 的 `handled_effect`，但它依赖 OxCaml。
-
-### 3. 说得过满：Eio 的 fork 会"丢"你的 handler
-
-这一点需要实测确认。Eio 的子 fiber 由底层调度器运行，你在 fork 点之上安装的 handler 很可能不在子 fiber 的栈里。Ocsigen 也遇到过类似问题：从回调里 `perform` 直接得到 `Unhandled`。
-
-多 Agent、swarm 场景下必须规定：**每个子 fiber 入口都重新安装 Harness 栈**（用 `Harness.spawn` 封装）。M0 阶段要写一个测试，先证实或排除这个问题。
-
-### 4. 说得过满："静默纠错"的方向不对
-
-校验没通过时，不应该悄悄改掉返回给模型的内容。应该返回带结构的诊断信息，写进日志，并设重试上限。否则 Eval 无法复现，审计也说不清。这和你在 YiState 里"证据必须可追溯"的原则一致。
-
-***
-
-## 二、实施 Spec：`ocagent-harness` v0.1
-
-### 2.1 目标与非目标
-
-**目标：**
-- Agent 核心代码只使用 `perform`，不直接依赖任何 SDK。
-- 同一份 agent 代码可以跑在三种 profile 下：Dev、Eval（确定性、可重放）、Prod。
-- 进程崩溃或重启后，靠重放恢复到断点，不重复执行已经完成的副作用。
-- 审批、预算、校验、追踪都以 handler 的形式插拔。
-
-**非目标（v0.1 不做）：**
-- 多次恢复的 continuation（multi-shot）。
-- 跨语言序列化 continuation。
-- 分布式调度。后续可以接 BRIGADE 或 Temporal。
-
-### 2.2 Effect 协议（`lib/proto/effects.ml`）
-
-原文的 `string * string` 太弱，这里改成带类型的结构，并把所有不确定的来源都做成 effect：
-
-```ocaml
-type tool_call   = { call_id : string; name : string; args : Yojson.Safe.t }
-type tool_result = { ok : bool; output : string; diagnostics : string list }
-type approval    = { action : string; risk : [`Low | `High]; payload : Yojson.Safe.t }
-type decision    = Approved | Rejected of string
+3.2 核心代数效应 (effects.ml)
+open Effect
+open Types
 
 type _ Effect.t +=
-  | Llm         : Llm.request -> Llm.response Effect.t   (* 模型调用也是 effect，Eval 才能 mock/重放 *)
-  | Tool        : tool_call -> tool_result Effect.t
-  | Ask_human   : approval -> decision Effect.t
-  | Checkpoint  : string -> unit Effect.t                (* 语义改为“日志屏障/fsync 点”，不是存 k *)
-  | Compact     : Msg.t list -> Msg.t list Effect.t
-  | Now         : float Effect.t                         (* 重放必须是确定的：时间、随机、ID 都走 effect *)
-  | Fresh_id    : string Effect.t
-```
+  | AskLLM : { messages : message list; model : string } -> llm_response Effect.t
+  | CallTool : { name : string; args_json : string } -> (string, string) result Effect.t
+  | SandboxExec : { cmd : string; timeout_sec : float } -> (string, string) result Effect.t
+  | EmitTrajectory : trajectory_event -> unit Effect.t
+  | AskApproval : { action : string; risk_level : string } -> bool Effect.t
 
-**规则 R1：** agent 代码里禁止直接调用 `Unix.time`、`Random` 或任何 I/O。CI 用 grep 或 lint 拦截。
+4. 基于 Eio 的安全沙箱与能力控制 (lib/harness/sandbox.ml)
+利用 Eio 限制系统的文件访问作用域，杜绝路径逃逸。
+open Effect
+open Effect.Deep
+open Core.Effects
 
-### 2.3 中间件写法
+let with_eio_sandbox 
+    ~(cwd : Eio.Fs.dir Eio.Path.t) 
+    ~(mgr : _ Eio.Process.mgr) 
+    (f : unit -> 'a) : 'a =
+  match_with f ()
+    { retc = (fun x -> x);
+      exnc = raise;
+      effc =
+        (fun (type b) (eff : b Effect.t) ->
+          match eff with
+          | SandboxExec { cmd; timeout_sec } ->
+            Some (fun (k : (b, _) continuation) ->
+              perform (EmitTrajectory (ToolStart ("sandbox_exec", cmd)));
+              let result =
+                try
+                  (* 基于 Eio 挂载的沙箱目录执行命令 *)
+                  let stdout = Eio.Process.parse_out mgr Eio.Buf_read.line
+                    [ "sh"; "-c"; cmd ] ~cwd in
+                  Ok stdout
+                with exn ->
+                  Error (Printexc.to_string exn)
+              in
+              perform (EmitTrajectory (ToolEnd ("sandbox_exec", result)));
+              continue k result)
+          | _ -> None) }
 
-handler 先在请求前、结果后做自己的事；中间要真正执行时，在 handler 里再 `perform` 一次同一个 effect，这次会交给外层 handler 处理：
+5. Harness 插件 Handlers 实现 (lib/harness/)
+5.1 轨迹与日志记录插件 (trajectory.ml)
+open Effect
+open Effect.Deep
+open Core.Effects
 
-```ocaml
-let with_budget ~max f =
-  let used = ref 0 in
-  Effect.Deep.try_with f ()
-    { effc = fun (type a) (e : a Effect.t) -> match e with
-      | Llm req -> Some (fun (k : (a, _) continuation) ->
-          incr used;
-          if !used > max then discontinue k Budget_exceeded
-          else continue k (perform (Llm req)))     (* 转交外层 *)
-      | _ -> None }
-```
+let with_trajectory ~(on_event : Core.Types.trajectory_event -> unit) (f : unit -> 'a) : 'a =
+  match_with f ()
+    { retc = (fun x -> x);
+      exnc = raise;
+      effc =
+        (fun (type b) (eff : b Effect.t) ->
+          match eff with
+          | EmitTrajectory ev ->
+            Some (fun (k : (b, _) continuation) ->
+              on_event ev;
+              continue k ())
+          | _ -> None) }
 
-**嵌套顺序：** 写在最里层的 handler 最先拦截到 effect。规范的栈从内到外如下：
+5.2 安全与人工审批拦截器 (approval.ml)
+open Effect
+open Effect.Deep
+open Core.Effects
 
-| 层（内 → 外） | 职责 | 备注 |
-|---|---|---|
-| `with_trace` | 记录 span 和日志 | 重放时打 `replayed=true` 标记，不重复上报 |
-| `with_verify` | Tool 执行后跑 lint、测试、schema 校验 | 结果写进 `diagnostics`；同一 call_id 最多 N 次 |
-| `with_budget` / `with_quota` | 统计次数和 token | 放在 Replay 以内，重放时预算状态会自然重建 |
-| `with_policy` | 判断风险；`High` 级别转成 `Ask_human` | 规则是纯函数，可以复用 YiState 的门控 |
-| `with_compact` | 超过阈值时调用 Llm 做摘要 | 摘要本身也是 Llm effect，会被记进日志 |
-| **`with_journal_replay`** | 日志里有记录就直接返回，否则先执行、写入日志、fsync，再 `continue` | durable 的核心 |
-| 执行层 | `with_sandbox`（Docker 或 mock）、`with_llm_client`、`with_human`（Slack/Telegram/CLI） | 只有这一层碰外部世界 |
-| `with_strict` | 把 `Unhandled` 转成 `Harness_error` | 最外层兜底 |
+let with_risk_approval ~(dangerous_tools : string list) (f : unit -> 'a) : 'a =
+  match_with f ()
+    { retc = (fun x -> x);
+      exnc = raise;
+      effc =
+        (fun (type b) (eff : b Effect.t) ->
+          match eff with
+          | CallTool { name; args_json } when List.mem name dangerous_tools ->
+            Some (fun (k : (b, _) continuation) ->
+              let prompt = Printf.sprintf "允许执行高危工具 %s 及其参数 [%s]?" name args_json in
+              let approved = perform (AskApproval { action = prompt; risk_level = "HIGH" }) in
+              if approved then
+                continue k (perform (CallTool { name; args_json }))
+              else
+                continue k (Error "用户拒绝了该高危操作"))[span_4](start_span)[span_4](end_span)
+          | _ -> None) }
 
-### 2.4 Durable Execution：重放协议（替代"持久化 k"）
+6. Runtime 预设与组装套件 (lib/runtime.ml)
+统一调度管理不同的 Handler 栈，提供一键调用的运行预设。
+type harness_mode =
+  | Production
+  | DryRun
+  | Evaluation of string (* Trajectory Record/Replay Path *)
 
-日志采用 JSONL 或 SQLite，每条记录如下：
+let run_harness 
+    ~(env : Eio_unix.Stdenv.base) 
+    ~(mode : harness_mode) 
+    ~(agent_entry : unit -> 'a) : 'a =
+  Eio.Switch.run @@ fun _sw ->
+  let cwd = Eio.Path.(env#fs / "tmp" / "dsh_workdir") in
+  let proc_mgr = env#process_mgr in
 
-```
-{ run_id; seq; kind; req_hash; status: Done|Pending; result; ts }
-```
+  match mode with
+  | Production ->
+      agent_entry
+      |> Harness.Approval.with_risk_approval ~dangerous_tools:["delete_file"; "deploy"][span_6](start_span)[span_6](end_span)
+      |> Harness.Trajectory.with_trajectory ~on_event:(fun ev -> Logs.info (fun m -> m "Ev: %a" pp_event ev))[span_7](start_span)[span_7](end_span)
+      |> Harness.Sandbox.with_eio_sandbox ~cwd ~mgr:proc_mgr
+      |> Harness.Llm_provider.with_deepseek_http ~net:env#net ~model:"deepseek-v4"
+  | Evaluation replay_path ->
+      agent_entry
+      |> Harness.Trajectory.with_trajectory ~on_event:(save_to_disk replay_path)[span_8](start_span)[span_8](end_span)
+      |> Harness.Sandbox.with_mock_sandbox
+      |> Harness.Llm_provider.with_mock_llm_responses replay_path
+  | DryRun ->
+      agent_entry
+      |> Harness.Approval.with_auto_deny[span_9](start_span)[span_9](end_span)
+      |> Harness.Sandbox.with_dry_run_sandbox
+      |> Harness.Llm_provider.with_deepseek_http ~net:env#net ~model:"deepseek-v4"
 
-replay handler 收到第 n 个 effect 时：
-
-1. **日志里有第 n 条：** 先校验 `req_hash`。不一致就抛 `Nondeterminism`（类似 Temporal 的 DeterminismViolation）。一致就直接 `continue k recorded`。
-2. **没有，且是普通副作用：** 先写 `Pending` 和幂等键，再执行，再写 `Done`，最后 `continue`。副作用至少执行一次，用幂等键防止重复。
-3. **没有，且是 `Ask_human`：** 写 `Pending`，然后 `discontinue k Suspended`。调用栈会正常展开，`Fun.protect` 里登记的资源也会释放，进程可以退出。
-4. **审批结果到达后：** 把结果写进第 n 条，重新运行 `agent prompt`，重放会一路快进到断点。
-5. **等待时间很短（几秒）且进程不退出时：** 可以走快速路径，把 k 保存在内存里等待。关闭进程前必须对所有挂起的 k 调用 `discontinue`，否则它们持有的资源会泄漏。
-
-**升级规则：** 修改 agent 代码会让旧日志的重放失效。`run_id` 要绑定 `agent_version`，跑在旧版本上的任务只能用旧二进制完成，或者显式迁移。
-
-### 2.5 反馈闭环规范
-
-`with_verify` 只拦截写入类工具（`write_file`、`apply_patch`），之后通过 `perform (Tool lint_call)` 调用校验器，所以校验结果也会记进日志。校验失败时返回：
-
-```
-{ ok = false; output; diagnostics = [...] }
-```
-
-由 agent 主循环决定是否重试，最多 3 次。handler 不替模型重写内容，只附加诊断信息。
-
-### 2.6 Profile 组合（`lib/profiles.ml`）
-
-```ocaml
-let eval  = stack [strict; mock_world ~fixtures; journal_replay ~mem; budget 10; verify; eval_logger]
-let prod  = stack [strict; docker_sandbox; llm_client; telegram_approval;
-                   journal_replay ~sqlite; policy; budget; verify; otel_trace]
-let run profile agent prompt = profile (fun () -> agent prompt)
-```
-
-`Harness.spawn`：子 agent fork 时，在子 fiber 内重新应用同一个 profile，并给子任务分配自己的 `run_id`。这和 BRIGADE 的 Switch 取消树是对齐的。
-
-### 2.7 里程碑（按 PR 拆分）
-
-| PR | 内容 | 验收 |
-|---|---|---|
-| M0 | 协议、`with_strict`，以及 Eio fork 继承 handler 的验证测试 | 证实或证伪第一节第 3 点；每个 profile 都通过 effect 覆盖测试 |
-| M1 | Mock world、budget、eval logger | 同一 fixture 跑 100 次，日志逐字节一致 |
-| M2 | journal 与重放 | 在任意 seq 位置 kill -9 后重启，结果一致，副作用不重复执行 |
-| M3 | Ask_human 挂起与恢复（Telegram 通道） | 隔一天审批后可以恢复；`Nondeterminism` 测试会触发报错 |
-| M4 | verify、policy（接入 YiState 门控）、compact | SWE 类小任务上，修复率和 token 消耗有对照数据 |
-| M5 | Docker sandbox、OTel，接入 BRIGADE 做多 agent | swarm 任务中子 agent 崩溃，监督者收到 DOWN 后能重放恢复 |
-
-***
-
-## 三、修正后的对比表
-
-| 维度 | 命令式 Harness | Effect Harness（修正版） |
-|---|---|---|
-| 中断与恢复 | 手写状态序列化 | **effect 结果日志 + 自动重放**；agent 代码保持不变，但要求确定性 |
-| 环境切换 | 配置分支 | 组合 handler 栈，**需要 CI 覆盖测试**（没有静态保证） |
-| 并发 | 回调或 async | 直写风格；**子 fiber 需要重新安装 handler** |
-| 纠错 | 硬编码在主循环 | 由 handler 附加结构化诊断，交给 agent 决定，并写进日志 |
-
-**下一步建议：** 先做 M0 和 M2。这两个最能证明这个架构可行：一个确认 Eio 下 handler 会不会丢，另一个验证重放加 kill -9 后能否正确恢复。需要的话，我可以按你习惯的方式，把 `with_journal_replay` 的完整实现逐行写出来讲解。
-
-来源
-[1] Language extensions - OCaml https://ocaml.org/manual/5.1/effects.html
-[2] ocaml.org · manual · 5OCaml - Language extensions https://ocaml.org/manual/5.2/effects.html
-[3] github.com · ocaml · ocamlocaml/runtime/extern.c at trunk · ocaml/ocaml · GitHub https://github.com/ocaml/ocaml/blob/trunk/runtime/extern.c
-[4] docs.temporal.io · workflowsTemporal Workflow | Temporal Documentation https://docs.temporal.io/workflows
-[5] effect-agent.comEffect Agent https://effect-agent.com/
-[6] github.com · ocaml-multicore · eioGitHub - ocaml-multicore/eio: Effects-based direct-style IO ... https://github.com/ocaml-multicore/eio
-[7] How are effects implemented? : r/ocaml - Reddit https://www.reddit.com/r/ocaml/comments/1lsaawt/how_are_effects_implemented/
-[8] Retrofitting Effect Handlers onto OCaml https://arxiv.org/html/2104.00250v1
-[9] [PDF] The practice of effects: from exceptions to effect handlers https://xavierleroy.org/CdF/2023-2024/5.pdf
-[10] letsbuildsolutions.com · blog · system-designDesigning a Durable Execution Engine: Workflow Replay ... https://letsbuildsolutions.com/blog/system-design/designing-a-durable-execution-engine-workflow-replay-checkpointing-and-failure-recovery-for-long-running-distributed-processes/
-[11] docs.reactiveagents.dev · concepts · effect-tsEffect-TS Primer | Reactive Agents https://docs.reactiveagents.dev/concepts/effect-ts/
-[12] deepwiki.com · dilagent · 4Effect-TS Layer System | schickling/dilagent | DeepWiki https://deepwiki.com/schickling/dilagent/4.4-effect-ts-layer-system
-[13] ocaml.org · changelog · 2025/01/08-ocaml-530Release of OCaml 5.3.0 • OCaml Changelog https://ocaml.org/changelog/2025-01-08-ocaml-530
-[14] ocaml.org · releases · 5OCaml 5.3.0 Release Notes https://ocaml.org/releases/5.3.0
-[15] github.com · glyh · oieEio — Effects-Based Parallel IO for OCaml - GitHub https://github.com/glyh/oie
-[16] ocaml-multicore.github.io · eio · eioindex (eio.index) - ocaml-multicore.github.io https://ocaml-multicore.github.io/eio/eio/index.html
-[17] github.com · ocaml-multicore · picosGitHub - ocaml-multicore/picos: Interoperable effects based ... https://github.com/ocaml-multicore/picos
-[18] ocaml-multicore.github.io · picos · docPicos — Interoperable effects based concurrency https://ocaml-multicore.github.io/picos/doc/picos/index.html
-[19] temporal.io · blog · idempotency-and-durable-executionWhat is idempotency? And why it matters for durable systems https://temporal.io/blog/idempotency-and-durable-execution
-[20] oh-bug.com · posts · agent-durable-executionAgent Durable Execution in Production: Preventing Duplicate ... https://oh-bug.com/posts/agent-durable-execution-production-guide/
-[21] jack-vanlightly.com · blog · 2025/11/24Demystifying Determinism in Durable Execution - Jack Vanlightly https://jack-vanlightly.com/blog/2025/11/24/demystifying-determinism-in-durable-execution
-[22] ocaml.org · manual · effectsOCaml - Language extensions https://ocaml.org/manual/effects.html
-[23] learn.temporal.io · durable-executionDevelop code that durably executes - TypeScript SDK dev guide https://learn.temporal.io/tutorials/typescript/background-check/durable-execution/
-[24] github.com · ocaml-multicore · ocaml-effects-tutorialGitHub - ocaml-multicore/ocaml-effects-tutorial: Concurrent ... https://github.com/ocaml-multicore/ocaml-effects-tutorial
-[25] www.cl.cam.ac.uk · ~jdy22 · papersEffective Concurrency through Algebraic Effects https://www.cl.cam.ac.uk/~jdy22/papers/effective-concurrency-through-algebraic-effects.pdf
-[26] lucasma8795.github.io · blog · 2025/07/04Effects-based scheduling for the OCaml compiler - w01 https://lucasma8795.github.io/blog/2025/07/04/effects-scheduling-w01.html
-[27] learn.temporal.io · durable-executionDevelop code that durably executes - Java SDK dev guide https://learn.temporal.io/tutorials/java/background-check/durable-execution/
-[28] iotdigitaltwinplm.com · durable-executionDurable Execution Architecture: Temporal, Restate and DBOS ... https://iotdigitaltwinplm.com/durable-execution-architecture-temporal-restate-dbos-2026/
-[29] www.philipzucker.com · continuations-effectsContinuations and Effects - Hey There Buddo! https://www.philipzucker.com/notes/Programming/continuations-effects/
-[30] ocsigen.org · latest · js_of_ocamlEffect handlers — Js_of_ocaml - ocsigen.org https://ocsigen.org/js_of_ocaml/latest/js_of_ocaml/effects.html
-[31] sachinsharma.dev · blogs · temporal-io-durableDurable Execution with Temporal.io: Fault-Tolerant ... https://sachinsharma.dev/blogs/temporal-io-durable-execution-workflow-orchestration-2026
-[32] 24 Effect handlers - OCaml https://ocaml.org/manual/5.5/effects.html
-[33] lewinb.net · posts · 17_playing_with_ocaml_effectsPlaying with OCaml Effects - lewinb.net https://lewinb.net/posts/17_playing_with_ocaml_effects/
-[34] ocaml.org · api · MarshalOCaml library : Marshal https://ocaml.org/api/Marshal.html
-[35] stackoverflow.com · questions · 46946065Continuation Passing Style in ocaml - Stack Overflow https://stackoverflow.com/questions/46946065/continuation-passing-style-in-ocaml
-[36] effect-handlers.org · talks · ehop-splv2022Effect handler oriented programming https://effect-handlers.org/talks/ehop-splv2022.pdf
-[37] github.com · ocaml · ocamlocaml/stdlib/effect.ml at trunk · ocaml/ocaml · GitHub https://github.com/ocaml/ocaml/blob/trunk/stdlib/effect.ml
-[38] kodejungle.org · learning · serialize-and-deBeginner Guide to Serialize and Deserialize Binary in OCaml https://kodejungle.org/learning/serialize-and-deserialize/beginner-guide-to-serialize-and-deserialize-binary-in-ocaml/
-[39] effect-handlers.org · talks · fopss2026Effect handler oriented programming https://effect-handlers.org/talks/fopss2026/ehop.pdf
-[40] ocaml.org · manual · latestOCaml library : Stdlib.Marshal https://ocaml.org/manual/latest/api/Stdlib.Marshal.html
-[41] kcsrk.info · papers · compose_ocaml22Composing Schedulers using Effect Handlers - kcsrk.info https://kcsrk.info/papers/compose_ocaml22.pdf
-[42] Effect vs fp-ts: error tracking and the two learning curves https://typescriptworld.com/effect-vs-fp-ts-error-tracking-and-the-two-learning-curves
-[43] Deep Dive into Effect Systems: From Monads to Algebraic ... https://yceffort.kr/en/2026/02/effect-ts-deep-dive
-[44] discuss.ocaml.orgOCaml https://discuss.ocaml.org/
-[45] github.com · ocaml · ocamlGitHub - ocaml/ocaml: The core OCaml system: compilers ... https://github.com/ocaml/ocaml
-[46] github.com · ocamlOCaml · GitHub https://github.com/ocaml
-[47] ocaml-doc.github.ioocaml-doc.github.io - OCaml Documentation Documentation https://ocaml-doc.github.io/
-[48] deepwiki.com · ocaml-multicore · eioUsing Eio | ocaml-multicore/eio | DeepWiki https://deepwiki.com/ocaml-multicore/eio/6-using-eio
-[49] ocaml-multicore.github.io · eio · eioEio (eio.Eio) - ocaml-multicore.github.io https://ocaml-multicore.github.io/eio/eio/Eio/index.html
-[50] ocaml.org · manualOCaml - The OCaml Manual https://ocaml.org/manual
-[51] tmcgilchrist.github.io · ocaml-debug-performanceContinuation-Passing for Tail Calls - OCaml Debugging and ... https://tmcgilchrist.github.io/ocaml-debug-performance/part-7-case-studies/common-patterns/continuation-passing.html
-[52] sanette.github.io · ocaml2 · docsDocs – OCaml - GitHub Pages https://sanette.github.io/ocaml2.org/docs/
-[53] ocaml-multicore.github.io · picosPicos — Interoperable effects based concurrency https://ocaml-multicore.github.io/picos/
-[54] gist.github.com · polytypic · b1c14d9f5e647c9f75Picos — Interoperable effects based concurrency · GitHub https://gist.github.com/polytypic/b1c14d9f5e647c9f75dbbcbd7d0f416b
-[55] github.com · ocaml-multicore · picospicos/doc at main · ocaml-multicore/picos · GitHub https://github.com/ocaml-multicore/picos/tree/main/doc
-[56] [PDF] Practical Algebraic Effect Handlers in Multicore OCaml https://kcsrk.info/slides/handlers_edinburgh.pdf
-[57] www.cst.cam.ac.uk · seminars · listPicos — Interoperable effects based concurrency for OCaml ... https://www.cst.cam.ac.uk/seminars/list/218308
-[58] Algebraic Effects: Another mistake carried through to perfection? https://lobste.rs/s/12m2f0/algebraic_effects_another_mistake
-[59] ocaml.org · manual · latestOCaml library : Effect https://ocaml.org/manual/latest/api/type_Effect.html
-[60] ocaml.org · manual · 5OCaml library : Effect https://ocaml.org/manual/5.3/api/Effect.html
-[61] ocaml.org · manual · 5OCaml library : Effect.Deep https://ocaml.org/manual/5.4/api/Effect.Deep.html
-[62] github.com · ocaml · ocamlNew syntax `continue ... with` for immediate resumption of ... https://github.com/ocaml/ocaml/issues/13511
-[63] github.com · ocaml-multicore · effects-examplesGitHub - ocaml-multicore/effects-examples: Examples to ... https://github.com/ocaml-multicore/effects-examples
-[64] kcsrk.info · ocaml · multicoreEffective Concurrency with Algebraic Effects · KC ... https://kcsrk.info/ocaml/multicore/2015/05/20/effects-multicore/
-[65] ocaml.org · manual · 5OCaml library : Stdlib.Effect https://ocaml.org/manual/5.3/api/Stdlib.Effect.html
-[66] blog.janestreet.com · fun-with-algebraic-effectsJane Street Blog - Fun with Algebraic Effects - from Toy ... https://blog.janestreet.com/fun-with-algebraic-effects-hardcaml/
-[67] 24 Effect handlers https://ocaml.org/manual/5.0/effects.html
-[68] ocaml.org · manual · intfcOCaml - Interfacing C with OCaml https://ocaml.org/manual/intfc.html
-[69] www.cs.cornell.edu · courses · cs3110Recitation 26: Continuations and CPS Conversion https://www.cs.cornell.edu/courses/cs3110/2012sp/recitations/rec26-cps/rec26.html
-[70] ocaml.org · manual · 4OCaml library : Marshal https://ocaml.org/manual/4.14/api/Marshal.html
-[71] stackoverflow.com · questions · 3072946recursion - Ocaml continuation passing style - Stack Overflow https://stackoverflow.com/questions/3072946/ocaml-continuation-passing-style
-[72] deepwiki.com · ocaml-multicore · eioTesting with Mock | ocaml-multicore/eio | DeepWiki https://deepwiki.com/ocaml-multicore/eio/6.2-testing-with-mock
-[73] stackoverflow.com · questions · 4840449What OCaml standard library types cannot be marshalled? https://stackoverflow.com/questions/4840449/what-ocaml-standard-library-types-cannot-be-marshalled
-[74] github.com · runtime · externocaml-macros/runtime/extern.c at macocaml-prototype-2026-08 ... https://github.com/modular-macros/ocaml-macros/blob/macocaml-prototype-2026-08-06/runtime/extern.c
-[75] sanette.github.io · ocaml-tutorial · 4OCaml - Interfacing C with OCaml - sanette.github.io https://sanette.github.io/ocaml-tutorial/4.00/manual033.html
-[76] ocaml.github.io · odoc · eioEio (eio.eio.Eio) - ocaml.github.io https://ocaml.github.io/odoc/eio/eio/Eio/index.html
-[77] jerrington.me · posts · 2023/04/02-generators-cpsJacob Errington | Implementing generators with continuation ... https://jerrington.me/posts/2023-04-02-generators-cps-streams-d17n.html
-[78] draftbrowns.com · survival-oneshot-adventureSurvival One-Shot Adventure: Resource management ... https://draftbrowns.com/survival-oneshot-adventure-resource-management-environmental-challenges-danger/
-[79] github.com · janestreet · handled_effectGitHub - janestreet/handled_effect: Typed effects API for ... https://github.com/janestreet/handled_effect
-[80] deadlyprintstudio.comDeadly Print Studio makes Fx's and bits for your miniatures https://deadlyprintstudio.com/
-[81] deepwiki.com · janestreet · handled_effectjanestreet/handled_effect | DeepWiki https://deepwiki.com/janestreet/handled_effect
-[82] github.com · janestreet · handled_effectHistory for .ocamlformat - janestreet/handled_effect · GitHub https://github.com/janestreet/handled_effect/commits/oxcaml/.ocamlformat
-[83] deepwiki.com · janestreet · handled_effectInteroperability | janestreet/handled_effect | DeepWiki https://deepwiki.com/janestreet/handled_effect/7-interoperability
-[84] ocaml.github.io · odoc · eioFiber (eio.eio.Eio.Fiber) - ocaml.github.io https://ocaml.github.io/odoc/eio/eio/Eio/Fiber/index.html
-[85] ocaml-multicore.github.io · Picos · FiberFiber (picos.Picos.Fiber) - ocaml-multicore.github.io https://ocaml-multicore.github.io/picos/doc/picos/Picos/Fiber/index.html
-[86] ocaml.org · manual · 4Marshal - ocaml.org https://ocaml.org/manual/4.01/libref/Marshal.html
-[87] www.janestreet.com · tech-talks · effective-programmingEffective Programming: Adding an Effect System to OCaml https://www.janestreet.com/tech-talks/effective-programming/
-[88] ocaml-multicore.github.io · eio · eioFiber (eio.Eio.Fiber) - ocaml-multicore.github.io https://ocaml-multicore.github.io/eio/eio/Eio/Fiber/index.html
-[89] oxcaml.org · documentationOxCaml | Documentation https://oxcaml.org/documentation/
-[90] deepwiki.com · ocaml · ocaml-lspConcurrency with Fiber | ocaml/ocaml-lsp | DeepWiki https://deepwiki.com/ocaml/ocaml-lsp/8.1-concurrency-with-fiber
-[91] jon.recoil.org · reference · eioSwitch (reference.eio.eio.Eio.Switch) - jon.recoil.org https://jon.recoil.org/reference/eio/eio/Eio/Switch/index.html
-[92] deepwiki.com · ocaml-multicore · eioStructured Concurrency with Switch | ocaml-multicore/eio ... https://deepwiki.com/ocaml-multicore/eio/2.1-structured-concurrency-with-switch
-[93] ocaml-multicore.github.io · picos · ocaml-2024Picos — Interoperable effects based concurrency https://ocaml-multicore.github.io/picos/ocaml-2024/picos/index.html
-[94] deepwiki.com · picos · 4Structured Concurrency | ocaml-multicore/picos | DeepWiki https://deepwiki.com/ocaml-multicore/picos/4.1-structured-concurrency
-[95] github.com · ocaml-multicore · eioSwitches documentation · Issue #548 · ocaml-multicore/eio https://github.com/ocaml-multicore/eio/issues/548
-[96] deepwiki.com · ocaml-multicore · picosocaml-multicore/picos | DeepWiki https://deepwiki.com/ocaml-multicore/picos
-[97] ocaml.github.io · odoc · eioResource (eio.eio.Eio.Resource) - ocaml.github.io https://ocaml.github.io/odoc/eio/eio/Eio/Resource/index.html
-[98] effect.website · blog · releasesEffect Website 2.0 (Release) | Effect Blog https://effect.website/blog/releases/website-20
-[99] learn.microsoft.com · en-us · dotnetChaining tasks using continuation tasks - .NET | Microsoft Learn https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/chaining-tasks-by-using-continuation-tasks
-[100] effect.website · docs · v3Getting Started - effect.website https://effect.website/docs/v3/getting-started
-[101] gist.github.com · mefyl · 2f8ba9cb193004cb57c58aecA possible alternative scheduling pattern for Eio that ... https://gist.github.com/mefyl/2f8ba9cb193004cb57c58aec675eae5c/3f7c7883f529afbba1a9980149285c290cf579cb
-[102] jon.recoil.org · reference · eioModule Eio.Fiber Source - jon.recoil.org https://jon.recoil.org/reference/eio/eio/Eio/Fiber/index.html
-[103] instantdomainsearch.com · directory · effecteffect.website: Traffic, Backlinks & Authority Metrics https://instantdomainsearch.com/directory/effect.website
-[104] gridinsoft.com · url · effect-websiteEffect.website Review: Safe or Legit? (77/100 Trust Score) https://gridinsoft.com/online-virus-scanner/url/effect-website
-[105] stackoverflow.com · questions · 715758Coroutine vs Continuation vs Generator - Stack Overflow https://stackoverflow.com/questions/715758/coroutine-vs-continuation-vs-generator
-[106] fsharpforfunandprofit.com · posts · computationUnderstanding continuations | F# for fun and profit https://fsharpforfunandprofit.com/posts/computation-expressions-continuations//
-[107] stackoverflow.com · questions · 79169460azure - ADF Copy data activity pagination with continuation ... https://stackoverflow.com/questions/79169460/adf-copy-data-activity-pagination-with-continuation-token-with-get-request
-[108] labhub.hopto.org · blog · cultureModern OCaml 2026 — OCaml 5.3 / Multicore / Effect Handlers ... https://labhub.hopto.org/blog/culture/2026-05-16-modern-ocaml-2026-ocaml-5-3-multicore-effect-handlers-dune-opam-mirageos-rescript-melange-jane-street-deep-dive?lang=en
-[109] ocaml.org · releasesReleases - OCaml https://ocaml.org/releases
-[110] github.com · joelhooks · effectts-skillsGitHub - joelhooks/effectts-skills: ⚡ Effect-TS v4 agent ... https://github.com/joelhooks/effectts-skills
-[111] Serializing the current state of "Module Random" in OCaml's StdLib https://stackoverflow.com/questions/62265945/serializing-the-current-state-of-module-random-in-ocamls-stdlib
-[112] Your production web stack in 2020 - Ecosystem - discuss OCaml https://discuss.ocaml.org/t/your-production-web-stack-in-2020/6691
-[113] ocaml.github.io · stdlib · StdlibEffect (ocaml-base-compiler.stdlib.Stdlib.Effect) https://ocaml.github.io/odoc/ocaml-base-compiler/stdlib/Stdlib/Effect/index.html
-[114] [PDF] Delimited Control in OCaml, Abstractly and Concretely - okmij.org https://okmij.org/ftp/continuations/caml-shift-journal.pdf
-[115] Making OCaml 5 Succeed for Developers and Organisations - Tarides https://tarides.com/blog/2023-07-07-making-ocaml-5-succeed-for-developers-and-organisations/
-[116] www.cl.cam.ac.uk · R277 · slides-effect-handlersEffect handlers https://www.cl.cam.ac.uk/teaching/2526/R277/slides-effect-handlers.pdf
-[117] docs.gofiber.io · api · ctxCtx - Fiber https://docs.gofiber.io/api/ctx/
-[118] aj002.github.io · _posts · 2026/02/24-ocaml-effectOCaml 5 Effect Handlers | Aastha Jain - aj002.github.io https://aj002.github.io/_posts/2026-02-24-ocaml-effect-handlers.html
-[119] yunkaizhang233.github.io · posts · 2024Effect Handlers - 01 : Basics & Examples - Yunkai Zhang’s ... https://yunkaizhang233.github.io/posts/2024/06/algebraic-effect-handlers-01/
-[120] raw.githubusercontent.com · trunk · runtimeraw.githubusercontent.com https://raw.githubusercontent.com/spdskatr/ocaml/refs/heads/trunk/runtime/extern.c
-[121] ocsigen.org · blog · postsWhy Ocsigen decided not to switch from Lwt to Eio (for now) https://ocsigen.org/blog/posts/why-ocsigen-stays-on-lwt-for-now.html
-[122] github.com · ocaml-multicore · eioQualify `Effect.Unhandled` by anmonteiro · Pull Request #329 ... https://github.com/ocaml-multicore/eio/pull/329
-[123] github.com · Dhyey0201 · ReplayLabGitHub - Dhyey0201/ReplayLab: Deterministic OCaml/Python ... https://github.com/Dhyey0201/ReplayLab
-[124] opensourceops.github.io · agentctl · durable-executionDurable execution | agentctl https://opensourceops.github.io/agentctl/durable-execution/
-[125] ocaml-tracing.github.io · ocaml-trace · ocamlTag (ocaml.Tag) - ocaml-tracing.github.io https://ocaml-tracing.github.io/ocaml-trace/ocaml/Tag/index.html
-[126] ocaml.org · manual · 5OCaml - Interfacing C with OCaml https://ocaml.org/manual/5.2/intfc.html
-[127] sanette.github.io · ocaml2 · learnTags – OCaml - sanette.github.io https://sanette.github.io/ocaml2.org/learn/tutorials/ocamlbuild/Tags.html
+7. 交付里程碑与 Roadmap
+| 里程碑 | 周期 | 核心交付物 | 校验标准 |
+|---|---|---|---|
+| M1: Core Engine | W1-W2 | 协议层 (effects.ml) + Agent 纯逻辑 (agent.ml) + Mock Runtime | 单元测试实现 100% 确定性 Mock 流程推演，无网络依赖 |
+| M2: Eio & Direct-style HTTP | W3-W4 | cohttp-eio SSE 流式 Client + 基于 Eio Process 的安全沙箱环境 | 支持 SSE 实时 Chunk 解析与基于 Path 限制的受限 Shell 命令执行 |
+| M3: Harness Safety & Trace | W5-W6 | 洋葱圈 Handler 栈组装、轨迹持久化 JSON、CLI 可视化面板 | 拦截高危命令触发 AskApproval，且能够保存/重放 Trajectory 轨迹 |
+| M4: Actor Extension | W7-W8 | 扩展基于 Eio.Fiber 的 Actor 消息模型 (Receive/Send/Spawn) | 支持树状 Multi-Agent 协同并发调度及 Supervisor 故障恢复 |

@@ -6,6 +6,8 @@ type _ Effect.t +=
   | SandboxExec : { cmd : string; timeout_sec : float } -> (string, string) result Effect.t
   | EmitTrajectory : trajectory_event -> unit Effect.t
   | AskApproval : { action : string; risk_level : string } -> bool Effect.t
+  | Fetch : { meth : http_method; url : string; body : string } -> (http_reply, string) result Effect.t
+  | Web_search : { query : string; limit : int } -> (search_answer, string) result Effect.t
   | Self : actor_id Effect.t
   | Send : { to_ : actor_id; body : string } -> unit Effect.t
   | Receive : actor_msg Effect.t

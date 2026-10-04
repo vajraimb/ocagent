@@ -3,7 +3,7 @@
 两套 OCaml 5 effect harness，浏览器里只演示第一套的协议。
 
 - [`ocaml/`](ocaml/) — journal replay。continuation 存不进去，恢复靠 JSONL 重放。
-- [`dsh-ocaml/`](dsh-ocaml/) — Eio 沙箱、预算、高危审批、mock 评测，以及 Fiber actor / OTP 监督树。子 fiber 不继承 handler，拉起时把栈装回去。
+- [`dsh-ocaml/`](dsh-ocaml/) — Eio 沙箱、预算、高危审批、mock 评测，以及 Fiber actor / OTP 监督树。子 fiber 不继承 handler，拉起时把栈装回去。`Fetch` 和 `Web_search` 也是 effect，OCaml 里 `perform` 就能访问 http/https 和 xAI 网页搜索。
 
 ```sh
 cd ocaml && eval $(opam env --switch=5.3.0) && dune runtest

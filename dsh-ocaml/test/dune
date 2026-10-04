@@ -9,3 +9,7 @@
 (test
  (name test_actor)
  (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))
+
+(test
+ (name test_net)
+ (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))

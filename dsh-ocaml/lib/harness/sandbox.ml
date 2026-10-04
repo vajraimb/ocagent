@@ -194,6 +194,20 @@ let with_tools ~fs f =
                     | "read_file" -> fs.read args_json
                     | "write_file" -> fs.write args_json
                     | "delete_file" -> fs.delete args_json
+                    | "fetch" | "http" -> (
+                        match Net.parse_fetch_args args_json with
+                        | Error _ as err -> err
+                        | Ok (meth, url, body) -> (
+                            match perform (Fetch { meth; url; body }) with
+                            | Error _ as err -> err
+                            | Ok reply -> Ok (Printf.sprintf "HTTP %d\n%s" reply.status reply.body)))
+                    | "search" | "web_search" -> (
+                        match Search.parse_query args_json with
+                        | Error _ as err -> err
+                        | Ok query -> (
+                            match perform (Web_search { query; limit = 5 }) with
+                            | Error _ as err -> err
+                            | Ok answer -> Ok (Search.render answer)))
                     | other -> Error ("unknown tool " ^ other)
                   in
                   continue k result)
