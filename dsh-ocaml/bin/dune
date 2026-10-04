@@ -1,0 +1,3 @@
+(executable
+ (name main)
+ (libraries dsh-ocaml eio_main))

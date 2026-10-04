@@ -1,0 +1,12 @@
+(lang dune 3.16)
+
+(name dsh-ocaml)
+
+(package
+ (name dsh-ocaml)
+ (synopsis "Effect and Eio harness for an AI agent")
+ (depends
+  ocaml
+  dune
+  eio
+  eio_main))

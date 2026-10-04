@@ -1,0 +1,5 @@
+(library
+ (name dsh_ocaml)
+ (public_name dsh-ocaml)
+ (libraries core harness eio eio.unix)
+ (modules runtime))

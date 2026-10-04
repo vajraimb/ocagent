@@ -1,0 +1,19 @@
+opam-version: "2.0"
+synopsis: "Effect and Eio harness for an AI agent"
+description: """
+dsh-ocaml. The agent only performs effects. Approval, budget, trajectory,
+sandbox and the model client are handlers. Evaluation replays scripted
+answers and does not touch the network.
+"""
+maintainer: "vajraimb"
+authors: "vajraimb"
+license: "MIT"
+homepage: "https://github.com/vajraimb/ocagent"
+depends: [
+  "ocaml" {>= "5.3.0"}
+  "dune" {>= "3.16"}
+  "eio" {>= "1.4"}
+  "eio_main"
+]
+build: ["dune" "build" "-p" name "-j" jobs]
+run-test: ["dune" "runtest" "-p" name "-j" jobs]

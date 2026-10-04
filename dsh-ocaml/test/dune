@@ -1,0 +1,7 @@
+(test
+ (name test_mock_eval)
+ (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))
+
+(test
+ (name test_sandbox)
+ (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))
