@@ -116,6 +116,7 @@ export type AgentResult = {
   now: number;
   published: "skipped" | "yes" | "rejected";
   diagnostics: string[];
+  answer?: string;
 };
 
 export type Probe = { released: boolean };
