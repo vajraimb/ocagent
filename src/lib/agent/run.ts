@@ -169,7 +169,7 @@ function instructionsFor(harnesses: HarnessId[], _modules: DeskModule[]): string
 只能使用下面的 module：Files、Search、Net、Trace、Clock，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
-用户要你写一个程序时，这一轮就用 Files.write_file 把源码写进文件，成功后立刻 Done。不要只记笔记不写文件。写进文件里的文本可以包含 Sys.time，那不会被执行。
+用户点名要加载的模块时，文件名就用那个名字，例如 PDF_gen 写成 PDF_gen.ml，写完再 Done。不要加载别的旧文件。
 
 这次开着的能力：${opened.length ? opened.join("、") : "没有"}。没开的调用会得到 Error。
 
@@ -215,8 +215,9 @@ end
 - Continue 表示还要再来一轮。Done、Ask、Partial 会结束这次任务。
 
 【工作方式】
-- 每一轮只做一小步：读、查、改其中之一，然后 Trace.note 关键信息，返回 Continue。
-- 写文件之前先读一遍。
+- 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。
+- 只有用户明确说「加载」或 harness 时，才把对应的 .ml 写好并结束。其它任务不要提 harness。
+- 工作区是空的时候，不要反复列出文件。
 - 收到编译错误时只改出错的地方，不要重写整段。
 - 不确定时返回 Ask，不要猜。
 

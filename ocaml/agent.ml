@@ -609,22 +609,85 @@ let () =
   let stock path = path = "src/math.ml" || path = "src/greet.ml" in
   let hostile body =
     List.exists (contains body)
-      [ "Sys.command"; "Sys.getenv"; "Sys.chdir"; "Sys.remove"; "Sys.rename"; "Sys.set_signal"; "#load"; "#directory"; "#use"; "open_in"; "open_out" ]
+      [ "Sys.command"; "Sys.getenv"; "Sys.chdir"; "Sys.remove"; "Sys.rename"; "Sys.set_signal"; "#load"; "#directory"; "#use" ]
   in
-  let adopt () =
-    List.iter
-      (fun (path, content) ->
-        if (not (stock path)) && String.ends_with ~suffix:".ml" path && String.length content <= 8000 && not (hostile content) then
-          match module_name_of path with
-          | Some name when valid_name name && not (reserved name) ->
-              modules := (name, content) :: List.filter (fun (kept, _) -> kept <> name) !modules
-          | _ -> ())
-      !files
+  let is_ident c = is_word c in
+  let idents text =
+    let n = String.length text in
+    let rec go i acc =
+      if i >= n then List.rev acc
+      else if (text.[i] >= 'A' && text.[i] <= 'Z') || (text.[i] >= 'a' && text.[i] <= 'z') then
+        let j = ref i in
+        while !j < n && is_ident text.[!j] do j := !j + 1 done;
+        go !j (String.sub text i (!j - i) :: acc)
+      else go (i + 1) acc
+    in
+    go 0 []
+  in
+  let skip_word word =
+    let word = String.lowercase_ascii word in
+    word = "harness" || word = "module" || word = "ocaml" || word = "step" || word = "ml"
+  in
+  let hints = List.filter (fun word -> String.length word >= 2 && not (skip_word word)) (idents task) in
+  let stem_key path =
+    match module_name_of path with None -> "" | Some name -> String.lowercase_ascii name
+  in
+  let hinted path =
+    let stem = stem_key path in
+    stem <> ""
+    && List.exists
+         (fun raw ->
+           let id = String.lowercase_ascii raw in
+           stem = id
+           || (String.length id >= 3 && String.starts_with ~prefix:id stem)
+           || (String.length stem >= 3 && String.starts_with ~prefix:stem id))
+         hints
+  in
+  let reject path content =
+    if String.length content > 8000 then Some (path ^ " 超过 8000 字，装不进 harness。")
+    else if hostile content then Some (path ^ " 里有禁止的调用，装不进 harness。")
+    else if stock path then None
+    else
+      match module_name_of path with
+      | Some name when valid_name name && not (reserved name) -> None
+      | _ -> Some (path ^ " 的模块名不行。")
+  in
+  let take path content =
+    match reject path content with
+    | Some _ -> ()
+    | None when stock path -> ()
+    | None -> (
+        match module_name_of path with
+        | Some name -> modules := (name, content) :: List.filter (fun (kept, _) -> kept <> name) !modules
+        | None -> ())
+  in
+  let explain_blocked fileset =
+    List.filter_map
+      (fun (path, content) -> if String.ends_with ~suffix:".ml" path && hinted path then reject path content else None)
+      fileset
+  in
+  let names_of picked =
+    List.filter_map
+      (fun (path, content) -> match reject path content with None -> module_name_of path | Some _ -> None)
+      picked
+  in
+  let claim picked =
+    List.iter (fun (path, content) -> take path content) picked;
+    match names_of picked with
+    | name :: rest -> Some ("已加载 module " ^ String.concat "、" (name :: rest))
+    | [] -> ( match explain_blocked !files with reason :: _ -> Some reason | [] -> None)
+  in
+  let candidates fileset =
+    let ml = List.filter (fun (path, _) -> String.ends_with ~suffix:".ml" path && not (stock path)) fileset in
+    match List.filter (fun (path, _) -> hinted path) ml with
+    | _ :: _ as named -> named
+    | [] when hints = [] && List.length ml = 1 -> ml
+    | [] -> []
   in
   let rec loop stalled last_code =
-    adopt ();
-    if wants_load task && !modules <> [] then finish ("已加载 module " ^ String.concat "、" (List.map fst !modules))
-    else
+    match if wants_load task then claim (candidates !files) else None with
+    | Some msg -> finish msg
+    | None ->
     let memory', journal' = Effect.perform (Compact_state (!memory, !journal)) in
     memory := memory';
     journal := journal';
@@ -668,7 +731,6 @@ let () =
               in
               let written = read_files 0 [] in
               files := written;
-              adopt ();
               note "code" code;
               List.iter
                 (fun line ->
@@ -678,13 +740,24 @@ let () =
                   if tool = "Trace.note" && output <> "" then note "trace" output)
                 (nonempty_lines effects);
               let _unused_traces = traces in
-              let loaded = List.map fst !modules in
-              (match kind with
-              | _ when wants_load task && loaded <> [] -> finish ("已加载 module " ^ String.concat "、" loaded)
-              | "done" | "ask" | "partial" -> finish answer
-              | "continue" ->
-                  if code = last_code then finish answer else loop 0 code
-              | _ -> finish answer)
+              let born =
+                List.filter
+                  (fun (path, content) ->
+                    String.ends_with ~suffix:".ml" path && not (stock path)
+                    && match List.assoc_opt path files0 with Some old -> old <> content | None -> true)
+                  written
+              in
+              let picked = let named = candidates !files in if named <> [] then named else if wants_load task then born else [] in
+              (match if wants_load task then claim picked else None with
+              | Some msg -> finish msg
+              | None -> (
+                  match kind with
+                  | "done" | "ask" | "partial" -> finish (if wants_load task && picked = [] then answer ^ "\n没有加载成 harness。" else answer)
+                  | "continue" when born <> [] -> finish ("已写下 " ^ String.concat "、" (List.map fst born))
+                  | "continue" ->
+                      if code = last_code then finish (if wants_load task then "没有加载成 harness。" else "同一步重复了，没有写出文件。")
+                      else loop 0 code
+                  | _ -> finish answer))
           | other ->
               let msg = "这一步没有跑成：" ^ clip other 160 in
               note "compile" msg;

@@ -52,9 +52,9 @@ export function Workbench() {
   const [seconds, setSeconds] = useState(0);
   const [ready, setReady] = useState(false);
   const [settings, setSettings] = useState(false);
+  const [filesOpen, setFilesOpen] = useState(false);
+  const [keyboardTop, setKeyboardTop] = useState(0);
   const runId = useRef(0);
-  const bottom = useRef<HTMLDivElement>(null);
-  const file = files.find((item) => item.path === selected) ?? files[0];
 
   useEffect(() => {
     if (!running) return;
@@ -104,8 +104,17 @@ export function Workbench() {
   }, [ready, task, files, harnesses, modules, journal, memory, turns]);
 
   useEffect(() => {
-    bottom.current?.scrollIntoView({ block: "end" });
-  }, [turns, running, files.length]);
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const pin = () => setKeyboardTop(viewport.offsetTop);
+    pin();
+    viewport.addEventListener("resize", pin);
+    viewport.addEventListener("scroll", pin);
+    return () => {
+      viewport.removeEventListener("resize", pin);
+      viewport.removeEventListener("scroll", pin);
+    };
+  }, []);
 
   async function go(text: string, resume: boolean) {
     if (!text || running) return;
@@ -136,7 +145,8 @@ export function Workbench() {
       if (touched) setSelected(touched.detail);
       else if (!nextFiles.some((item) => item.path === selected)) setSelected(nextFiles[0]?.path ?? "");
       const spoken = result.ok ? result.answer : result.error;
-      setTurns((current) => [...current, { role: "agent", text: spoken, code: lastCode(result.journal ?? []), steps: result.steps }]);
+      const added = (result.journal ?? []).slice(nextJournal.length);
+      setTurns((current) => [...current, { role: "agent", text: spoken, code: lastCode(added), steps: result.steps }]);
     } catch (caught) {
       if (runId.current !== id) return;
       const message = caught instanceof Error ? caught.message : "没跑成";
@@ -168,82 +178,20 @@ export function Workbench() {
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-2xl flex-col">
-      <header className="sticky top-0 z-10 border-b border-border bg-bg/95 px-4 py-3 backdrop-blur">
+      <header className="px-4 pb-2 pt-3">
         <p className="font-mono text-xs tracking-widest text-muted">OCAGENT</p>
         <h1 className="mt-1 text-lg font-semibold text-fg">用 OCaml 行动的 agent</h1>
-        <p className="mt-1 text-sm leading-6 text-muted">每一轮只执行它写下的一段 OCaml。编译不过，就不行动。它看不见返回值，除非自己用 Trace.note 记下。</p>
       </header>
 
-      <div className="flex flex-1 flex-col gap-4 px-4 py-4">
-        {turns.length === 0 && !running ? (
-          <p className="rounded-2xl border border-border bg-surface px-4 py-4 text-sm leading-6 text-muted">
-            工作区是空的。直接说要做什么。它会把结果写成文件；说「加载进 harness」，写好的 .ml 会出现在设置里。
-          </p>
-        ) : null}
-
-        {turns.map((turn, index) => (
-          <article key={`${turn.role}-${index}`} className={turn.role === "user" ? "ml-8 rounded-2xl bg-raised px-4 py-3" : "mr-6 rounded-2xl border border-border bg-surface px-4 py-3"}>
-            <p className="font-mono text-[11px] tracking-widest text-muted">{turn.role === "user" ? "你" : "OCAGENT"}</p>
-            <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-fg">{turn.text.replaceAll("**", "").replaceAll("`", "")}</p>
-            {turn.code ? (
-              <pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{turn.code}</pre>
-            ) : null}
-            {turn.steps?.length ? (
-              <ul className="mt-3 flex flex-col gap-2">
-                {turn.steps.map((step, stepIndex) => (
-                  <li key={`${step.tool}-${step.detail}-${stepIndex}`} className="min-w-0">
-                    <p className="font-mono text-xs text-fg">
-                      {toolLabel(step.tool)}
-                      {step.detail ? <span className="text-muted"> {step.detail}</span> : null}
-                    </p>
-                    {step.output ? <p className="line-clamp-3 font-mono text-xs leading-5 text-muted">{step.output}</p> : null}
-                  </li>
-                ))}
-              </ul>
-            ) : null}
-          </article>
-        ))}
-
-        {running ? <p className="text-sm text-muted">正在编译并执行 · {seconds} 秒</p> : null}
-        {error ? <p className="text-sm text-danger">{error}</p> : null}
-
-        <section className="rounded-2xl border border-border bg-surface p-4">
-          <div className="flex items-baseline justify-between gap-3">
-            <h2 className="text-sm font-medium text-fg">工作区</h2>
-            <p className="text-xs text-muted">{files.length ? `${files.length} 个文件` : "空"}</p>
-          </div>
-          {files.length === 0 ? <p className="mt-2 text-sm text-muted">还没有文件。</p> : null}
-          {files.length ? (
-            <div className="mt-3 flex gap-2 overflow-x-auto">
-              {files.map((item) => (
-                <button
-                  key={item.path}
-                  type="button"
-                  onClick={() => setSelected(item.path)}
-                  className={`inline-flex min-h-11 shrink-0 items-center rounded-lg border px-3 font-mono text-xs ${item.path === file?.path ? "border-primary bg-primary text-primary-fg" : "border-border bg-bg text-fg"}`}
-                >
-                  {item.path}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          {file ? <pre className="mt-3 max-h-64 overflow-auto rounded-lg bg-bg px-3 py-3 font-mono text-xs leading-5 text-fg">{file.content}</pre> : null}
-        </section>
-        <div ref={bottom} />
-      </div>
-
-      <footer className="sticky bottom-0 border-t border-border bg-bg px-4 py-3">
-        {settings ? (
-          <HarnessPanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} />
-        ) : null}
+      <div className="sticky z-20 border-b border-border bg-bg px-4 py-3" style={{ top: keyboardTop }}>
         <label className="flex flex-col gap-2">
           <span className="sr-only">对它说</span>
           <textarea
             value={task}
             onChange={(event) => setTask(event.target.value)}
-            rows={2}
+            rows={4}
             placeholder="说一件要做完的事"
-            className="w-full resize-none rounded-xl border border-border bg-surface px-3 py-3 text-sm leading-6 text-fg outline-none placeholder:text-muted focus:border-primary"
+            className="w-full resize-y select-text rounded-xl border border-border bg-surface px-3 py-3 text-sm leading-6 text-fg outline-none placeholder:text-muted focus:border-primary"
           />
         </label>
         <div className="mt-2 flex flex-wrap gap-2">
@@ -255,15 +203,76 @@ export function Workbench() {
           >
             {running ? `停下 · ${seconds} 秒` : "发送"}
           </button>
-          <button type="button" onClick={() => setSettings((open) => !open)} className="min-h-11 rounded-lg border border-border px-3 text-sm text-fg">
-            {settings ? "收起 harness" : `Harness ${modules.length ? `· ${modules.length}` : ""}`}
+          <button type="button" onClick={() => { setSettings((open) => !open); setFilesOpen(false); }} className="min-h-11 rounded-lg border border-border px-3 text-sm text-fg">
+            {settings ? "收起 harness" : `Harness${modules.length ? ` · ${modules.length}` : ""}`}
+          </button>
+          <button type="button" onClick={() => { setFilesOpen((open) => !open); setSettings(false); }} className="min-h-11 rounded-lg border border-border px-3 text-sm text-fg">
+            {filesOpen ? "收起工作区" : `工作区${files.length ? ` · ${files.length}` : ""}`}
           </button>
           <button type="button" onClick={reset} className="min-h-11 rounded-lg border border-border px-3 text-sm text-muted">
             清空
           </button>
         </div>
-      </footer>
+      </div>
+
+      <div className="flex flex-1 flex-col gap-4 px-4 py-4 pb-16">
+        {turns.length === 0 && !running ? (
+          <p className="rounded-2xl border border-border bg-surface px-4 py-4 text-sm leading-6 text-muted">
+            直接说要做什么。最新的一步会出现在这里。
+          </p>
+        ) : null}
+        {running ? <p className="text-sm text-muted">正在编译并执行 · {seconds} 秒</p> : null}
+        {settings ? <HarnessPanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} /> : null}
+        {filesOpen ? <WorkspacePanel files={files} selected={selected} onSelect={setSelected} /> : null}
+
+        {[...turns.entries()].reverse().map(([index, turn]) => (
+          <article key={`${turn.role}-${index}`} className={`select-text ${turn.role === "user" ? "ml-8 rounded-2xl bg-raised px-4 py-3" : "mr-6 rounded-2xl border border-border bg-surface px-4 py-3"}`}>
+            <p className="font-mono text-[11px] tracking-widest text-muted">{turn.role === "user" ? "你" : "OCAGENT"}</p>
+            <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-fg">{turn.text.replaceAll("**", "").replaceAll("`", "")}</p>
+            {turn.steps?.length ? (
+              <ul className="mt-3 flex flex-col gap-2">
+                {[...turn.steps].reverse().map((step, stepIndex) => (
+                  <li key={`${step.tool}-${step.detail}-${stepIndex}`} className="min-w-0">
+                    <p className="font-mono text-xs text-fg">
+                      {toolLabel(step.tool)}
+                      {step.detail ? <span className="text-muted"> {step.detail}</span> : null}
+                    </p>
+                    {step.output ? <p className="line-clamp-2 font-mono text-xs leading-5 text-muted">{step.output}</p> : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {turn.code ? (
+              <pre className="mt-3 max-h-36 overflow-auto rounded-lg bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{turn.code}</pre>
+            ) : null}
+          </article>
+        ))}
+
+        {error ? <p className="text-sm text-danger">{error}</p> : null}
+      </div>
     </main>
+  );
+}
+
+function WorkspacePanel({ files, selected, onSelect }: { files: DeskFile[]; selected: string; onSelect: (path: string) => void }) {
+  const file = files.find((item) => item.path === selected) ?? files[0];
+  return (
+    <section className="rounded-2xl border border-border bg-surface p-3">
+      {files.length === 0 ? <p className="text-sm text-muted">还没有文件。</p> : null}
+      <div className="flex flex-wrap gap-2">
+        {files.map((item) => (
+          <button
+            key={item.path}
+            type="button"
+            onClick={() => onSelect(item.path)}
+            className={`inline-flex min-h-11 items-center rounded-lg border px-3 font-mono text-xs ${item.path === file?.path ? "border-primary bg-primary text-primary-fg" : "border-border bg-bg text-fg"}`}
+          >
+            {item.path}
+          </button>
+        ))}
+      </div>
+      {file ? <pre className="mt-3 max-h-36 overflow-auto rounded-lg bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{file.content}</pre> : null}
+    </section>
   );
 }
 
@@ -279,42 +288,35 @@ function HarnessPanel({
   setModules: (next: DeskModule[]) => void;
 }) {
   return (
-    <section className="mb-3 rounded-2xl border border-border bg-surface p-3">
-      <p className="text-xs leading-5 text-muted">Step 里永远有 Trace 和 Clock。下面三个可以开关。加载的 module 来自它写的 .ml。</p>
-      <ul className="mt-2 flex flex-col gap-2">
+    <section className="rounded-2xl border border-border bg-surface p-3">
+      <div className="flex flex-wrap gap-2">
         {SWITCHES.map((item) => {
           const on = harnesses.includes(item.id);
           return (
-            <li key={item.id} className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <p className="font-mono text-sm text-fg">{item.moduleName}</p>
-                <p className="text-xs text-muted">{item.summary}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setHarnesses(on ? harnesses.filter((kept) => kept !== item.id) : [...harnesses, item.id])}
-                className={`inline-flex min-h-11 shrink-0 items-center rounded-md border px-3 text-sm ${on ? "border-border text-fg" : "border-primary bg-primary text-primary-fg"}`}
-              >
-                {on ? "开" : "关"}
-              </button>
-            </li>
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setHarnesses(on ? harnesses.filter((kept) => kept !== item.id) : [...harnesses, item.id])}
+              className={`inline-flex min-h-11 items-center rounded-lg border px-3 font-mono text-sm ${on ? "border-primary bg-primary text-primary-fg" : "border-border bg-bg text-muted"}`}
+            >
+              {item.moduleName}
+            </button>
           );
         })}
-      </ul>
-      <h3 className="mt-3 text-sm text-fg">已加载</h3>
-      {modules.length === 0 ? <p className="mt-1 text-sm text-muted">还没有。</p> : null}
-      <ul className="mt-2 flex flex-col gap-2">
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {modules.length === 0 ? <p className="text-sm text-muted">还没有加载的 module。</p> : null}
         {modules.map((mod) => (
-          <li key={mod.name} className="rounded-lg border border-border bg-bg px-3 py-2">
-            <div className="flex items-center justify-between gap-3">
-              <p className="font-mono text-sm text-fg">module {mod.name}</p>
-              <button type="button" onClick={() => setModules(modules.filter((item) => item.name !== mod.name))} className="min-h-11 px-2 text-sm text-muted">
-                拿下
-              </button>
-            </div>
-          </li>
+          <button
+            key={mod.name}
+            type="button"
+            onClick={() => setModules(modules.filter((item) => item.name !== mod.name))}
+            className="inline-flex min-h-11 items-center rounded-lg border border-border bg-bg px-3 font-mono text-sm text-fg"
+          >
+            {mod.name} · 拿下
+          </button>
         ))}
-      </ul>
+      </div>
     </section>
   );
 }
