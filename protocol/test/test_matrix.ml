@@ -1,6 +1,21 @@
 let fail msg = failwith msg
 
+let contains hay needle =
+  let n = String.length hay and m = String.length needle in
+  let rec loop i = i + m <= n && (String.sub hay i m = needle || loop (i + 1)) in
+  m = 0 || loop 0
+
 let () =
+  let nasty =
+    Ocagent_protocol.Fetch.canonical
+      (Ocagent_protocol.Fetch.of_parts ~meth:"GET" ~url:"a\t\x00\"中" ~body:"x\\y")
+  in
+  if Ocagent_protocol.Fetch.has_raw_control nasty then fail "控制字符没有被转义";
+  if not (contains nasty "\\u0009") then fail "tab";
+  if not (contains nasty "\\u0000") then fail "nul";
+  if not (contains nasty "中") then fail "中文";
+  if not (contains nasty {|{"body":|}) then fail "键顺序";
+  if not (Ocagent_protocol.Fetch.has_raw_control "\t") then fail "原始 tab 应被拒绝";
   let need tree name =
     match Ocagent_protocol.covered tree name with
     | [] -> fail ("missing " ^ name)

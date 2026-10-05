@@ -24,6 +24,9 @@ type entry = {
   idempotency_key : string;
   mutable attempt : int;
   mutable idempotent : bool;
+  mutable dispatched : bool;
+  mutable recovery : string;
+  mutable callback_id : string;
   ts : int;
   mutable last_hit : hit;
 }
@@ -83,6 +86,9 @@ let entry_json (e : entry) =
       ("idempotency_key", Json.String e.idempotency_key);
       ("attempt", Json.Int e.attempt);
       ("idempotent", Json.Bool e.idempotent);
+      ("dispatched", Json.Bool e.dispatched);
+      ("recovery", Json.String e.recovery);
+      ("callback_id", Json.String e.callback_id);
       ("ts", Json.Int e.ts);
       ("last_hit", hit_json e.last_hit);
     ]
@@ -103,6 +109,10 @@ let entry_of_json j =
     attempt = (match Json.field_opt "attempt" j with Some (Json.Int n) -> n | _ -> 1);
     idempotent =
       (match Json.field_opt "idempotent" j with Some (Json.Bool b) -> b | _ -> true);
+    dispatched = (match Json.field_opt "dispatched" j with Some (Json.Bool b) -> b | _ -> false);
+    recovery =
+      (match Json.field_opt "recovery" j with Some (Json.String s) -> s | _ -> "Manual_only");
+    callback_id = (match Json.field_opt "callback_id" j with Some (Json.String s) -> s | _ -> "");
     ts = Json.int_field "ts" j;
     last_hit;
   }
@@ -175,6 +185,8 @@ let slim_line (e : entry) =
          ("idempotency_key", Json.String e.idempotency_key);
          ("attempt", Json.Int e.attempt);
          ("idempotent", Json.Bool e.idempotent);
+         ("dispatched", Json.Bool e.dispatched);
+         ("recovery", Json.String e.recovery);
          ("ts", Json.Int e.ts);
        ])
 

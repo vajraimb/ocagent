@@ -22,7 +22,8 @@
 
 `test_model_replay_chain` 是同进程里的重放模型：`exit_process` 不启动新进程，JSONL 只在内存里往返，Fetch 默认返回固定字符串。它证明的是日志分支，不是磁盘或网络。
 
-`test_process_recover` 才跨过进程边界。进程 A 把日志原子写入磁盘后退出。批准走 `Store.commit_decision`，再写一次同样的决定不会改记录。进程 B 只读磁盘，向本机 HTTP 计数服务发一次 Fetch。进程 C 重放，HTTP 计数和 Llm 执行计数都不再增加。非幂等且仍是 Pending 的记录会先标成 Unknown，恢复时不重做。旧 attempt 的 `commit_result` 写不进去。半截内容只出现在 `.tmp` 时，正式文件保持原样。
+`test_process_recover` 跨过进程边界。快照是带版本、校验和的完整文件：临时文件 fsync 之后才改名，锁文件不会被一起换掉。批准只走 `Store.commit_decision`：同一次决定再写一次不改记录，冲突决定和拿 Llm 记录去批准都会被拒绝。旧 attempt 写不进去。进程 B 向本机 HTTP 计数服务发 Fetch，计数在响应发出前落盘。进程 C 重放时 HTTP 和模型计数都不再增加。在 provider 已确认、Done 还没提交时 SIGKILL，下次打开会把这条 `Manual_only` 记成 Unknown，不再请求。这还不是工作台里的可恢复执行，浏览器那条路径仍是 legacy。
+
 
 这些测试没有覆盖多机选举。幂等的 Pending（例如还没写完 Done 的 GET）恢复时仍会再执行一次。
 

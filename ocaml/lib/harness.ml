@@ -394,6 +394,9 @@ let make_entry ctx seq (type a) (e : a Effect.t) =
     idempotency_key = Printf.sprintf "%s:%d:%s" ctx.journal.run_id seq hash;
     attempt = 1;
     idempotent = true;
+    dispatched = false;
+    recovery = "memory";
+    callback_id = "";
     ts = ctx.world.clock + seq;
     last_hit = Journal.Execute;
   }

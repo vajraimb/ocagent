@@ -3,16 +3,15 @@
     through [Store.commit_decision]. B loads the file and performs Fetch against
     the counter. C replays; the counter must not move. *)
 
-module H = Ocagent_harness.Harness
+module D = Ocagent_harness.Durable
 module J = Ocagent_harness.Journal
 module P = Ocagent_harness.Proto
 module S = Ocagent_harness.Store
-module W = Ocagent_harness.World
 module Json = Ocagent_harness.Json
 
 let fail fmt = Printf.ksprintf failwith fmt
 
-let journal_path dir = Filename.concat dir "journal.jsonl"
+let journal_path dir = Filename.concat dir "snapshot.json"
 let port_path dir = Filename.concat dir "port"
 let http_path dir = Filename.concat dir "http.count"
 let effect_path dir = Filename.concat dir "effects.log"
@@ -86,11 +85,6 @@ let agent url () =
       let page = Effect.perform (P.Fetch { url }) in
       if page.status = 200 && P.contains page.body "spec-body" then "done" else "bad:" ^ page.body
 
-let record_executes dir world =
-  List.iter
-    (fun (side : W.side) -> if not side.duplicate then note (effect_path dir) side.name)
-    world.W.log
-
 let serve dir =
   let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
   Unix.setsockopt sock Unix.SO_REUSEADDR true;
@@ -113,24 +107,21 @@ let serve dir =
     let client, _ = Unix.accept sock in
     let tmp = Bytes.create 1024 in
     let (_ : int) = Unix.read client tmp 0 1024 in
+    note (http_path dir) "hit";
     let rec write_all off len =
       if len > 0 then
         let n = Unix.write_substring client resp off len in
         write_all (off + n) (len - n)
     in
     write_all 0 (String.length resp);
-    Unix.close client;
-    note (http_path dir) "hit"
+    Unix.close client
   done
 
 let worker_a dir url =
-  let world = W.create () in
-  let session = H.run ~profile:H.Prod ~run_id:"proc" ~world (agent url) in
-  if session.result.status <> H.Suspended then fail "A 应在审批处挂起";
-  let exited = session.exit_process () in
-  S.save (journal_path dir) exited.result.journal;
-  record_executes dir world;
-  exit 0
+  match D.run ~dir ~fetch:http_get (agent url) with
+  | D.Suspended -> exit 0
+  | D.Finished text -> fail "A 不应完成：%s" text
+  | D.Blocked msg -> fail "A 被阻塞：%s" msg
 
 let ask_seq journal =
   match
@@ -151,57 +142,37 @@ let worker_approve dir =
   (match S.commit_decision path seq decision with
   | Ok () -> ()
   | Error msg -> fail "重复审批应被接受为同一次：%s" msg);
-  let again = S.load path in
-  (match J.nth again seq with
+  (match S.commit_decision path seq (P.decision_json (P.Rejected "no")) with
+  | Error _ -> ()
+  | Ok () -> fail "冲突的审批决定被接受了");
+  (match S.commit_decision path 0 decision with
+  | Error _ -> ()
+  | Ok () -> fail "非审批记录被批准了");
+  (match J.nth (S.load path) seq with
   | Some entry when entry.status = J.Done -> ()
   | _ -> fail "审批没有落盘");
   exit 0
 
-let run_loaded dir url =
-  let world = W.create () in
-  world.fetch <- Some http_get;
-  let session =
-    H.run ~profile:H.Prod ~run_id:"proc" ~journal:(S.load (journal_path dir)) ~world (agent url)
-  in
-  record_executes dir world;
-  (session, world)
-
 let worker_b dir url =
-  let session, _ = run_loaded dir url in
-  (match session.result.status with
-  | H.Done "done" -> ()
-  | H.Done text -> fail "B 结果 %s" text
-  | H.Failed e -> fail "B 失败：%s" (H.describe e)
-  | H.Suspended -> fail "B 仍挂起"
-  | H.Crashed { seq; window } -> fail "B 崩溃 %d %s" seq window);
-  S.save (journal_path dir) session.result.journal;
-  exit 0
+  match D.run ~dir ~fetch:http_get (agent url) with
+  | D.Finished "done" -> exit 0
+  | D.Finished text -> fail "B 结果 %s" text
+  | D.Suspended -> fail "B 仍挂起"
+  | D.Blocked msg -> fail "B 被阻塞：%s" msg
 
 let worker_c dir url =
-  let session, world = run_loaded dir url in
-  (match session.result.status with
-  | H.Done "done" -> ()
-  | H.Failed e -> fail "C 失败：%s" (H.describe e)
-  | _ -> fail "C 没有完成");
-  if world.log <> [] then fail "C 又执行了 world";
-  if world.sandbox_execs <> 0 then fail "C 又进了沙箱";
-  exit 0
+  match D.run ~dir ~fetch:http_get (agent url) with
+  | D.Finished "done" -> exit 0
+  | D.Blocked msg -> fail "C 被阻塞：%s" msg
+  | D.Suspended -> fail "C 仍挂起"
+  | D.Finished text -> fail "C 结果 %s" text
 
-let worker_uncertain dir =
-  let path = journal_path dir in
-  let journal = S.load path in
-  (match List.find_opt (fun entry -> entry.J.kind = "Fetch") !(journal.entries) with
-  | None -> fail "没有 Fetch 记录"
-  | Some entry ->
-      entry.status <- J.Pending;
-      entry.idempotent <- false;
-      entry.result <- Json.Null);
-  S.save path journal;
-  ignore (S.refuse_uncertain path);
-  (match List.find_opt (fun entry -> entry.J.kind = "Fetch") !((S.load path).J.entries) with
-  | Some entry when entry.status = J.Unknown -> ()
-  | _ -> fail "非幂等 Pending 应标成 Unknown");
-  exit 0
+let worker_resume dir url =
+  match D.run ~dir ~fetch:http_get (agent url) with
+  | D.Blocked msg when P.contains msg "结果未知" -> exit 0
+  | D.Blocked msg -> fail "恢复没有停在未知：%s" msg
+  | D.Finished _ -> fail "未知结果被重做并完成了"
+  | D.Suspended -> fail "未知结果变成了挂起"
 
 let worker_stale dir =
   let path = journal_path dir in
@@ -230,6 +201,15 @@ let spawn args =
   | _, Unix.WEXITED 0 -> ()
   | _, Unix.WEXITED code -> fail "子进程退出 %d (%s)" code (String.concat " " args)
   | _, _ -> fail "子进程被信号结束"
+
+let spawn_kill args =
+  let pid =
+    Unix.create_process Sys.argv.(0) (Array.of_list (Sys.argv.(0) :: args)) Unix.stdin Unix.stdout Unix.stderr
+  in
+  match Unix.waitpid [] pid with
+  | _, Unix.WSIGNALED _ -> ()
+  | _, Unix.WEXITED code -> fail "应被 SIGKILL，实际退出 %d" code
+  | _, _ -> fail "子进程没有被 SIGKILL"
 
 let wait_port dir =
   let rec loop n =
@@ -274,25 +254,32 @@ let parent () =
       if count_lines (http_path dir) <> 1 then fail "C 又请求了 HTTP";
       if effects_of dir "Llm" <> llm_after_b then fail "C 又执行了 Llm";
       if effects_of dir "Fetch" <> 1 then fail "C 又执行了 Fetch";
-      spawn [ "uncertain"; dir ];
-      let world = W.create () in
-      world.fetch <- Some http_get;
-      let refused =
-        H.run ~profile:H.Prod ~run_id:"proc" ~journal:(S.load (journal_path dir)) ~world (agent url)
-      in
-      (match refused.result.status with
-      | H.Failed (H.Harness msg) when P.contains msg "结果未知" -> ()
-      | H.Failed e -> fail "Unknown 恢复：%s" (H.describe e)
-      | _ -> fail "非幂等 Pending 被重做了");
-      if count_lines (http_path dir) <> 1 then fail "拒绝重做之后 HTTP 又增加了";
-      let good = S.load (journal_path dir) in
-      let tmp = journal_path dir ^ ".tmp" in
-      let oc = open_out tmp in
+      let half = journal_path dir ^ ".half.tmp" in
+      let oc = open_out half in
       output_string oc "{";
       close_out oc;
       ignore (S.load (journal_path dir));
-      Sys.remove tmp;
-      if J.slim good <> J.slim (S.load (journal_path dir)) then fail "未改名的半截文件覆盖了日志");
+      Sys.remove half;
+      let kill_dir = Filename.concat dir "kill" in
+      Unix.mkdir kill_dir 0o755;
+      spawn [ "a"; kill_dir; url ];
+      spawn [ "approve"; kill_dir ];
+      let barrier = Filename.concat kill_dir "barrier" in
+      let oc = open_out barrier in
+      output_string oc "after-provider";
+      close_out oc;
+      let before = count_lines (http_path dir) in
+      spawn_kill [ "b"; kill_dir; url ];
+      if count_lines (http_path dir) <> before + 1 then fail "SIGKILL 前 fixture 应已计数";
+      Sys.remove barrier;
+      spawn [ "resume"; kill_dir; url ];
+      if count_lines (http_path dir) <> before + 1 then fail "Unknown 之后又请求了 HTTP";
+      let oc = open_out (journal_path kill_dir) in
+      output_string oc "OCAGENT 1\nrevision 1\nrecords 0\nchecksum 00000000\n";
+      close_out oc;
+      match S.load (journal_path kill_dir) with
+      | _ -> fail "损坏的快照被读入了"
+      | exception S.Corrupt _ -> ());
   print_endline "process recover ok"
 
 let () =
@@ -303,6 +290,6 @@ let () =
   | _ :: "approve" :: dir :: _ -> worker_approve dir
   | _ :: "b" :: dir :: url :: _ -> worker_b dir url
   | _ :: "c" :: dir :: url :: _ -> worker_c dir url
+  | _ :: "resume" :: dir :: url :: _ -> worker_resume dir url
   | _ :: "stale" :: dir :: _ -> worker_stale dir
-  | _ :: "uncertain" :: dir :: _ -> worker_uncertain dir
   | _ -> parent ()

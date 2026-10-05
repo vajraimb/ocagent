@@ -77,12 +77,12 @@ module Fetch = struct
   let escape s =
     let buf = Buffer.create (String.length s + 8) in
     String.iter
-      (function
-        | '"' -> Buffer.add_string buf "\\\""
-        | '\\' -> Buffer.add_string buf "\\\\"
-        | '\n' -> Buffer.add_string buf "\\n"
-        | '\r' -> Buffer.add_string buf "\\r"
-        | c -> Buffer.add_char buf c)
+      (fun c ->
+        let code = Char.code c in
+        if c = '"' then Buffer.add_string buf "\\\""
+        else if c = '\\' then Buffer.add_string buf "\\\\"
+        else if code < 32 then Printf.bprintf buf "\\u%04x" code
+        else Buffer.add_char buf c)
       s;
     Buffer.contents buf
 
@@ -90,5 +90,41 @@ module Fetch = struct
 
   let canonical { meth; url; body } =
     Printf.sprintf {|{"body":%s,"meth":%s,"url":%s}|} (quote body) (quote meth) (quote url)
+
+  let has_raw_control s =
+    let rec loop i =
+      if i >= String.length s then false
+      else
+        let code = Char.code s.[i] in
+        if code < 32 then true else loop (i + 1)
+    in
+    loop 0
 end
+
+module Policy = struct
+  type t =
+    | Workspace_transactional
+    | Read_retryable of int
+    | Provider_idempotent
+    | Reconcile
+    | Manual_only
+
+  let name = function
+    | Workspace_transactional -> "Workspace_transactional"
+    | Read_retryable n -> "Read_retryable:" ^ string_of_int n
+    | Provider_idempotent -> "Provider_idempotent"
+    | Reconcile -> "Reconcile"
+    | Manual_only -> "Manual_only"
+
+  let of_name s =
+    match s with
+    | "Workspace_transactional" -> Workspace_transactional
+    | "Provider_idempotent" -> Provider_idempotent
+    | "Reconcile" -> Reconcile
+    | "Manual_only" -> Manual_only
+    | other when String.starts_with ~prefix:"Read_retryable:" other ->
+        Read_retryable (int_of_string (String.sub other 16 (String.length other - 16)))
+    | other -> failwith ("unknown recovery " ^ other)
+end
+
 
