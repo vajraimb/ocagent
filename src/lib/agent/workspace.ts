@@ -8,33 +8,7 @@ export type ToolStep = {
 
 export type JournalItem = { kind: string; text: string };
 
-export const SEED: DeskFile[] = [
-  {
-    path: "README.md",
-    content: `# desk
-
-一个很小的工作区。这里不只有 src/math.ml：还有问候函数和一张待办。
-
-## 怎么跑
-
-（还没写）
-`,
-  },
-  {
-    path: "src/math.ml",
-    content: "let add x y = x - y\n",
-  },
-  {
-    path: "src/greet.ml",
-    content: 'let hello name = "hi " ^ name\n',
-  },
-  {
-    path: "notes/todo.md",
-    content: `- 把 add 改成真正的加法
-- 补上 README 的运行说明
-`,
-  },
-];
+export const SEED: DeskFile[] = [];
 
 const MAX_FILES = 24;
 const MAX_CONTENT = 8000;

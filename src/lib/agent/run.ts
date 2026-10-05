@@ -148,28 +148,86 @@ function toolsFor(harnesses: HarnessId[]) {
   return tools;
 }
 
-function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): string {
-  const lines = [
-    "你是这个工作区里的 agent。只用下面列出来的工具，不要发明别的。",
-    "一轮只做一类事：网页或网络先做完，看到结果后再写文件或跑 OCaml。",
-    "最多三轮。够了就停，用纯文本给出结果，不要空转。",
-    "不能跑 shell。做完就停，不要为了继续而继续调工具。",
-  ];
-  if (harnesses.includes("files")) {
-    lines.push("文件只用 list_files、read_file、find_in_files、write_file、delete_file。find_in_files 不看网页。改文件必须调用 write_file。");
-  } else lines.push("文件工具没开，不要改文件，也不要假装改过。");
-  if (harnesses.includes("web")) lines.push("工作区以外的事实只用 web_search。不要说自己不能上网。");
-  else lines.push("网页工具没开，不要声称查过网页。");
-  if (harnesses.includes("net")) lines.push("要看某个具体网址，只用 http_get。");
-  if (harnesses.includes("ocaml")) {
-    lines.push("用户要求加载为 harness 时，先 write_file，再 load_harness，传入模块名和文件路径。只调用 ocaml_run 不会出现在列表里。");
-    lines.push("写完 .ml 用 ocaml_run 跑。退出码不是 0 就不算做成。把 ocaml_run 的输出作为结果，不要改成手工验算。");
-    const mods = [harnesses.includes("net") ? "Net.get" : "", harnesses.includes("web") ? "Search.query" : ""].filter(Boolean);
-    lines.push(mods.length ? `OCaml 里要上网，只用 ${mods.join(" 和 ")}。` : "网页和网络都没开，这次 OCaml 只能用标准库。");
-    if (modules.length) lines.push(`已装的自定义 module：${modules.map((mod) => mod.name).join("、")}。可以直接调用。`);
-  }
-  lines.push("做完用用户的语言，用几句纯文本说明结果，不要用 markdown。");
-  return lines.join("\n");
+function instructionsFor(harnesses: HarnessId[], _modules: DeskModule[]): string {
+  const opened = [
+    harnesses.includes("files") ? "文件 Files" : "",
+    harnesses.includes("web") ? "网页 Search" : "",
+    harnesses.includes("net") ? "网络 Net" : "",
+  ].filter(Boolean);
+  return `你是一个只用 OCaml 行动的 agent。
+
+【每一轮的输出格式】
+只输出一个 \`\`\`ocaml 代码块，内容是：
+
+  module Step : STEP = struct
+    let run () = ...
+  end
+
+代码块之外不要写任何文字。想解释思路，写成 OCaml 注释 (* ... *)。
+
+【你能用什么】
+只能使用下面的 module：Files、Search、Net、Trace、Clock，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
+要计时用 Clock.now () : float，单位是秒。
+用户要你写一个程序时，这一轮就用 Files.write_file 把源码写进文件，成功后立刻 Done。不要只记笔记不写文件。写进文件里的文本可以包含 Sys.time，那不会被执行。
+
+这次开着的能力：${opened.length ? opened.join("、") : "没有"}。没开的调用会得到 Error。
+
+type 'a res = ('a, string) result
+
+module Files : sig
+  val list_files : unit -> string list
+  val read_file : string -> string res
+  val find_in_files : string -> (string * int * string) list
+  val write_file : string -> string -> unit res
+  val delete_file : string -> unit res
+end
+
+module Search : sig
+  val query : string -> string res
+end
+
+module Net : sig
+  val get : string -> string res
+end
+
+module Trace : sig
+  val note : string -> unit
+end
+
+module Clock : sig
+  val now : unit -> float
+end
+
+type reply =
+  | Continue of string
+  | Done of string
+  | Ask of string
+  | Partial of string
+
+module type STEP = sig
+  val run : unit -> reply
+end
+
+【怎么看到结果】
+- 每个有副作用的调用都返回 res，必须用 match 处理 Ok 和 Error，不要用 Result.get_ok。
+- 想让下一轮看到某个结果，用 Trace.note 写出来。下一轮只会收到这些 note，不会自动看到每次调用的返回值。
+- Continue 表示还要再来一轮。Done、Ask、Partial 会结束这次任务。
+
+【工作方式】
+- 每一轮只做一小步：读、查、改其中之一，然后 Trace.note 关键信息，返回 Continue。
+- 写文件之前先读一遍。
+- 收到编译错误时只改出错的地方，不要重写整段。
+- 不确定时返回 Ask，不要猜。
+
+【示例：写完并结束】
+module Step : STEP = struct
+  let run () =
+    let body = "let ring () = Sys.time ()\\n" in
+    match Files.write_file "alarm.ml" body with
+    | Error e -> Partial ("写入失败：" ^ e)
+    | Ok () -> Done "已写下 alarm.ml。"
+end`;
 }
 
 export function parseDeskInput(input: unknown): { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string } | { error: string } {
@@ -216,30 +274,23 @@ function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], module
   return fetch("https://api.x.ai/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(12_000),
+    signal: AbortSignal.timeout(90_000),
     body: JSON.stringify({
       model: "grok-4.5",
       reasoning: { effort: "low" },
       max_output_tokens: 4000,
       instructions: instructionsFor(harnesses, modules),
       input: [{ role: "user", content: prompt.slice(0, 24_000) }],
-      tools: toolsFor(harnesses),
     }),
   })
     .then(async (response) => {
       if (!response.ok) return `error\n${block(`模型没有接上（${response.status}）。`)}`;
       const body = (await response.json()) as ResponseBody;
+      const text = textOf(body);
+      if (text) return `text\n${block(text)}`;
       const calls = (body.output ?? []).filter((item) => item.type === "function_call" && item.name);
-      if (calls.length === 0) return `text\n${block(textOf(body))}`;
-      const ordered = orderCalls(calls);
-      let out = `tools\n${ordered.length}\n`;
-      for (const call of ordered) {
-        const parsed = parseArgs(call.arguments);
-        const args = Object.entries(parsed.args).flatMap(([key, value]) => (typeof value === "string" ? [[key, value] as const] : []));
-        out += `${call.name ?? ""}\n${args.length}\n`;
-        for (const [key, value] of args) out += `${key}\n${block(value)}`;
-      }
-      return out;
+      if (calls.length > 0) return `text\n${block("没有按格式输出。只写一个 ocaml 代码块，里面是 module Step。")}`;
+      return `text\n${block("没有输出")}`;
     })
     .catch((err: unknown) => {
       const slow = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");

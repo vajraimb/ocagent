@@ -135,13 +135,13 @@ export function prelude(enabled: HarnessId[], modules: DeskModule[] = []): strin
 
 const MODULE_NAME = /^[A-Z][A-Za-z0-9_]{0,24}$/;
 const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml"]);
-const BANNED = /[#]|Unix\b|\bopen_in\b|\bopen_out\b|\bcall\b|\bObj\b|\bMarshal\b|Sys\.(command|getenv|readdir|chdir|remove|rename|set_signal)\b/;
+const BANNED = /\bopen_in\b|\bopen_out\b|\bObj\.|\bMarshal\.|#\s*(load|use|directory|mod_use)|Sys\.(command|getenv|readdir|chdir|remove|rename|set_signal)\b/;
 
 export function checkModule(name: string, body: string): DeskModule | null {
   const moduleName = name.trim();
   const source = body.trim();
   if (!MODULE_NAME.test(moduleName) || RESERVED.has(moduleName)) return null;
-  if (!source || source.length > 2500 || BANNED.test(source)) return null;
+  if (!source || source.length > 8000 || BANNED.test(source)) return null;
   return { name: moduleName, body: source };
 }
 

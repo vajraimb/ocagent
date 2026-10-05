@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,16 @@ import { searchWeb } from "./search.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 const SYSTEM_OCAML = "/root/.opam/5.3.0/bin/ocaml";
+
+async function installBin(src: string, dest: string): Promise<void> {
+  try {
+    await copyFile(src, dest);
+  } catch (err) {
+    const code = err && typeof err === "object" && "code" in err ? String(err.code) : "";
+    if (code !== "ETXTBSY") throw err;
+  }
+  await chmod(dest, 0o755);
+}
 
 async function exists(file: string): Promise<boolean> {
   try {
@@ -119,7 +129,7 @@ export async function runOcaml(
     : null;
 
   await ensureRuntime();
-  const dir = await mkdtemp(path.join(RUNTIME, "runs", "ml-"));
+  const dir = await mkdtemp(rt("runs", "ml-"));
   try {
     for (const file of files) {
       if (!file.path.endsWith(".ml") || !safePath(file.path)) continue;
@@ -144,11 +154,11 @@ export async function runOcaml(
       extra.OCAGENT_PORT = String(bridge.port);
       extra.OCAGENT_TOKEN = bridge.token;
     }
-    const runtimeLib = "/usr/lib/ocagent-rt/lib";
+    const runtimeLib = rt("lib");
     extra.OCAMLLIB = runtimeLib;
     extra.CAMLLIB = runtimeLib;
-    const run = "/usr/lib/ocagent-rt/ocamlrun";
-    const image = "/usr/lib/ocagent-rt/ocaml";
+    const run = rt("ocamlrun");
+    const image = rt("ocaml");
     const ran = await execute(run, [image, path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 8_000 });
     return ran.text;
   } finally {
@@ -227,8 +237,8 @@ function execute(
       resolve({ text, timedOut: timeout });
     };
     const env = { PATH: "/usr/bin:/bin", HOME: cwd, TMPDIR: cwd, LANG: "C.UTF-8", ...extra };
-    const child = opts?.sandbox
-      ? spawn("unshare", ["--user", "--map-root-user", "--mount", "/usr/lib/ocagent-rt/enter.sh", cwd, bin, ...args], {
+    const child = opts?.sandbox && sandboxReady
+      ? spawn(unshareBin, ["--user", "--map-root-user", "--mount", rt("enter.sh"), cwd, bin, ...args], {
           cwd,
           env,
           stdio: ["ignore", "pipe", "pipe"],
@@ -274,26 +284,60 @@ function execute(
   });
 }
 
-const RUNTIME = "/usr/lib/ocagent-rt";
+const PREFERRED_RUNTIME = "/usr/lib/ocagent-rt";
+let runtimeRoot = path.join(tmpdir(), "ocagent-rt");
+let sandboxReady = false;
+let unshareBin = "";
+
+function rt(...parts: string[]): string {
+  return path.join(runtimeRoot, ...parts);
+}
+
+async function chooseRuntime(): Promise<void> {
+  const fallback = path.join(tmpdir(), "ocagent-rt");
+  for (const root of [PREFERRED_RUNTIME, fallback]) {
+    try {
+      await mkdir(root, { recursive: true });
+      const probe = path.join(root, ".write-probe");
+      await writeFile(probe, "ok");
+      await rm(probe, { force: true });
+      runtimeRoot = root;
+      return;
+    } catch {
+      /* this location is missing or read-only; try the next one */
+    }
+  }
+  throw new Error("没有可写的运行目录");
+}
 
 export async function ensureRuntime(): Promise<void> {
-  await mkdir(`${RUNTIME}/lib`, { recursive: true });
-  await mkdir(`${RUNTIME}/empty`, { recursive: true });
-  await mkdir(`${RUNTIME}/runs`, { recursive: true });
+  await chooseRuntime();
+  await mkdir(rt("lib"), { recursive: true });
+  await mkdir(rt("empty"), { recursive: true });
+  await mkdir(rt("runs"), { recursive: true });
   const run = await fileAt("ocamlrun");
   const image = await fileAt("ocaml");
   if (!run || !image) throw new Error("没有 OCaml 运行器");
-  await copyFile(run, `${RUNTIME}/ocamlrun`);
-  await copyFile(image, `${RUNTIME}/ocaml`);
-  await chmod(`${RUNTIME}/ocamlrun`, 0o755);
+  await installBin(run, rt("ocamlrun"));
+  await installBin(image, rt("ocaml"));
   const lib = await ensureLib();
   if (!lib) throw new Error("标准库没有装上");
   for (const name of STDLIB_FILES) {
-    await copyFile(path.join(lib, name), `${RUNTIME}/lib/${name}`);
+    await copyFile(path.join(lib, name), rt("lib", name));
   }
-  await copyFile("/bin/sh", `${RUNTIME}/sh-real`);
-  await chmod(`${RUNTIME}/sh-real`, 0o755);
-  const wrapper = `#!${RUNTIME}/sh-real
+  sandboxReady = false;
+  unshareBin = "";
+  if (runtimeRoot.startsWith(tmpdir())) return;
+  for (const candidate of ["/usr/bin/unshare", "/bin/unshare"]) {
+    if (await exists(candidate)) {
+      unshareBin = candidate;
+      break;
+    }
+  }
+  if (!unshareBin || !(await exists("/bin/sh"))) return;
+  await copyFile("/bin/sh", rt("sh-real"));
+  await chmod(rt("sh-real"), 0o755);
+  const wrapper = `#!${rt("sh-real")}
 cmd=$2
 if [ "$1" != "-c" ]; then
   echo "沙箱拒绝了这条命令" >&2
@@ -308,28 +352,29 @@ case $cmd in
   *";"*|*"|"*|*"&"*) echo "沙箱拒绝了这条命令" >&2
      exit 126 ;;
 esac
-exec ${RUNTIME}/sh-real -c "$cmd"
+exec ${rt("sh-real")} -c "$cmd"
 `;
-  await writeFile(`${RUNTIME}/sh`, wrapper, { mode: 0o755 });
-  const enter = `#!${RUNTIME}/sh-real
+  await writeFile(rt("sh"), wrapper, { mode: 0o755 });
+  const enter = `#!${rt("sh-real")}
 work=$1
 shift
-mount --bind ${RUNTIME}/sh /bin/sh || exit 1
+mount --bind ${rt("sh")} /bin/sh || exit 1
 for d in /workspace /root /home /opt /var /usr/local /etc /proc /sys; do
   if [ -d "$d" ]; then
-    mount --bind ${RUNTIME}/empty "$d" && mount -o remount,bind,ro "$d" || true
+    mount --bind ${rt("empty")} "$d" && mount -o remount,bind,ro "$d" || true
   fi
 done
 mount -t tmpfs tmpfs /tmp || exit 1
 mkdir -p /tmp/work
 mount --bind "$work" /tmp/work || exit 1
 cd /tmp/work || exit 1
-mount --bind ${RUNTIME} ${RUNTIME} || exit 1
-mount -o remount,bind,ro ${RUNTIME} || exit 1
+mount --bind ${runtimeRoot} ${runtimeRoot} || exit 1
+mount -o remount,bind,ro ${runtimeRoot} || exit 1
 export TMPDIR=/tmp/work HOME=/tmp/work OCAGENT_CLIENT=/tmp/work/ocagent_client.mjs
 exec "$@"
 `;
-  await writeFile(`${RUNTIME}/enter.sh`, enter, { mode: 0o755 });
+  await writeFile(rt("enter.sh"), enter, { mode: 0o755 });
+  sandboxReady = true;
 }
 
 export type CoreJob = {
@@ -415,8 +460,8 @@ async function agentBin(): Promise<{ run: string; image: string }> {
   await ensureRuntime();
   const image = await fileAt("ocagent");
   if (!image) throw new Error("没有 OCaml 循环");
-  await copyFile(image, `${RUNTIME}/ocagent`);
-  return { run: `${RUNTIME}/ocamlrun`, image: `${RUNTIME}/ocagent` };
+  await installBin(image, rt("ocagent"));
+  return { run: rt("ocamlrun"), image: rt("ocagent") };
 }
 
 export async function runCore(
@@ -429,7 +474,7 @@ export async function runCore(
   },
 ): Promise<CoreResult> {
   const { run, image } = await agentBin();
-  const dir = await mkdtemp(path.join(RUNTIME, "runs", "job-"));
+  const dir = await mkdtemp(rt("runs", "job-"));
   const bridge = await startCoreBridge(handlers);
   try {
     await writeFile(path.join(dir, "job"), encodeJob(job));
@@ -444,7 +489,6 @@ export async function runCore(
         OCAGENT_PORT: String(bridge.port),
         OCAGENT_TOKEN: bridge.token,
       },
-      { timeoutMs: 42_000 },
     );
     const resultPath = path.join(dir, "result");
     if (await exists(resultPath)) {
@@ -529,7 +573,377 @@ function startCoreBridge(handlers: {
   });
 }
 
+function shortenDiagnostic(raw: string): string {
+  const text = raw.replace(/\u001b\[[0-9;]*m/g, "");
+  const spots = [...text.matchAll(/ocagent_step\.ml", line (\d+), characters (\d+)-(\d+)/g)];
+  const actual = spots.at(-1);
+  const span = /ocagent_step\.ml", lines (\d+)-(\d+)/.exec(text);
+  const where = actual
+    ? `编译失败 (第 ${actual[1]} 行，第 ${actual[2]}-${actual[3]} 列)`
+    : span
+      ? `编译失败 (第 ${span[1]}-${span[2]} 行)`
+      : "编译失败";
+  const pair = /Type "([^"]+)" is not compatible with type "([^"]+)"/.exec(text);
+  const got = pair?.[1] ?? /has type ([^\n]+)/.exec(text)?.[1];
+  const expected = pair?.[2] ?? /expected of type ([^\n]+)/.exec(text)?.[1];
+  const pretty = (type: string) => type.replaceAll("(string, string) result", "string res").replaceAll("(unit, string) result", "unit res");
+  const lines = [where];
+  if (expected) lines.push(`这里期望: ${pretty(expected.trim())}`);
+  if (got) lines.push(`实际是:   ${pretty(got.trim())}`);
+  if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
+    lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
+  } else if (/Unbound value|Unbound module/.test(text)) {
+    lines.push("提示: 只能用 Files、Search、Net、Trace，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+  } else if (/Unbound constructor/.test(text)) {
+    lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
+  } else if (/Signature mismatch/.test(text)) {
+    lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
+  } else {
+    const err = /Error: ([^\n]+)/.exec(text);
+    if (err) lines.push(err[1].trim());
+  }
+  return lines.join("\n");
+}
+
+function codeOutsideLiterals(source: string): string {
+  let out = "";
+  let i = 0;
+  while (i < source.length) {
+    if (source.startsWith("(*", i)) {
+      const end = source.indexOf("*)", i + 2);
+      i = end < 0 ? source.length : end + 2;
+      out += " ";
+      continue;
+    }
+    if (source.startsWith("{|", i)) {
+      const end = source.indexOf("|}", i + 2);
+      i = end < 0 ? source.length : end + 2;
+      out += " ";
+      continue;
+    }
+    const c = source[i];
+    if (c === '"') {
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (source[i] === '"') {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      out += " ";
+      continue;
+    }
+    if (c === "'") {
+      i += 1;
+      if (source[i] === "\\") i += 2;
+      else i += 1;
+      if (source[i] === "'") i += 1;
+      out += " ";
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+function rejectedSource(source: string): string | null {
+  const code = codeOutsideLiterals(source);
+  if (code.includes("Unix")) return "编译失败\nStep 里不能调用 Unix。要记时间用 Clock.now ()。写进文件的源码可以包含 Unix，那只是文本。";
+  if (code.includes("Sys.")) return "编译失败\nStep 里不能调用 Sys。要记时间用 Clock.now ()。写进文件的源码可以包含 Sys.time，那只是文本。";
+  if (/\bopen_in\b|\bopen_out\b|\bopen_in_bin\b|\bopen_out_bin\b/.test(code)) return "编译失败\n不要直接打开文件。用 Files.read_file 和 Files.write_file。";
+  if (/#\s*(load|use|directory|mod_use)/.test(code)) return "编译失败\n不能加载别的文件。";
+  if (/\bObj\.|\bMarshal\./.test(code)) return "编译失败\n不能用 Obj 或 Marshal。";
+  return null;
+}
+
+function stepApi(filesOn: boolean, webOn: boolean, netOn: boolean): string {
+  return `
+type 'a res = ('a, string) result
+
+let quote s =
+  let buf = Buffer.create (String.length s + 2) in
+  Buffer.add_char buf '\\'';
+  String.iter (fun c -> if c = '\\'' then Buffer.add_string buf "'\\\\''" else Buffer.add_char buf c) s;
+  Buffer.add_char buf '\\'';
+  Buffer.contents buf
+
+let slurp path =
+  let ic = open_in path in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic))
+
+let bridge op payload =
+  let req = Filename.temp_file "ocagent" ".in" in
+  let resp = req ^ ".out" in
+  let oc = open_out req in
+  output_string oc payload;
+  close_out oc;
+  let cmd =
+    String.concat " "
+      [ quote (Sys.getenv "OCAGENT_NODE"); quote (Sys.getenv "OCAGENT_CLIENT"); quote op; quote req; quote resp ]
+  in
+  let code = Sys.command cmd in
+  let body = try slurp resp with _ -> "" in
+  if code <> 0 then Error (if body = "" then "调用失败" else body) else Ok body
+
+let effects = open_out_gen [ Open_append; Open_creat ] 0o644 "ocagent_effects"
+
+let one_line s = String.map (fun c -> if c = '\\n' || c = '\\t' || c = '\\r' then ' ' else c) s
+
+let log_effect name detail result =
+  let shown = if String.length result > 300 then String.sub result 0 300 else result in
+  output_string effects (name ^ "\\t" ^ one_line detail ^ "\\t" ^ one_line shown ^ "\\n");
+  flush effects
+
+let hidden name = String.starts_with ~prefix:"ocagent_" name || String.starts_with ~prefix:"." name
+
+let has_dotdot s =
+  let n = String.length s in
+  let rec go i = if i + 1 >= n then false else if s.[i] = '.' && s.[i + 1] = '.' then true else go (i + 1) in
+  go 0
+
+let safe_rel path =
+  path <> "" && String.length path <= 80 && (not (String.starts_with ~prefix:"/" path))
+  && (not (String.starts_with ~prefix:"." path))
+  && (not (String.ends_with ~suffix:"/" path))
+  && (not (has_dotdot path))
+  && not (String.contains path '\\\\')
+
+let rec mkdir_p path =
+  if path = "" || path = "." then ()
+  else (
+    mkdir_p (Filename.dirname path);
+    if not (Sys.file_exists path) then try Sys.mkdir path 0o755 with Sys_error _ -> ())
+
+let files_on = ${filesOn ? "true" : "false"}
+let web_on = ${webOn ? "true" : "false"}
+let net_on = ${netOn ? "true" : "false"}
+
+module Files = struct
+  let list_files () =
+    if not files_on then []
+    else
+      let found = ref [] in
+      let rec walk prefix dir =
+        let names = try Sys.readdir dir with Sys_error _ -> [||] in
+        Array.iter
+          (fun name ->
+            if not (hidden name) then
+              let rel = if prefix = "" then name else prefix ^ "/" ^ name in
+              let full = Filename.concat dir name in
+              if Sys.is_directory full then walk rel full else found := rel :: !found)
+          names
+      in
+      walk "" ".";
+      List.sort compare !found
+
+  let read_file path =
+    let result =
+      if (not files_on) || not (safe_rel path) then Error "路径不行"
+      else try Ok (slurp path) with Sys_error _ -> Error "没有这个文件"
+    in
+    log_effect "Files.read_file" path (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let find_in_files query =
+    if (not files_on) || query = "" then []
+    else
+      let q = String.lowercase_ascii query in
+      let hits = ref [] in
+      List.iter
+        (fun path ->
+          match read_file path with
+          | Error _ -> ()
+          | Ok text ->
+              let rec scan i line_no =
+                if i >= String.length text || List.length !hits >= 15 then ()
+                else
+                  let stop = match String.index_from_opt text i '\\n' with None -> String.length text | Some j -> j in
+                  let line = String.sub text i (stop - i) in
+                  if q = "" || (let lower = String.lowercase_ascii line in let n = String.length lower and m = String.length q in
+                    let rec has i = if i + m > n then false else if String.sub lower i m = q then true else has (i + 1) in has 0)
+                  then hits := (path, line_no, line) :: !hits;
+                  scan (if stop >= String.length text then stop else stop + 1) (line_no + 1)
+              in
+              scan 0 1)
+        (list_files ());
+      log_effect "Files.find_in_files" query (string_of_int (List.length !hits));
+      List.rev !hits
+
+  let write_file path content =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else if String.length content > 8000 then Error "内容太长"
+      else (
+        mkdir_p (Filename.dirname path);
+        let oc = open_out path in
+        Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc content);
+        Ok ())
+    in
+    log_effect "Files.write_file" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
+    result
+
+  let delete_file path =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else try Sys.remove path; Ok () with Sys_error e -> Error e
+    in
+    log_effect "Files.delete_file" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
+    result
+end
+
+module Search = struct
+  let query q =
+    let result = if not web_on then Error "网页没开" else if String.trim q = "" then Error "查询是空的" else bridge "search" q in
+    log_effect "Search.query" q (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
+module Net = struct
+  let get url =
+    let result = if not net_on then Error "网络没开" else if String.trim url = "" then Error "地址是空的" else bridge "net" url in
+    log_effect "Net.get" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
+module Trace = struct
+  let note text =
+    log_effect "Trace.note" "" text
+end
+
+module Clock = struct
+  let now () =
+    let t = Sys.time () in
+    log_effect "Clock.now" "" (string_of_float t);
+    t
+end
+
+type reply =
+  | Continue of string
+  | Done of string
+  | Ask of string
+  | Partial of string
+
+module type STEP = sig
+  val run : unit -> reply
+end
+`;
+}
+
+const STEP_FINISH = `
+let () =
+  let kind, text =
+    match Step.run () with
+    | Continue s -> ("continue", s)
+    | Done s -> ("done", s)
+    | Ask s -> ("ask", s)
+    | Partial s -> ("partial", s)
+  in
+  let oc = open_out_bin "ocagent_step_out" in
+  output_string oc kind;
+  output_char oc '\\n';
+  output_string oc (string_of_int (String.length text));
+  output_char oc '\\n';
+  output_string oc text;
+  output_char oc '\\n';
+  close_out oc
+`;
+
+function encodeBlock(text: string): string {
+  const body = Buffer.from(text, "utf8");
+  return `${body.length}\n${body.toString("utf8")}\n`;
+}
+
+async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Promise<DeskFile[]> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name.startsWith("ocagent_") || entry.name.startsWith(".")) continue;
+    const abs = path.join(dir, entry.name);
+    const rel = path.relative(root, abs).split(path.sep).join("/");
+    if (!safePath(rel)) continue;
+    if (entry.isDirectory()) await collectFiles(abs, root, out);
+    else if (entry.isFile()) {
+      try {
+        const content = await readFile(abs, "utf8");
+        if (!content.includes("\u0000") && content.length <= 8000) out.push({ path: rel, content });
+      } catch {
+        /* skip unreadable files */
+      }
+    }
+  }
+  return out;
+}
+
+export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
+  const cur = reader(Buffer.from(payload, "utf8"));
+  const source = cur.block();
+  const count = Number(cur.line());
+  const files: DeskFile[] = [];
+  for (let i = 0; i < count; i += 1) files.push({ path: cur.line(), content: cur.block() });
+  const banned = rejectedSource(source);
+  if (banned) return `fail\n${encodeBlock(banned)}`;
+  const command = await ocamlCommand();
+  if (!command) return `fail\n${encodeBlock("这台服务器没有 OCaml 运行器。")}`;
+  await ensureRuntime();
+  const bridge = harnesses.some((id) => id === "net" || id === "web") ? await startBridge(apiKey, harnesses) : null;
+  const dir = await mkdtemp(rt("runs", "step-"));
+  try {
+    for (const file of files) {
+      if (!safePath(file.path)) continue;
+      const target = path.resolve(dir, file.path);
+      if (!target.startsWith(dir + path.sep)) continue;
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, file.content, "utf8");
+    }
+    await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(harnesses.includes("files"), harnesses.includes("web"), harnesses.includes("net")), "utf8");
+    await writeFile(path.join(dir, "ocagent_step.ml"), `${source.trim()}\n`, "utf8");
+    await writeFile(path.join(dir, "ocagent_finish.ml"), STEP_FINISH, "utf8");
+    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_step.ml";;\n#use "ocagent_finish.ml";;\n', "utf8");
+    await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
+    const extra: Record<string, string> = {
+      OCAGENT_NODE: process.execPath,
+      OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
+      OCAMLLIB: rt("lib"),
+      CAMLLIB: rt("lib"),
+    };
+    if (bridge) {
+      extra.OCAGENT_PORT = String(bridge.port);
+      extra.OCAGENT_TOKEN = bridge.token;
+    }
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 20_000 });
+    const outPath = path.join(dir, "ocagent_step_out");
+    if (!(await exists(outPath))) {
+      return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;
+    }
+    const outcome = reader(await readFile(outPath));
+    const kind = outcome.line();
+    const text = outcome.block();
+    const effectText = (await exists(path.join(dir, "ocagent_effects"))) ? await readFile(path.join(dir, "ocagent_effects"), "utf8") : "";
+    const traces = effectText
+      .split("\n")
+      .filter((line) => line.startsWith("Trace.note\t"))
+      .map((line) => line.split("\t")[2] ?? "")
+      .filter(Boolean)
+      .join("\n");
+    const written = await collectFiles(dir);
+    let body = `ok\n${kind}\n${encodeBlock(text)}${encodeBlock(traces)}${encodeBlock(effectText.trim())}${written.length}\n`;
+    for (const file of written) body += `${file.path}\n${encodeBlock(file.content)}`;
+    return body;
+  } finally {
+    if (bridge) await bridge.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
+  if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey);
   const cur = reader(Buffer.from(payload, "utf8"));
   const entry = cur.block();
   const source = cur.block();
