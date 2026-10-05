@@ -122,6 +122,34 @@ let () =
   | Ok (M.String got) when got = "中" -> ()
   | Ok _ -> fail "unicode escape decoded wrong"
   | Error e -> fail "unicode escape %s" (M.describe e));
+  (match M.parse "\"\\uD83D\\uDE00\"" with
+  | Ok (M.String got) when got = "\xF0\x9F\x98\x80" -> ()
+  | Ok _ -> fail "surrogate pair decoded wrong"
+  | Error e -> fail "surrogate pair %s" (M.describe e));
+  (match M.parse "\"\\b\\f\\/\"" with
+  | Ok (M.String got) when got = "\b\012/" -> ()
+  | Ok _ -> fail "escape decoded wrong"
+  | Error e -> fail "escape %s" (M.describe e));
+  let deep = String.make 40 '[' ^ "1" ^ String.make 40 ']' in
+  (match M.parse deep with
+  | Error _ -> ()
+  | exception exn -> fail "depth raised %s" (Printexc.to_string exn)
+  | Ok _ -> fail "deep json accepted");
+  let prepared = M.canonical_record record in
+  let marked = "\"state\":\"Prepared\"" in
+  let completed =
+    let n = String.length marked in
+    let rec find i =
+      if i + n > String.length prepared then failwith "state missing"
+      else if String.sub prepared i n = marked then i
+      else find (i + 1)
+    in
+    let i = find 0 in
+    String.sub prepared 0 i ^ "\"state\":\"Completed\"" ^ String.sub prepared (i + n) (String.length prepared - i - n)
+  in
+  (match M.parse_record completed with
+  | Error _ -> ()
+  | Ok _ -> fail "incomplete Completed accepted");
   let binary = bundle "let run () = Done \"ok\"\n" [ { mod_a with artifact = "\xFF\xFE\x00" } ] in
   let binary = { binary with M.artifact = "\xFF\xFE not utf8" } in
   (match M.build ~run_id:"run" ~step_id:"0" ~step_seq:0 binary with

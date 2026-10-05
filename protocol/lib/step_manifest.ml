@@ -29,6 +29,10 @@ let describe = function
 
 let sha256 s = Digestif.SHA256.to_hex (Digestif.SHA256.digest_string s)
 
+let hash_ok s =
+  String.length s = 64
+  && String.for_all (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) s
+
 let max_safe = 9007199254740991
 
 let utf8_ok s =
@@ -61,6 +65,21 @@ let utf8_ok s =
           second >= lo && second <= hi && cont s (i + 2) (i + len) && loop (i + len)
   in
   loop 0
+
+let add_utf8 buf code =
+  if code < 0x80 then Buffer.add_char buf (Char.chr code)
+  else if code < 0x800 then (
+    Buffer.add_char buf (Char.chr (0xC0 lor (code lsr 6)));
+    Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+  else if code < 0x10000 then (
+    Buffer.add_char buf (Char.chr (0xE0 lor (code lsr 12)));
+    Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+    Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+  else (
+    Buffer.add_char buf (Char.chr (0xF0 lor (code lsr 18)));
+    Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 12) land 0x3F)));
+    Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+    Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
 
 let escape buf s =
   String.iter
@@ -155,23 +174,46 @@ let parse_string p =
             | 't' ->
                 Buffer.add_char buf '\t';
                 loop ()
+            | 'b' ->
+                Buffer.add_char buf '\b';
+                loop ()
+            | 'f' ->
+                Buffer.add_char buf '\012';
+                loop ()
+            | '/' ->
+                Buffer.add_char buf '/';
+                loop ()
             | 'u' -> (
-                if p.i + 4 > String.length p.s then fail "escape"
-                else
-                  let hex = String.sub p.s p.i 4 in
-                  p.i <- p.i + 4;
-                  match int_of_string_opt ("0x" ^ hex) with
-                  | Some code when code >= 0 && code <= 0x10FFFF && not (code >= 0xD800 && code <= 0xDFFF) ->
-                      if code < 0x80 then Buffer.add_char buf (Char.chr code)
-                      else if code < 0x800 then (
-                        Buffer.add_char buf (Char.chr (0xC0 lor (code lsr 6)));
-                        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
-                      else (
-                        Buffer.add_char buf (Char.chr (0xE0 lor (code lsr 12)));
-                        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
-                        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))));
-                      loop ()
-                  | _ -> fail "escape")
+                let hex_ok s =
+                  String.length s = 4
+                  && String.for_all
+                       (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+                       s
+                in
+                let read_unit () =
+                  if p.i + 4 > String.length p.s then None
+                  else
+                    let hex = String.sub p.s p.i 4 in
+                    if hex_ok hex then (
+                      p.i <- p.i + 4;
+                      int_of_string_opt ("0x" ^ hex))
+                    else None
+                in
+                match read_unit () with
+                | Some hi when hi >= 0xD800 && hi <= 0xDBFF ->
+                    if p.i + 6 <= String.length p.s && p.s.[p.i] = '\\' && p.s.[p.i + 1] = 'u' then (
+                      p.i <- p.i + 2;
+                      match read_unit () with
+                      | Some lo when lo >= 0xDC00 && lo <= 0xDFFF ->
+                          let code = 0x10000 + ((hi - 0xD800) lsl 10) + (lo - 0xDC00) in
+                          add_utf8 buf code;
+                          loop ()
+                      | _ -> fail "escape")
+                    else fail "escape"
+                | Some code when code >= 0 && code <= 0xFFFF && not (code >= 0xDC00 && code <= 0xDFFF) ->
+                    add_utf8 buf code;
+                    loop ()
+                | _ -> fail "escape")
             | _ -> fail "escape")
         | c when Char.code c < 32 -> fail "raw control"
         | c ->
@@ -204,22 +246,26 @@ let starts p lit =
   let n = String.length lit in
   p.i + n <= String.length p.s && String.sub p.s p.i n = lit
 
-let rec parse_value p =
-  skip p;
-  match peek p with
-  | 'n' -> if starts p "null" then (p.i <- p.i + 4; Ok Null) else fail "null"
-  | 't' -> if starts p "true" then (p.i <- p.i + 4; Ok (Bool true)) else fail "bool"
-  | 'f' -> if starts p "false" then (p.i <- p.i + 5; Ok (Bool false)) else fail "bool"
-  | '"' -> (
-      match parse_string p with
-      | Ok s -> Ok (String s)
-      | Error _ as e -> e)
-  | '[' -> parse_array p
-  | '{' -> parse_object p
-  | '-' | '0' .. '9' -> parse_number p
-  | _ -> fail "value"
+let max_depth = 32
 
-and parse_array p =
+let rec parse_value p depth =
+  if depth > max_depth then fail "depth"
+  else (
+    skip p;
+    match peek p with
+    | 'n' -> if starts p "null" then (p.i <- p.i + 4; Ok Null) else fail "null"
+    | 't' -> if starts p "true" then (p.i <- p.i + 4; Ok (Bool true)) else fail "bool"
+    | 'f' -> if starts p "false" then (p.i <- p.i + 5; Ok (Bool false)) else fail "bool"
+    | '"' -> (
+        match parse_string p with
+        | Ok s -> Ok (String s)
+        | Error _ as e -> e)
+    | '[' -> parse_array p depth
+    | '{' -> parse_object p depth
+    | '-' | '0' .. '9' -> parse_number p
+    | _ -> fail "value")
+
+and parse_array p depth =
   ignore (bump p);
   skip p;
   if peek p = ']' then (
@@ -227,7 +273,7 @@ and parse_array p =
     Ok (Arr []))
   else
     let rec elts acc =
-      match parse_value p with
+      match parse_value p (depth + 1) with
       | Error _ as e -> e
       | Ok v ->
           let acc = v :: acc in
@@ -243,7 +289,7 @@ and parse_array p =
     in
     elts []
 
-and parse_object p =
+and parse_object p depth =
   ignore (bump p);
   skip p;
   if peek p = '}' then (
@@ -260,7 +306,7 @@ and parse_object p =
             skip p;
             if bump p <> ':' then fail "colon"
             else
-              match parse_value p with
+              match parse_value p (depth + 1) with
               | Error _ as e -> e
               | Ok v ->
                   let acc = (key, v) :: acc in
@@ -278,7 +324,7 @@ and parse_object p =
 
 let parse text =
   let p = { s = text; i = 0 } in
-  match parse_value p with
+  match parse_value p 0 with
   | Error _ as e -> e
   | Ok v ->
       skip p;
@@ -350,11 +396,17 @@ type state =
   | Completed
   | Failed
 
+type reply =
+  | Continue of string
+  | Done of string
+  | Ask of string
+  | Partial of string
+
 type record = {
   admission_key : string;
   manifest : t;
   state : state;
-  reply : string option;
+  reply : reply option;
   final_workspace : string option;
   error : string option;
 }
@@ -414,13 +466,32 @@ let manifest_json m =
 
 let seal m = { m with execution_hash = sha256 (canonical (preimage m)) }
 
-let opt_string = function
-  | Null -> Ok None
-  | String s -> Ok (Some s)
-  | _ -> fail "nullable string"
+let reply_json = function
+  | Continue text -> Obj [ ("tag", String "Continue"); ("text", String text) ]
+  | Done text -> Obj [ ("tag", String "Done"); ("text", String text) ]
+  | Ask text -> Obj [ ("tag", String "Ask"); ("text", String text) ]
+  | Partial text -> Obj [ ("tag", String "Partial"); ("text", String text) ]
+
+let reply_of_json = function
+  | Obj fields -> (
+      match exact_keys fields [ "tag"; "text" ] with
+      | Error _ as e -> e
+      | Ok () -> (
+          match (field fields "tag", field fields "text") with
+          | Ok (String "Continue"), Ok (String text) -> Ok (Continue text)
+          | Ok (String "Done"), Ok (String text) -> Ok (Done text)
+          | Ok (String "Ask"), Ok (String text) -> Ok (Ask text)
+          | Ok (String "Partial"), Ok (String text) -> Ok (Partial text)
+          | Ok (String _), Ok (String _) -> Error Unknown_version
+          | _ -> fail "reply"))
+  | _ -> fail "reply"
 
 let record_json r =
-  let nullable = function
+  let workspace = function
+    | None -> Null
+    | Some s -> String s
+  in
+  let err = function
     | None -> Null
     | Some s -> String s
   in
@@ -429,9 +500,9 @@ let record_json r =
       ("admission_key", String r.admission_key);
       ("manifest", manifest_json r.manifest);
       ("state", String (state_name r.state));
-      ("reply", nullable r.reply);
-      ("final_workspace", nullable r.final_workspace);
-      ("error", nullable r.error);
+      ("reply", (match r.reply with None -> Null | Some reply -> reply_json reply));
+      ("final_workspace", workspace r.final_workspace);
+      ("error", err r.error);
     ]
 
 let canonical_record r = canonical (record_json r)
@@ -445,8 +516,10 @@ let module_of_json = function
           | Ok name, Ok source_hash, Ok interface_hash, Ok artifact_hash -> (
               match (as_string name, as_string source_hash, as_string interface_hash, as_string artifact_hash) with
               | Ok name, Ok source_hash, Ok interface_hash, Ok artifact_hash ->
-                  if module_name_ok name then Ok { name; source_hash; interface_hash; artifact_hash }
-                  else Error (Bad_module name)
+                  if not (module_name_ok name) then Error (Bad_module name)
+                  else if not (hash_ok source_hash && hash_ok interface_hash && hash_ok artifact_hash) then
+                    Error (Bad_json "hash")
+                  else Ok { name; source_hash; interface_hash; artifact_hash }
               | Error _ as e, _, _, _ | _, (Error _ as e), _, _ | _, _, (Error _ as e), _ | _, _, _, (Error _ as e) -> e)
           | Error _ as e, _, _, _ | _, (Error _ as e), _, _ | _, _, (Error _ as e), _ | _, _, _, (Error _ as e) -> e))
   | _ -> fail "module"
@@ -512,6 +585,13 @@ let manifest_of_json = function
           with
           | Ok manifest_version, Ok protocol_version, Ok step_api_version, Ok run_id, Ok step_id, Ok step_seq, Ok source_hash, Ok (Arr raw_modules), Ok compiler_id, Ok runtime_id, Ok sdk_hash, Ok driver_hash, Ok artifact_hash, Ok base_workspace_hash, Ok input_context_hash, Ok capability_grant_hash, Ok policy_version, Ok execution_hash -> (
               if manifest_version <> 1 || protocol_version <> 1 || step_api_version <> 1 then Error Unknown_version
+              else if run_id = "" || step_id = "" then fail "identity"
+              else if
+                not
+                  (hash_ok source_hash && hash_ok sdk_hash && hash_ok driver_hash && hash_ok artifact_hash
+                 && hash_ok base_workspace_hash && hash_ok input_context_hash && hash_ok capability_grant_hash
+                 && hash_ok execution_hash)
+              then Error (Bad_json "hash")
               else
                 let rec take acc = function
                   | [] -> Ok (List.rev acc)
@@ -553,6 +633,34 @@ let manifest_of_json = function
           | _ -> fail "manifest"))
   | _ -> fail "manifest"
 
+let opt_workspace = function
+  | Null -> Ok None
+  | String s when hash_ok s -> Ok (Some s)
+  | String _ -> Error (Bad_json "hash")
+  | _ -> fail "workspace"
+
+let opt_error = function
+  | Null -> Ok None
+  | String s -> Ok (Some s)
+  | _ -> fail "error"
+
+let opt_reply = function
+  | Null -> Ok None
+  | json -> (
+      match reply_of_json json with
+      | Ok reply -> Ok (Some reply)
+      | Error _ as err -> err)
+
+let completion_ok state reply final_workspace =
+  match state with
+  | Completed -> (
+      match (reply, final_workspace) with
+      | Some _, Some _ -> Ok ()
+      | _ -> Error (Bad_json "completion"))
+  | Failed -> if reply = None && final_workspace = None then Ok () else Error (Bad_json "completion")
+  | Prepared | Running | Awaiting_approval | Blocked_unknown ->
+      if reply = None && final_workspace = None then Ok () else Error (Bad_json "completion")
+
 let record_of_json = function
   | Obj fields -> (
       match exact_keys fields [ "admission_key"; "manifest"; "state"; "reply"; "final_workspace"; "error" ] with
@@ -560,10 +668,14 @@ let record_of_json = function
       | Ok () -> (
           match (field fields "admission_key", field fields "manifest", field fields "state", field fields "reply", field fields "final_workspace", field fields "error") with
           | Ok (String admission_key), Ok manifest, Ok (String state), Ok reply, Ok final_workspace, Ok error -> (
-              match (manifest_of_json manifest, state_of state, opt_string reply, opt_string final_workspace, opt_string error) with
-              | Ok manifest, Ok state, Ok reply, Ok final_workspace, Ok error ->
-                  Ok { admission_key; manifest; state; reply; final_workspace; error }
-              | Error _ as e, _, _, _, _ | _, (Error _ as e), _, _, _ | _, _, (Error _ as e), _, _ | _, _, _, (Error _ as e), _ | _, _, _, _, (Error _ as e) -> e)
+              match (manifest_of_json manifest, state_of state, opt_reply reply, opt_workspace final_workspace, opt_error error) with
+              | Ok manifest, Ok state, Ok reply, Ok final_workspace, Ok error -> (
+                  match completion_ok state reply final_workspace with
+                  | Error _ as err -> err
+                  | Ok () -> Ok { admission_key; manifest; state; reply; final_workspace; error })
+              | Error _ as e, _, _, _, _ | _, (Error _ as e), _, _, _ | _, _, (Error _ as e), _, _ | _, _, _, (Error _ as e), _ | _, _, _, _, (Error _ as e)
+                ->
+                  e)
           | _ -> fail "record"))
   | _ -> fail "record"
 

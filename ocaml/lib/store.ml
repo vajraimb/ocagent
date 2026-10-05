@@ -247,6 +247,9 @@ let parse text =
   let finish body step =
     let journal = try Journal.of_jsonl body with Json.Parse msg -> raise (Corrupt msg) in
     if List.length !(journal.entries) <> records then raise (Corrupt "record count");
+    (match step with
+    | Some record when record.Step_manifest.manifest.run_id <> journal.run_id -> raise (Corrupt "step run")
+    | _ -> ());
     { revision; epoch; journal; step }
   in
   if magic = "OCAGENT 2" then (
@@ -575,7 +578,7 @@ let file_bytes path = read_file path
 let max_blob = 262144
 
 type 'a step_run =
-  | Stored_completion of { reply : string; workspace : string }
+  | Stored_completion of { reply : Step_manifest.reply; workspace : string }
   | Resumed of 'a
 
 let blob_file path hash = Filename.concat (Filename.concat (Filename.dirname path) "step-blobs") hash
@@ -672,7 +675,9 @@ let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
                       | None -> Error Version_unavailable
                       | Some existing
                         when existing.admission_key = admission_key && existing.manifest.execution_hash = manifest.execution_hash ->
-                          Ok existing.manifest
+                          if snap.journal.run_id <> run_id || existing.manifest.run_id <> run_id then Error Run_mismatch
+                          else if snap.journal.agent_version <> agent_version then Error Version_mismatch
+                          else Ok existing.manifest
                       | Some existing when existing.admission_key = admission_key -> Error Admission_conflict
                       | Some _ -> Error Multiple_steps_unsupported)))
 
@@ -727,7 +732,9 @@ let has_pending journal =
   List.exists (fun entry -> entry.Journal.status = Journal.Pending) !(journal.Journal.entries)
 
 let complete_step executor ~cursor ~reply ~workspace_hash =
-  with_store executor.path (fun () ->
+  if not (Step_manifest.hash_ok workspace_hash) then Error (Protocol "hash")
+  else
+    with_store executor.path (fun () ->
       match read_snapshot executor.path with
       | Error _ as err -> err
       | Ok snap -> (

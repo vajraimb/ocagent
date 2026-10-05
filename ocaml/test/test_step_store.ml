@@ -45,6 +45,8 @@ let bundle source =
 let admit path source key =
   S.admit_step ~path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:key (bundle source)
 
+let workspace = M.sha256 "ws"
+
 let contains s sub =
   let n = String.length s and m = String.length sub in
   let rec at i = i + m <= n && (String.sub s i m = sub || at (i + 1)) in
@@ -59,6 +61,11 @@ let () =
   let again = ok (admit path "let run () = Done \"ok\"\n" "adm") in
   if again.execution_hash <> first.execution_hash || again.step_id <> first.step_id then fail "retry changed identity";
   if S.file_bytes path <> bytes || (ok (S.read_snapshot path)).revision <> rev then fail "retry wrote the snapshot";
+  (match S.admit_step ~path ~run_id:"run" ~agent_version:"other" ~admission_key:"adm" (bundle "let run () = Done \"ok\"\n") with
+  | Error S.Version_mismatch -> ()
+  | Ok _ -> fail "不同 agent_version 被当成同一次接纳"
+  | Error err -> fail "agent_version %s" (S.describe err));
+  if S.file_bytes path <> bytes then fail "agent_version 冲突改了快照";
   let before = S.file_bytes path in
   (match admit path "let run () = Done \"other\"\n" "adm" with
   | Error S.Admission_conflict -> ()
@@ -78,7 +85,7 @@ let () =
   if (ok (S.read_snapshot path)).epoch <> epoch || S.file_bytes path <> before then fail "mismatch wrote the snapshot";
   (match
      S.with_step_executor ~path ~execution_hash:first.execution_hash (fun ex ->
-         match S.complete_step ex ~cursor:1 ~reply:"no" ~workspace_hash:"ws" with
+         match S.complete_step ex ~cursor:1 ~reply:(M.Done "no") ~workspace_hash:workspace with
          | Error S.Replay_incomplete -> Ok ()
          | Ok () -> fail "short cursor completed"
          | Error err -> fail "cursor %s" (S.describe err))
@@ -88,7 +95,7 @@ let () =
   | Error err -> fail "run %s" (S.describe err));
   (match
      S.with_step_executor ~path ~execution_hash:first.execution_hash (fun ex ->
-         ok (S.complete_step ex ~cursor:0 ~reply:"done" ~workspace_hash:"ws");
+         ok (S.complete_step ex ~cursor:0 ~reply:(M.Done "done") ~workspace_hash:workspace);
          Ok ())
    with
   | Ok (S.Resumed ()) -> ()
@@ -97,7 +104,7 @@ let () =
   let done_rev = (ok (S.read_snapshot path)).revision in
   let done_epoch = (ok (S.read_snapshot path)).epoch in
   (match S.with_step_executor ~path ~execution_hash:first.execution_hash (fun _ -> Ok ()) with
-  | Ok (S.Stored_completion { reply = "done"; workspace = "ws" }) -> ()
+  | Ok (S.Stored_completion { reply = M.Done "done"; workspace }) when workspace = M.sha256 "ws" -> ()
   | Ok (S.Resumed ()) -> fail "completed step ran again"
   | Ok (S.Stored_completion _) -> fail "stored reply changed"
   | Error err -> fail "stored %s" (S.describe err));
@@ -141,7 +148,7 @@ let () =
          match S.prepare_operation ex request with
          | Ok (S.Execute token) -> (
              issued := Some token;
-             match S.complete_step ex ~cursor:1 ~reply:"early" ~workspace_hash:"ws" with
+             match S.complete_step ex ~cursor:1 ~reply:(M.Done "early") ~workspace_hash:workspace with
              | Error S.Replay_incomplete -> Ok ()
              | Ok () -> fail "pending fetch completed"
              | Error err -> fail "pending %s" (S.describe err))
@@ -172,7 +179,7 @@ let () =
   ok (S.commit_result pending token (Json.String "spec-body"));
   (match
      S.with_step_executor ~path:pending ~execution_hash:pending_manifest.execution_hash (fun ex ->
-         ok (S.complete_step ex ~cursor:1 ~reply:"done" ~workspace_hash:"ws");
+         ok (S.complete_step ex ~cursor:1 ~reply:(M.Done "done") ~workspace_hash:workspace);
          let request =
            {
              S.seq = 1;

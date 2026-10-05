@@ -82,7 +82,7 @@ val compare_and_save :
   path:string -> expected_revision:int -> epoch:int -> Journal.t -> (unit, error) result
 
 type 'a step_run =
-  | Stored_completion of { reply : string; workspace : string }
+  | Stored_completion of { reply : Step_manifest.reply; workspace : string }
   | Resumed of 'a
 
 val admit_step :
@@ -99,7 +99,7 @@ val with_step_executor :
   (executor -> ('a, error) result) ->
   ('a step_run, error) result
 
-val complete_step : executor -> cursor:int -> reply:string -> workspace_hash:string -> (unit, error) result
+val complete_step : executor -> cursor:int -> reply:Step_manifest.reply -> workspace_hash:string -> (unit, error) result
 
 val approve_step :
   path:string ->
