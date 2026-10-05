@@ -33,8 +33,13 @@ describe("web search steps", () => {
     assert.deepEqual(round.defer.map((call) => call.name), ["write_file"]);
     assert.deepEqual(callsThisRound([{ name: "write_file" }]).run.map((call) => call.name), ["write_file"]);
     assert.deepEqual(
-      orderCalls([{ name: "ocaml_run" }, { name: "write_file" }, { name: "web_search" }]).map((call) => call.name),
-      ["web_search", "write_file", "ocaml_run"],
+      orderCalls([
+        { name: "ocaml_run" },
+        { name: "load_harness" },
+        { name: "write_file" },
+        { name: "web_search" },
+      ]).map((call) => call.name),
+      ["web_search", "write_file", "load_harness", "ocaml_run"],
     );
   });
 });

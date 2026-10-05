@@ -9,7 +9,12 @@ type SearchCall = {
 const IO = new Set(["web_search", "http_get"]);
 
 export function orderCalls<T extends { name?: string }>(calls: T[]): T[] {
-  const rank = (name?: string) => (name === "ocaml_run" ? 2 : IO.has(name ?? "") ? 0 : 1);
+  const rank = (name?: string) => {
+    if (IO.has(name ?? "")) return 0;
+    if (name === "load_harness") return 2;
+    if (name === "ocaml_run") return 3;
+    return 1;
+  };
   return [...calls].sort((left, right) => rank(left.name) - rank(right.name));
 }
 

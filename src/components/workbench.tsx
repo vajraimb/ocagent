@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
-import { FileText, Play, Plus, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FileText, Play } from "lucide-react";
 import { runDesk } from "@/lib/agent/run";
-import { CATALOG, DEFAULT_HARNESSES, isHarnessId, type HarnessId } from "@/lib/agent/harness";
-import { SEED, type DeskFile, type ToolStep } from "@/lib/agent/workspace";
+import { CATALOG, DEFAULT_HARNESSES, checkModule, isHarnessId, type DeskModule, type HarnessId } from "@/lib/agent/harness";
+import { SEED, type DeskFile, type JournalItem, type ToolStep } from "@/lib/agent/workspace";
 import { runProofs, type Proof } from "@/lib/harness/proofs";
 import { BUGGY_ADD } from "@/lib/harness/world";
 
@@ -14,23 +14,39 @@ type Saved = {
   answer: string;
   steps: ToolStep[];
   harnesses: HarnessId[];
+  modules: DeskModule[];
+  journal: JournalItem[];
+  memory: string;
 };
 
-const STORAGE_KEY = "ocagent-desk-v4";
+const STORAGE_KEY = "ocagent-desk-v5";
 
 export function Workbench() {
   const [tab, setTab] = useState<Tab>("run");
   const [task, setTask] = useState("");
   const [harnesses, setHarnesses] = useState<HarnessId[]>(DEFAULT_HARNESSES);
+  const [modules, setModules] = useState<DeskModule[]>([]);
+  const [journal, setJournal] = useState<JournalItem[]>([]);
+  const [memory, setMemory] = useState("");
   const [files, setFiles] = useState<DeskFile[]>(SEED);
   const [selected, setSelected] = useState(SEED[0]!.path);
   const [answer, setAnswer] = useState("");
   const [steps, setSteps] = useState<ToolStep[]>([]);
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
+  const [seconds, setSeconds] = useState(0);
   const [ready, setReady] = useState(false);
   const [proofs, setProofs] = useState<Proof[] | null>(null);
   const file = files.find((item) => item.path === selected) ?? files[0];
+  const runId = useRef(0);
+
+  useEffect(() => {
+    if (!running) return;
+    const started = Date.now();
+    setSeconds(0);
+    const tick = window.setInterval(() => setSeconds(Math.floor((Date.now() - started) / 1000)), 400);
+    return () => window.clearInterval(tick);
+  }, [running]);
 
   useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -39,7 +55,21 @@ export function Workbench() {
         const saved = JSON.parse(raw) as Saved;
         if (typeof saved.task === "string") setTask(saved.task);
         if (Array.isArray(saved.files) && saved.files.length) setFiles(saved.files);
-        if (Array.isArray(saved.harnesses)) setHarnesses(saved.harnesses.filter(isHarnessId));
+        if (Array.isArray(saved.harnesses)) {
+          const ids = (saved.harnesses as string[])
+            .map((id) => (id === "search" ? "web" : id))
+            .filter(isHarnessId);
+          setHarnesses(ids);
+        }
+        if (Array.isArray(saved.modules)) {
+          setModules(saved.modules.flatMap((mod) => {
+            if (!mod || typeof mod.name !== "string" || typeof mod.body !== "string") return [];
+            const checked = checkModule(mod.name, mod.body);
+            return checked ? [checked] : [];
+          }));
+        }
+        if (Array.isArray(saved.journal)) setJournal(saved.journal);
+        if (typeof saved.memory === "string") setMemory(saved.memory);
         setAnswer(saved.answer ?? "");
         setSteps(saved.steps ?? []);
       } catch {
@@ -51,34 +81,57 @@ export function Workbench() {
 
   useEffect(() => {
     if (!ready) return;
-    const saved: Saved = { task, files, answer, steps, harnesses };
+    const saved: Saved = { task, files, answer, steps, harnesses, modules, journal, memory };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
-  }, [ready, task, files, answer, steps, harnesses]);
+  }, [ready, task, files, answer, steps, harnesses, modules, journal, memory]);
 
   useEffect(() => {
     if (tab === "proofs" && !proofs) setProofs(runProofs());
   }, [tab, proofs]);
 
-  async function go() {
+  async function go(resume = false) {
     const text = task.trim();
     if (!text || running) return;
+    const id = ++runId.current;
+    const started = Date.now();
     setRunning(true);
     setError("");
     setAnswer("");
     setSteps([]);
+    const nextJournal = resume ? journal : [];
+    if (!resume) setJournal([]);
+    const watch = window.setTimeout(() => {
+      if (runId.current !== id) return;
+      setRunning(false);
+      setAnswer("太久没有回来。再点一次。若刚才那次稍后做完，结果会自己出现。");
+    }, 55_000);
     try {
-      const result = await runDesk({ data: { task: text, files, harnesses } });
+      const result = await runDesk({ data: { task: text, files, harnesses, modules, journal: nextJournal, memory } });
+      if (runId.current !== id) return;
+      const spent = Math.max(1, Math.round((Date.now() - started) / 1000));
       setFiles(result.files);
       setSteps(result.steps);
-      if (result.ok) setAnswer(result.answer);
-      else setError(result.error);
+      if (result.journal) setJournal(result.journal);
+      if (typeof result.memory === "string") setMemory(result.memory);
+      if (result.modules) setModules(result.modules);
+      if (result.ok) setAnswer(`${result.answer}\n\n这一次用了 ${spent} 秒。`);
+      else setError(`${result.error}（用了 ${spent} 秒）`);
       const touched = [...result.steps].reverse().find((step) => result.files.some((item) => item.path === step.detail));
       if (touched) setSelected(touched.detail);
     } catch (caught) {
+      if (runId.current !== id) return;
       setError(caught instanceof Error ? caught.message : "没跑成");
     } finally {
-      setRunning(false);
+      window.clearTimeout(watch);
+      if (runId.current === id) setRunning(false);
     }
+  }
+
+  function stop() {
+    runId.current += 1;
+    setRunning(false);
+    setAnswer(journal.length ? "已停下。点继续从日志接着做，或再点一次重做。" : "已停下。再点一次重新做。");
+    setError("");
   }
 
   const passed = proofs?.filter((proof) => proof.pass).length ?? 0;
@@ -89,7 +142,7 @@ export function Workbench() {
         <p className="font-mono text-xs tracking-widest text-muted">OCAGENT</p>
         <h1 className="text-2xl font-semibold tracking-tight text-fg">让它干活</h1>
         <p className="max-w-xl text-sm leading-6 text-muted">
-          写一句任务。它按你装上的 harness 改文件、上网、发请求、跑 OCaml。
+          做完会停，并把用时写在结果里。太久会把已经做出的部分交回来，也可以中途停下。
         </p>
       </header>
 
@@ -102,7 +155,7 @@ export function Workbench() {
       {tab === "run" ? (
         <div className="grid min-w-0 items-start gap-5 lg:grid-cols-2">
           <section className="flex min-w-0 flex-col gap-3 rounded-3xl border border-border bg-surface p-4 lg:sticky lg:top-4">
-            <HarnessBar harnesses={harnesses} setHarnesses={setHarnesses} />
+            <HarnessBar harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} />
             <label className="flex flex-col gap-2">
               <span className="font-mono text-xs tracking-widest text-muted">要它做什么</span>
               <textarea
@@ -115,12 +168,20 @@ export function Workbench() {
             </label>
             <button
               type="button"
-              onClick={() => void go()}
-              disabled={running || task.trim().length === 0}
+              onClick={() => (running ? stop() : void go(false))}
+              disabled={!running && task.trim().length === 0}
               className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-fg disabled:opacity-40"
             >
               <Play className="size-4" aria-hidden />
-              {running ? "正在做" : "去做"}
+              {running ? `停下 · ${seconds} 秒` : "去做"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void go(true)}
+              disabled={running || journal.length === 0}
+              className="min-h-11 rounded-lg border border-border bg-bg px-3 text-sm text-fg disabled:opacity-40"
+            >
+              继续
             </button>
             <button
               type="button"
@@ -130,6 +191,8 @@ export function Workbench() {
                 setAnswer("");
                 setSteps([]);
                 setError("");
+                setJournal([]);
+                setMemory("");
               }}
               className="min-h-11 rounded-lg border border-border bg-bg px-3 text-sm text-fg"
             >
@@ -142,11 +205,11 @@ export function Workbench() {
             {answer ? (
               <section className="rounded-3xl border border-border bg-surface p-4">
                 <h2 className="text-base font-medium text-fg">它说</h2>
-                <p className="mt-2 text-sm leading-6 text-fg">{answer.replaceAll("**", "").replaceAll("`", "")}</p>
+                <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-fg">{answer.replaceAll("**", "").replaceAll("`", "")}</p>
               </section>
             ) : (
               <p className="rounded-3xl border border-border bg-surface px-4 py-4 text-sm leading-6 text-muted">
-                {running ? "正在做。每一步单独计时，超时也会把已经拿到的结果留下。" : "还没开始。点「添加 harness」装能力，再写任务。"}
+                {running ? `已用 ${seconds} 秒。做完会写在这里；不想等就点停下。` : "还没开始。点继续会从上次日志接着做。"}
               </p>
             )}
 
@@ -200,78 +263,68 @@ export function Workbench() {
   );
 }
 
-function HarnessBar({ harnesses, setHarnesses }: { harnesses: HarnessId[]; setHarnesses: (next: HarnessId[]) => void }) {
-  const [adding, setAdding] = useState(false);
+function HarnessBar({
+  harnesses,
+  setHarnesses,
+  modules,
+  setModules,
+}: {
+  harnesses: HarnessId[];
+  setHarnesses: (next: HarnessId[]) => void;
+  modules: DeskModule[];
+  setModules: (next: DeskModule[]) => void;
+}) {
   return (
     <section className="flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-3">
-        <h2 className="font-mono text-xs tracking-widest text-muted">HARNESS</h2>
-        <button
-          type="button"
-          aria-expanded={adding}
-          onClick={() => setAdding((open) => !open)}
-          className="inline-flex min-h-11 items-center gap-2 rounded-md border border-primary bg-primary px-3 text-sm font-medium text-primary-fg"
-        >
-          <Plus className="size-4" aria-hidden />
-          添加 harness
-        </button>
+      <div className="flex items-baseline justify-between gap-3">
+        <h2 className="font-mono text-xs tracking-widest text-muted">MODULE</h2>
+        <p className="text-xs text-muted">{harnesses.length} 个预制开着</p>
       </div>
-      <div className="rounded-lg border border-border bg-bg px-3 py-3">
-        <h3 className="text-sm font-medium text-fg">时限</h3>
-        <p className="mt-1 text-sm leading-6 text-muted">每一步最多 12 秒，整次最多 40 秒。某一步超时就停那一步，已经拿到的结果照常交出来。</p>
-      </div>
-      {adding ? (
-        <ul className="flex flex-col gap-2 rounded-lg border border-border bg-bg p-2">
-          {CATALOG.map((item) => {
-            const on = harnesses.includes(item.id);
-            return (
-              <li key={item.id} className="flex items-center justify-between gap-3 px-2 py-1">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-fg">{item.name}</p>
-                  <p className="text-sm leading-6 text-muted">{item.summary}</p>
-                </div>
-                {on ? (
-                  <span className="shrink-0 font-mono text-xs text-muted">已装上</span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => setHarnesses([...harnesses, item.id])}
-                    className="inline-flex min-h-11 shrink-0 items-center rounded-md border border-border px-3 text-sm text-fg"
-                  >
-                    加上
-                  </button>
-                )}
-              </li>
-            );
-          })}
-        </ul>
-      ) : null}
       <ul className="flex flex-col gap-2">
-        {harnesses.map((id) => {
-          const item = CATALOG.find((spec) => spec.id === id);
-          if (!item) return null;
+        {CATALOG.map((item) => {
+          const on = harnesses.includes(item.id);
           return (
-            <li key={id} className="rounded-lg border border-border bg-bg px-3 py-3">
+            <li key={item.id} className="rounded-lg border border-border bg-bg px-3 py-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <h3 className="text-sm font-medium text-fg">{item.name}</h3>
+                  <h3 className="font-mono text-sm text-fg">module {item.moduleName}</h3>
                   <p className="mt-1 text-sm leading-6 text-muted">{item.summary}</p>
                 </div>
                 <button
                   type="button"
-                  aria-label={`拿下${item.name}`}
-                  onClick={() => setHarnesses(harnesses.filter((kept) => kept !== id))}
-                  className="inline-flex size-11 shrink-0 items-center justify-center rounded-md border border-border text-muted"
+                  onClick={() => setHarnesses(on ? harnesses.filter((kept) => kept !== item.id) : [...harnesses, item.id])}
+                  className={`inline-flex min-h-11 shrink-0 items-center rounded-md border px-3 text-sm ${on ? "border-border text-fg" : "border-primary bg-primary text-primary-fg"}`}
                 >
-                  <X className="size-4" aria-hidden />
+                  {on ? "拿下" : "加上"}
                 </button>
               </div>
-              <p className="mt-2 font-mono text-xs text-primary">{item.signature}</p>
-              <pre className="mt-2 max-h-36 overflow-auto rounded-md bg-surface px-3 py-2 font-mono text-xs leading-5 text-fg">{item.source}</pre>
+              <pre className="mt-2 max-h-28 overflow-auto rounded-md bg-surface px-3 py-2 font-mono text-xs leading-5 text-fg">{item.source}</pre>
             </li>
           );
         })}
       </ul>
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-medium text-fg">agent 加载的</h3>
+        <p className="text-sm leading-6 text-muted">不用手工填。让它写好文件再加载，成功后会出现在这里。</p>
+        {modules.length === 0 ? <p className="text-sm text-muted">还没有。</p> : null}
+        <ul className="flex flex-col gap-2">
+          {modules.map((mod) => (
+            <li key={mod.name} className="rounded-lg border border-border bg-bg px-3 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <h4 className="font-mono text-sm text-fg">module {mod.name}</h4>
+                <button
+                  type="button"
+                  onClick={() => setModules(modules.filter((item) => item.name !== mod.name))}
+                  className="inline-flex min-h-11 shrink-0 items-center rounded-md border border-border px-3 text-sm text-fg"
+                >
+                  拿下
+                </button>
+              </div>
+              <pre className="mt-2 max-h-28 overflow-auto font-mono text-xs leading-5 text-fg">{mod.body}</pre>
+            </li>
+          ))}
+        </ul>
+      </div>
     </section>
   );
 }
@@ -279,10 +332,11 @@ function HarnessBar({ harnesses, setHarnesses }: { harnesses: HarnessId[]; setHa
 function toolLabel(tool: string): string {
   if (tool === "list_files") return "列出文件";
   if (tool === "read_file") return "读文件";
-  if (tool === "search") return "在文件里找";
+  if (tool === "search" || tool === "find_in_files") return "在文件里找";
   if (tool === "web_search") return "网上搜";
   if (tool === "http_get") return "请求网络";
   if (tool === "ocaml_run") return "跑 OCaml";
+  if (tool === "load_harness") return "加载 harness";
   if (tool === "budget") return "时限";
   if (tool === "write_file") return "写入";
   if (tool === "delete_file") return "删除";

@@ -1,14 +1,17 @@
-export const HARNESS_IDS = ["search", "net", "ocaml"] as const;
+export const HARNESS_IDS = ["files", "web", "net", "ocaml"] as const;
 
 export type HarnessId = (typeof HARNESS_IDS)[number];
 
 export type HarnessSpec = {
   id: HarnessId;
   name: string;
+  moduleName: string;
   summary: string;
-  signature: string;
+  tools: string;
   source: string;
 };
+
+export type DeskModule = { name: string; body: string };
 
 const CALL = `let quote s =
   let buf = Buffer.create (String.length s + 2) in
@@ -52,31 +55,57 @@ const SEARCH = `module Search = struct
 end
 `;
 
+const FILES = `module Files = struct
+  (* list_files *)
+  (* read_file *)
+  (* find_in_files *)
+  (* write_file *)
+  (* delete_file *)
+end
+`;
+
+const RUNNER = `(* ocaml_run *)
+(* 只加载已经加上的 module *)
+`;
+
 export const CATALOG: HarnessSpec[] = [
   {
-    id: "search",
-    name: "搜索",
-    summary: "查网页。OCaml 里用 Search.query。",
-    signature: "val query : string -> string",
+    id: "files",
+    name: "文件",
+    moduleName: "Files",
+    summary: "只动工作区里的文件，不看网页。",
+    tools: "list_files · read_file · find_in_files · write_file · delete_file",
+    source: FILES.trim(),
+  },
+  {
+    id: "web",
+    name: "网页",
+    moduleName: "Search",
+    summary: "查公开网页。没有第二个搜索。",
+    tools: "web_search · Search.query",
     source: SEARCH.trim(),
   },
   {
     id: "net",
     name: "网络",
-    summary: "请求一个公网地址。OCaml 里用 Net.get。",
-    signature: "val get : string -> string",
+    moduleName: "Net",
+    summary: "请求一个公网地址。",
+    tools: "http_get · Net.get",
     source: NET.trim(),
   },
   {
     id: "ocaml",
-    name: "OCaml",
-    summary: "跑工作区里的 .ml。已打开的 harness 会接进同一次运行。",
-    signature: "val call : string -> string -> string",
-    source: CALL.trim(),
+    name: "运行",
+    moduleName: "OCaml",
+    summary: "跑工作区里的 .ml，并加载已经加上的 module。",
+    tools: "ocaml_run",
+    source: RUNNER.trim(),
   },
 ];
 
-export const DEFAULT_HARNESSES: HarnessId[] = [];
+export const DEFAULT_HARNESSES: HarnessId[] = ["files", "web", "net", "ocaml"];
+
+const LEGACY: Record<string, HarnessId> = { search: "web" };
 
 export function isHarnessId(value: string): value is HarnessId {
   return (HARNESS_IDS as readonly string[]).includes(value);
@@ -86,17 +115,60 @@ export function normalizeHarnesses(raw: unknown): HarnessId[] {
   if (!Array.isArray(raw)) return [...DEFAULT_HARNESSES];
   const ids: HarnessId[] = [];
   for (const item of raw) {
-    if (typeof item !== "string" || !isHarnessId(item) || ids.includes(item)) continue;
-    ids.push(item);
+    if (typeof item !== "string") continue;
+    const id = isHarnessId(item) ? item : LEGACY[item];
+    if (!id || ids.includes(id)) continue;
+    ids.push(id);
   }
   return ids;
 }
 
-export function prelude(enabled: HarnessId[]): string {
+export function prelude(enabled: HarnessId[], modules: DeskModule[] = []): string {
   const parts = [CALL];
   if (enabled.includes("net")) parts.push(NET);
-  if (enabled.includes("search")) parts.push(SEARCH);
+  if (enabled.includes("web")) parts.push(SEARCH);
+  if (enabled.includes("ocaml")) {
+    for (const mod of modules) parts.push(`module ${mod.name} = struct\n${mod.body}\nend\n`);
+  }
   return parts.join("\n");
+}
+
+const MODULE_NAME = /^[A-Z][A-Za-z0-9_]{0,24}$/;
+const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml"]);
+const BANNED = /[#]|Unix\b|\bopen_in\b|\bopen_out\b|\bcall\b|\bObj\b|\bMarshal\b|Sys\.(command|getenv|readdir|chdir|remove|rename|set_signal)\b/;
+
+export function checkModule(name: string, body: string): DeskModule | null {
+  const moduleName = name.trim();
+  const source = body.trim();
+  if (!MODULE_NAME.test(moduleName) || RESERVED.has(moduleName)) return null;
+  if (!source || source.length > 2500 || BANNED.test(source)) return null;
+  return { name: moduleName, body: source };
+}
+
+export function moduleFromFile(name: string, content: string): DeskModule | null {
+  const trimmed = content.trim();
+  const moduleName = name.trim();
+  const start = trimmed.match(new RegExp(`^module\\s+${moduleName}\\s*=\\s*struct\\s*`));
+  if (!start) return checkModule(moduleName, trimmed);
+  const rest = trimmed.slice(start[0].length);
+  const end = rest.lastIndexOf("\nend");
+  const body = (end >= 0 ? rest.slice(0, end) : rest).trim();
+  return checkModule(moduleName, body);
+}
+
+export function normalizeModules(raw: unknown): DeskModule[] {
+  if (!Array.isArray(raw)) return [];
+  const modules: DeskModule[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const name = "name" in item && typeof item.name === "string" ? item.name : "";
+    const body = "body" in item && typeof item.body === "string" ? item.body : "";
+    const mod = checkModule(name, body);
+    if (!mod || modules.some((kept) => kept.name === mod.name)) continue;
+    modules.push(mod);
+    if (modules.length >= 6) break;
+  }
+  return modules;
 }
 
 export function spec(id: HarnessId): HarnessSpec {

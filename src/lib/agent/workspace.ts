@@ -6,6 +6,8 @@ export type ToolStep = {
   output: string;
 };
 
+export type JournalItem = { kind: string; text: string };
+
 export const SEED: DeskFile[] = [
   {
     path: "README.md",
@@ -60,7 +62,7 @@ export function applyTool(
     if (!file) return { files, detail: path, output: "没有这个文件" };
     return { files, detail: path, output: file.content };
   }
-  if (name === "search") {
+  if (name === "search" || name === "find_in_files") {
     const query = stringArg(args, "query").trim();
     if (!query) return { files, detail: "空查询", output: "查询是空的" };
     const hits: string[] = [];

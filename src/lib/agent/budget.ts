@@ -10,7 +10,7 @@ export function settle(input: { answer: string; note: string; steps: Step[]; tim
   if (input.note) lines.push(input.note);
   for (const step of input.steps) {
     if (step.detail === "推迟" || step.tool === "budget") continue;
-    if (step.tool !== "web_search" && step.tool !== "http_get" && step.tool !== "ocaml_run" && step.tool !== "write_file") {
+    if (step.tool !== "web_search" && step.tool !== "http_get" && step.tool !== "ocaml_run" && step.tool !== "write_file" && step.tool !== "load_harness") {
       continue;
     }
     lines.push(`${step.detail}：${step.output.replace(/\s+/g, " ").slice(0, 220)}`);
