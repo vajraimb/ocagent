@@ -14,5 +14,105 @@ jobs:
           ocaml-compiler: 5.3.0
       - name: install dune and eio
         run: opam install -y dune eio eio_main digestif
+      - name: diagnose propagation_private
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import builtins, ctypes, os, subprocess
+          def print(*args, **kwargs):
+              kwargs.setdefault("flush", True)
+              builtins.print(*args, **kwargs)
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.unshare.argtypes = [ctypes.c_int]
+          libc.unshare.restype = ctypes.c_int
+          libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p]
+          libc.mount.restype = ctypes.c_int
+          CLONE_NEWNS, CLONE_NEWUSER, CLONE_NEWNET = 0x00020000, 0x10000000, 0x40000000
+          MS_REC, MS_PRIVATE = 1 << 14, 1 << 18
+
+          def show(label, path, limit=500):
+              try:
+                  data = open(path, "rb").read(limit).decode("utf-8", "replace")
+              except Exception as exc:
+                  data = f"unreadable {type(exc).__name__}: {exc}"
+              print(f"{label}: {data.replace(chr(10), ' | ')}")
+
+          def status_bits(prefix):
+              try:
+                  lines = open("/proc/self/status", encoding="utf-8", errors="replace").read().splitlines()
+              except Exception as exc:
+                  print(f"{prefix}_status: unreadable {exc}")
+                  return
+              for line in lines:
+                  if line.startswith(("Cap", "NoNewPrivs", "Seccomp", "Uid", "Gid")):
+                      print(f"{prefix}_{line}")
+
+          print("parent_uid", os.getuid(), "parent_gid", os.getgid())
+          show("sysctl_userns", "/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+          show("parent_attr", "/proc/self/attr/current")
+          show("parent_apparmor", "/proc/self/attr/apparmor/current")
+          status_bits("parent")
+          read_r, write_r = os.pipe()
+          read_g, write_g = os.pipe()
+          pid = os.fork()
+          if pid == 0:
+              os.close(read_r)
+              os.close(write_g)
+              if libc.unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET) != 0:
+                  os.write(write_r, f"unshare {ctypes.get_errno()}\n".encode())
+                  os._exit(1)
+              os.write(write_r, b"R\n")
+              if os.read(read_g, 1) != b"G":
+                  os._exit(1)
+              print("child_before_mount")
+              status_bits("child")
+              show("child_attr", "/proc/self/attr/current")
+              show("child_apparmor", "/proc/self/attr/apparmor/current")
+              show("child_mountinfo_head", "/proc/self/mountinfo")
+              rc = libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
+              err = ctypes.get_errno()
+              print("mount_ms_rec_ms_private", rc, err)
+              os._exit(0 if rc == 0 else 2)
+          os.close(write_r)
+          os.close(read_g)
+          note = os.read(read_r, 64)
+          print("child_handshake", note)
+          if note.startswith(b"R"):
+              uid, gid = os.getuid(), os.getgid()
+              wrote = True
+              for name, text in (
+                  ("setgroups", "deny\n"),
+                  ("uid_map", f"0 {uid} 1\n"),
+                  ("gid_map", f"0 {gid} 1\n"),
+              ):
+                  path = f"/proc/{pid}/{name}"
+                  try:
+                      fd = os.open(path, os.O_WRONLY)
+                      os.write(fd, text.encode())
+                      os.close(fd)
+                      print("parent_wrote", name)
+                  except OSError as exc:
+                      print("parent_write_failed", name, exc.errno, exc.strerror)
+                      wrote = False
+                      break
+              os.write(write_g, b"G" if wrote else b"A")
+          else:
+              os.write(write_g, b"A")
+          _, status = os.waitpid(pid, 0)
+          print("child_status", status)
+          for cmd in (
+              ["dmesg", "-T"],
+              ["journalctl", "-k", "-n", "40", "--no-pager"],
+          ):
+              try:
+                  out = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=5)
+                  text = (out.stdout or "") + (out.stderr or "")
+                  lines = [line for line in text.splitlines() if "apparmor" in line.lower() or "mount" in line.lower()]
+                  print(cmd[0], "exit", out.returncode, "matches", len(lines))
+                  print("\n".join(lines[-20:]))
+              except Exception as exc:
+                  print(cmd[0], "unreadable", type(exc).__name__, exc)
+          PY
       - name: ocaml and dsh-ocaml
         run: opam exec -- dune runtest --root .
+
