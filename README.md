@@ -20,11 +20,12 @@
 | Web_search | Production | 有 `XAI_API_KEY` 才打 xAI，否则明确说没配置 |
 | Spawn, Supervise | actor | 子 fiber 里重装整套 handler |
 
-`test_chain` 覆盖一条链路：读材料、模型给出方案、请求审批、进程退出、新进程从 JSONL 恢复、在沙箱里执行 Fetch、完成。恢复时已记录的 Llm 不再进入 world；Fetch 只执行一次；再跑一遍时 world 日志为空。
+`test_model_replay_chain` 是同进程里的重放模型：`exit_process` 不启动新进程，JSONL 只在内存里往返，Fetch 默认返回固定字符串。它证明的是日志分支，不是磁盘或网络。
 
-`test_faults` 覆盖：结果标成 Unknown 时不重做、审批回调来第二次被拒绝、审批参数变了就报 Nondeterminism 且不执行 Fetch、旧 worker 的不同结果不能覆盖 Done、JSONL 尾部截断被拒绝。
+`test_process_recover` 才跨过进程边界。进程 A 把日志原子写入磁盘后退出。批准走 `Store.commit_decision`，再写一次同样的决定不会改记录。进程 B 只读磁盘，向本机 HTTP 计数服务发一次 Fetch。进程 C 重放，HTTP 计数和 Llm 执行计数都不再增加。非幂等且仍是 Pending 的记录会先标成 Unknown，恢复时不重做。旧 attempt 的 `commit_result` 写不进去。半截内容只出现在 `.tmp` 时，正式文件保持原样。
 
-这些测试没有覆盖多进程选举，也没有覆盖「副作用也许已经发生、但日志仍是 Pending」的自动补救。Pending 仍会再执行一次。
+这些测试没有覆盖多机选举。幂等的 Pending（例如还没写完 Done 的 GET）恢复时仍会再执行一次。
+
 
 ```sh
 eval $(opam env --switch=5.3.0)

@@ -392,6 +392,8 @@ let make_entry ctx seq (type a) (e : a Effect.t) =
     status = Journal.Pending;
     result = Json.Null;
     idempotency_key = Printf.sprintf "%s:%d:%s" ctx.journal.run_id seq hash;
+    attempt = 1;
+    idempotent = true;
     ts = ctx.world.clock + seq;
     last_hit = Journal.Execute;
   }
@@ -443,8 +445,9 @@ let finish_pending (type a r) ctx (e : a Effect.t) (entry : Journal.entry)
   else begin
     entry.last_hit <- Journal.Execute;
     let value = Effect.perform e in
-    entry.status <- Journal.Done;
-    entry.result <- Proto.encode_result e value;
+    (match Journal.commit entry ~attempt:entry.attempt (Proto.encode_result e value) with
+    | Ok () -> ()
+    | Error msg -> raise (Proto.Harness_error msg));
     log ctx "journal" entry.label "execute" (Printf.sprintf "seq %d" entry.seq);
     if hit_crash ctx entry.seq After_done then crash_now ctx entry.seq After_done k
     else Deep.continue k value

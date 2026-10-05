@@ -64,3 +64,31 @@ let rows =
 
 let covered tree effect_name =
   List.filter (fun row -> row.tree = tree && row.effect_name = effect_name) rows
+
+module Fetch = struct
+  type request = {
+    meth : string;
+    url : string;
+    body : string;
+  }
+
+  let of_parts ~meth ~url ~body = { meth; url; body }
+
+  let escape s =
+    let buf = Buffer.create (String.length s + 8) in
+    String.iter
+      (function
+        | '"' -> Buffer.add_string buf "\\\""
+        | '\\' -> Buffer.add_string buf "\\\\"
+        | '\n' -> Buffer.add_string buf "\\n"
+        | '\r' -> Buffer.add_string buf "\\r"
+        | c -> Buffer.add_char buf c)
+      s;
+    Buffer.contents buf
+
+  let quote s = "\"" ^ escape s ^ "\""
+
+  let canonical { meth; url; body } =
+    Printf.sprintf {|{"body":%s,"meth":%s,"url":%s}|} (quote body) (quote meth) (quote url)
+end
+

@@ -20,6 +20,7 @@ type t = {
   mutable log : side list;
   mutable sandbox_execs : int;
   mutable next_id : int;
+  mutable fetch : (Proto.fetch_request -> Proto.fetch_reply) option;
   clock : int;
 }
 
@@ -35,6 +36,7 @@ let create () =
     log = [];
     sandbox_execs = 0;
     next_id = 1;
+    fetch = None;
     clock = 1_725_000_000;
   }
 
@@ -106,7 +108,9 @@ let interpret (type a) (e : a Effect.t) w ~sandbox ~llm_mode : a =
       if not sandbox then raise (Proto.Harness_error "Fetch 只在沙箱 profile 里执行")
       else (
         w.sandbox_execs <- w.sandbox_execs + 1;
-        { Proto.status = 200; body = "fetched " ^ req.url })
+        match w.fetch with
+        | None -> { Proto.status = 200; body = "fetched " ^ req.url }
+        | Some fetch -> fetch req)
   | Proto.Ask_human _ -> raise (Proto.Harness_error "world 不应直接执行 Ask_human")
   | Proto.Compact _ -> raise (Proto.Harness_error "world 不应直接执行 Compact")
   | _ -> raise (Proto.Harness_error "world 不认识这个 effect")

@@ -22,6 +22,8 @@ type entry = {
   mutable status : status;
   mutable result : Json.t;
   idempotency_key : string;
+  mutable attempt : int;
+  mutable idempotent : bool;
   ts : int;
   mutable last_hit : hit;
 }
@@ -79,6 +81,8 @@ let entry_json (e : entry) =
       ("status", status_json e.status);
       ("result", e.result);
       ("idempotency_key", Json.String e.idempotency_key);
+      ("attempt", Json.Int e.attempt);
+      ("idempotent", Json.Bool e.idempotent);
       ("ts", Json.Int e.ts);
       ("last_hit", hit_json e.last_hit);
     ]
@@ -96,6 +100,9 @@ let entry_of_json j =
     status;
     result = (match Json.field_opt "result" j with Some v -> v | None -> Json.Null);
     idempotency_key = Json.string_field "idempotency_key" j;
+    attempt = (match Json.field_opt "attempt" j with Some (Json.Int n) -> n | _ -> 1);
+    idempotent =
+      (match Json.field_opt "idempotent" j with Some (Json.Bool b) -> b | _ -> true);
     ts = Json.int_field "ts" j;
     last_hit;
   }
@@ -135,6 +142,18 @@ let of_jsonl text =
         entries = ref entries;
       }
 
+let commit entry ~attempt result =
+  if attempt <> entry.attempt then Error "旧 attempt 没有写入权"
+  else
+    match entry.status with
+    | Done when entry.result = result -> Ok ()
+    | Done -> Error "旧 worker 的结果和已记录的不一致"
+    | Unknown -> Error "结果未知，不接受写入"
+    | Pending ->
+        entry.status <- Done;
+        entry.result <- result;
+        Ok ()
+
 let accept_late entry result =
   match entry.status with
   | Done when entry.result = result -> Ok ()
@@ -154,6 +173,8 @@ let slim_line (e : entry) =
          ("status", status_json e.status);
          ("result", e.result);
          ("idempotency_key", Json.String e.idempotency_key);
+         ("attempt", Json.Int e.attempt);
+         ("idempotent", Json.Bool e.idempotent);
          ("ts", Json.Int e.ts);
        ])
 

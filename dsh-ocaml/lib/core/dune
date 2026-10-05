@@ -1,4 +1,6 @@
 (library
  (name core)
  (public_name dsh-ocaml.core)
- (modules types effects agent))
+ (libraries ocagent-protocol)
+ (modules types effects agent adapt))
+

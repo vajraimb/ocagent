@@ -9,10 +9,19 @@
  (libraries ocagent-harness))
 
 (test
- (name test_chain)
+ (name test_model_replay_chain)
  (libraries ocagent-harness))
 
 (test
  (name test_faults)
  (libraries ocagent-harness))
+
+(test
+ (name test_fetch_codec)
+ (libraries ocagent-harness ocagent-protocol))
+
+(test
+ (name test_process_recover)
+ (libraries ocagent-harness unix))
+
 

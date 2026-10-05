@@ -131,7 +131,7 @@ let request_json (type a) (e : a Effect.t) =
   | Compact ms -> Json.Assoc [ ("tag", Json.String "Compact"); ("messages", msgs_json ms) ]
   | Now -> Json.Assoc [ ("tag", Json.String "Now") ]
   | Fresh_id -> Json.Assoc [ ("tag", Json.String "Fresh_id") ]
-  | Fetch r -> Json.Assoc [ ("tag", Json.String "Fetch"); ("url", Json.String r.url) ]
+  | Fetch r -> Json.parse (Adapt.fetch_wire r.url)
   | _ -> Json.Assoc [ ("tag", Json.String "unknown") ]
 
 let req_hash e = Json.hash (request_json e)

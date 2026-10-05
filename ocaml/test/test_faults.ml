@@ -14,7 +14,7 @@ let fail fmt = Printf.ksprintf failwith fmt
 let agent payload () =
   let _ =
     Effect.perform
-      (P.Llm { purpose = "plan"; messages = [ { role = "user"; content = payload } ] })
+      (P.Llm { purpose = "plan"; messages = [ { role = "user"; content = "stable" } ] })
   in
   let decision =
     Effect.perform
@@ -57,7 +57,11 @@ let () =
     H.run ~profile:H.Prod ~run_id:"fault" ~journal:exited.result.journal (agent "v2")
   in
   (match changed.result.status with
-  | H.Failed (H.Nondeterminism _) -> ()
+  | H.Failed (H.Nondeterminism { seq; label; _ })
+    when seq = 1 && P.contains label "Ask_human" ->
+      ()
+  | H.Failed (H.Nondeterminism { seq; label; _ }) ->
+      fail "审批参数应在 Ask_human 失败，实际 seq=%d %s" seq label
   | H.Failed e -> fail "改参数：%s" (H.describe e)
   | H.Done _ -> fail "改过的审批参数仍被执行"
   | _ -> fail "改参数没有失败");

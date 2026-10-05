@@ -17,3 +17,7 @@
 (test
  (name test_drop_handler)
  (libraries dsh-ocaml.core eio_main))
+
+(test
+ (name test_fetch_codec)
+ (libraries dsh-ocaml.core ocagent-protocol))

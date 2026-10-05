@@ -1,7 +1,7 @@
-(** One process reads, asks the model, and suspends on approval.
-    The next process restores from JSONL and performs Fetch once inside the
-    sandbox. A third process replays that journal and must not run Llm or Fetch
-    in the world again. *)
+(** In-memory replay model. Exit is [exit_process] in the same OS process.
+    JSONL is a string round-trip, not a disk commit. Fetch is the mock world
+    unless a test installs [World.fetch]. This file does not claim a new
+    process or a network call. *)
 
 module H = Ocagent_harness.Harness
 module J = Ocagent_harness.Journal
@@ -78,4 +78,4 @@ let () =
   | _ -> fail "重放没有完成");
   if replay_world.log <> [] then fail "重放又碰到了 world";
   if replay_world.sandbox_execs <> 0 then fail "重放又执行了沙箱";
-  print_endline "chain ok"
+  print_endline "model replay ok"
