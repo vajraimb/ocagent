@@ -268,12 +268,32 @@ end
   in
   fault "rlimit" C.Rlimit "rlimit 13";
   fault "fd" C.Descriptors "fd 13";
-  fault "isolation" C.Isolation "mount ";
+  fault "isolation" C.Isolation "snapshot_bind ";
   let tools =
     match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
     | Ok tools -> tools
     | Error err -> fail "hold %s" (C.describe err)
   in
+  let bare =
+    {|open Step_api
+module Step : STEP = struct
+  let run () = Done "x"
+end
+|}
+  in
+  let later name skip setup expect =
+    match
+      C.compile_fault_after skip setup ~deadline:(Unix.gettimeofday () +. 40.) tools ~source:bare ~modules:[] ~input:[]
+    with
+    | Error (C.Unavailable msg) when String.starts_with ~prefix:expect msg -> ()
+    | Error (C.Rejected "fallback") -> fail "%s reused an exec marker" name
+    | Ok _ -> fail "%s executed" name
+    | Error err -> fail "%s %s" name (C.describe err)
+  in
+  later "second rlimit" 2 C.Rlimit "rlimit 13";
+  later "second fd" 2 C.Descriptors "fd 13";
+  later "second mount" 2 C.Isolation "snapshot_bind ";
+  later "cmt rlimit" 6 C.Rlimit "rlimit 13";
   let sentinel = Filename.temp_file "ocagent-sentinel" "" in
   let oc = open_out sentinel in
   output_string oc "secret";

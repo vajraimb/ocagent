@@ -265,6 +265,13 @@ let stage_text code =
     | 8 -> "chdir"
     | 9 -> "landlock"
     | 10 -> "setgroups"
+    | 11 -> "propagation_private"
+    | 12 -> "jail_mkdir"
+    | 13 -> "jail_tmpfs"
+    | 14 -> "snapshot_bind"
+    | 15 -> "snapshot_readonly"
+    | 16 -> "work_bind"
+    | 17 -> "root_move"
     | n -> "stage" ^ string_of_int n
   in
   stage ^ " " ^ string_of_int (code mod 1000)
@@ -433,7 +440,22 @@ external to_int : Unix.file_descr -> int = "%identity"
 let userns_setup_failure msg =
   List.exists
     (fun prefix -> String.starts_with ~prefix msg)
-    [ "namespace "; "setgroups "; "uid "; "gid "; "mount "; "chroot "; "chdir " ]
+    [
+      "namespace ";
+      "setgroups ";
+      "uid ";
+      "gid ";
+      "mount ";
+      "chroot ";
+      "chdir ";
+      "propagation_private ";
+      "jail_mkdir ";
+      "jail_tmpfs ";
+      "snapshot_bind ";
+      "snapshot_readonly ";
+      "work_bind ";
+      "root_move ";
+    ]
 
 let wait_byte fd deadline =
   let buf = Bytes.create 1 in
@@ -478,10 +500,25 @@ let finish_status ~marker text status =
   | _ -> Error (Rejected "compiler failed")
 
 let observed_netns = ref ""
+let fault_skip = ref 0
+let marker_seq = ref 0
+
+let fresh_marker dir =
+  marker_seq := !marker_seq + 1;
+  let path = Filename.concat dir (Printf.sprintf ".exec-marker-%d" !marker_seq) in
+  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  path
 
 let run_userns ~deadline ~work ~snap ~setup_fault ~marker ~stdout ~stderr job =
   if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
   else
+    let setup_fault =
+      match setup_fault with
+      | Some _ when !fault_skip > 0 ->
+          fault_skip := !fault_skip - 1;
+          None
+      | fault -> fault
+    in
     let status_r, status_w = Unix.pipe ~cloexec:true () in
     let child_to_parent_r, child_to_parent_w = Unix.pipe ~cloexec:true () in
     let parent_to_child_r, parent_to_child_w = Unix.pipe ~cloexec:true () in
@@ -601,13 +638,13 @@ let check_sources ~users source modules =
   | Error (Step_validate.Rejected msg) -> say_limited msg; exit 2
   | Ok () -> mods modules
 
-let validate_child ~hang ~deadline ~snap ~users source modules =
+let validate_child ~hang ~deadline ~snap ~setup_fault ~users source modules =
   let work = Filename.temp_dir "ocagent-check" "" in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close null; remove_tree work) (fun () ->
-      let marker = Filename.concat work "exec-marker" in
+      let marker = fresh_marker work in
       match
-        run_userns ~deadline ~work ~snap ~setup_fault:None ~marker ~stdout:null ~stderr:null
+        run_userns ~deadline ~work ~snap ~setup_fault ~marker ~stdout:null ~stderr:null
           (Call
              (fun () ->
                if hang then Unix.sleep 60;
@@ -619,12 +656,12 @@ let validate_child ~hang ~deadline ~snap ~users source modules =
       | Error (Rejected msg) -> Error (Rejected msg)
       | Error _ as err -> err)
 
-let validate_cmt ~deadline ~snap ~users dir names =
+let validate_cmt ~deadline ~snap ~setup_fault ~users dir names =
   let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close null) (fun () ->
-      let marker = Filename.concat dir "exec-marker" in
+      let marker = fresh_marker dir in
       match
-        run_userns ~deadline ~work:dir ~snap ~setup_fault:None ~marker ~stdout:null ~stderr:null
+        run_userns ~deadline ~work:dir ~snap ~setup_fault ~marker ~stdout:null ~stderr:null
           (Call
              (fun () ->
                let rec go = function
@@ -641,7 +678,7 @@ let validate_cmt ~deadline ~snap ~users dir names =
       | Error (Unavailable msg) when String.starts_with ~prefix:"rlimit" msg -> Error (Unavailable msg)
       | Error _ as err -> err)
 
-let source_gate ~hang ~deadline ~snap ~source ~modules ~input =
+let source_gate ~hang ~deadline ~snap ~setup_fault ~source ~modules ~input =
   if List.length modules > 16 then Error (Rejected "too many modules")
   else if (not (text_ok source)) || List.exists (fun item -> not (text_ok item.source && text_ok item.interface_)) modules then
     Error (Rejected "too big")
@@ -650,14 +687,14 @@ let source_gate ~hang ~deadline ~snap ~source ~modules ~input =
     let names = List.map (fun item -> item.name) modules in
     if List.exists (fun name -> not (module_name_ok name)) names then Error (Rejected "module name")
     else if List.length names <> List.length (List.sort_uniq String.compare names) then Error (Rejected "duplicate module")
-    else validate_child ~hang ~deadline ~snap ~users:("Step" :: names) source modules
+    else validate_child ~hang ~deadline ~snap ~setup_fault ~users:("Step" :: names) source modules
 
 let landlock_note = ref (fun ~work:_ ~snap:_ msg -> Error (Unavailable msg))
 
 let launch_compile ~deadline ~work ~tools ~setup_fault args =
   let stdout_path = Filename.concat work "tool.out" in
   let stderr_path = Filename.concat work "tool.err" in
-  let marker = Filename.concat work "exec-marker" in
+  let marker = fresh_marker work in
   let out = Unix.openfile stdout_path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
   let err = Unix.openfile stderr_path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close out; Unix.close err) (fun () ->
@@ -677,7 +714,7 @@ let launch_compile ~deadline ~work ~tools ~setup_fault args =
       | Error _ as err -> err)
 
 let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
-  match source_gate ~hang ~deadline ~snap:tools.root ~source ~modules ~input with
+  match source_gate ~hang ~deadline ~snap:tools.root ~setup_fault ~source ~modules ~input with
   | Error _ as err -> err
   | Ok () -> (
       match input_text input with
@@ -723,7 +760,7 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                   | Error _ as err -> err
                   | Ok () -> (
                       match
-                        validate_cmt ~deadline ~snap:tools.root ~users:("Step" :: List.map (fun item -> item.name) modules) dir
+                        validate_cmt ~deadline ~snap:tools.root ~setup_fault ~users:("Step" :: List.map (fun item -> item.name) modules) dir
                           ("step" :: List.map (fun item -> item.name) modules)
                       with
                       | Error _ as err -> err
@@ -768,16 +805,23 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                                   }))))))
 
 let compile_go ~setup_fault ~hang ~budget ~source ~modules ~input =
-  let deadline = Unix.gettimeofday () +. budget in
-  match select_toolchain ~deadline with
-  | Error _ as err -> err
-  | Ok tools ->
-      Fun.protect ~finally:(fun () -> release tools) (fun () -> compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input)
+  fault_skip := 0;
+  Fun.protect ~finally:(fun () -> fault_skip := 0) (fun () ->
+      let deadline = Unix.gettimeofday () +. budget in
+      match select_toolchain ~deadline with
+      | Error _ as err -> err
+      | Ok tools ->
+          Fun.protect ~finally:(fun () -> release tools) (fun () -> compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input))
 
 let compile ~source ~modules ~input = compile_go ~setup_fault:None ~hang:false ~budget:compile_timeout ~source ~modules ~input
 
 let compile_fault setup_fault ~source ~modules ~input =
   compile_go ~setup_fault:(Some setup_fault) ~hang:false ~budget:compile_timeout ~source ~modules ~input
+
+let compile_fault_after n setup_fault ~deadline tools ~source ~modules ~input =
+  fault_skip := n;
+  Fun.protect ~finally:(fun () -> fault_skip := 0) (fun () ->
+      compile_with ~setup_fault:(Some setup_fault) ~hang:false ~deadline tools ~source ~modules ~input)
 
 let admit ~path ~run_id ~agent_version ~admission_key artifact =
   match Store.admit_step ~path ~run_id ~agent_version ~admission_key artifact.bundle with
@@ -873,7 +917,7 @@ let probe_isolation tools ~sentinel ~tcp_port ~udp_port =
   let work = Filename.temp_dir "ocagent-probe" "" in
   let null = Unix.openfile "/dev/null" [ Unix.O_RDWR ] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close null; remove_tree work) (fun () ->
-      let marker = Filename.concat work "exec-marker" in
+      let marker = fresh_marker work in
       let deadline = Unix.gettimeofday () +. 5. in
       match
         run_userns ~deadline ~work ~snap:tools.root ~setup_fault:None ~marker ~stdout:null ~stderr:null

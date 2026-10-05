@@ -28,6 +28,13 @@
 #define ST_CHDIR 8
 #define ST_LANDLOCK 9
 #define ST_SETGROUPS 10
+#define ST_PROPAGATION 11
+#define ST_JAIL_MKDIR 12
+#define ST_JAIL_TMPFS 13
+#define ST_SNAPSHOT_BIND 14
+#define ST_SNAPSHOT_RO 15
+#define ST_WORK_BIND 16
+#define ST_ROOT_MOVE 17
 
 #ifndef __NR_landlock_create_ruleset
 #define __NR_landlock_create_ruleset 444
@@ -146,34 +153,52 @@ static int write_text(const char *path, const char *text) {
   return 0;
 }
 
-static int bind_at(const char *jail, const char *src, int readonly) {
+static int stage_errno(int stage) { return stage * 1000 + errno; }
+
+static int bind_tree(const char *jail, const char *src) {
   struct stat st;
+  char dst[4096];
   if (stat(src, &st) != 0) return -1;
+  if (!S_ISDIR(st.st_mode)) {
+    errno = ENOTDIR;
+    return -1;
+  }
+  if (snprintf(dst, sizeof dst, "%s%s", jail, src) >= (int)sizeof dst) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  mkdir_p(dst);
+  if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) != 0) return -1;
+  return 0;
+}
+
+static int remount_readonly(const char *jail, const char *src) {
   char dst[4096];
   if (snprintf(dst, sizeof dst, "%s%s", jail, src) >= (int)sizeof dst) {
     errno = ENAMETOOLONG;
     return -1;
   }
-  if (S_ISDIR(st.st_mode)) {
-    mkdir_p(dst);
-    if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) != 0) return -1;
-  } else {
-    char parent[4096];
-    snprintf(parent, sizeof parent, "%s", dst);
-    char *slash = strrchr(parent, '/');
-    if (slash == NULL) {
-      errno = EINVAL;
-      return -1;
-    }
-    *slash = 0;
-    mkdir_p(parent);
-    int fd = open(dst, O_CREAT | O_WRONLY, 0644);
-    if (fd < 0) return -1;
-    close(fd);
-    if (mount(src, dst, NULL, MS_BIND, NULL) != 0) return -1;
-  }
-  if (readonly && mount(NULL, dst, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) return -1;
+  if (mount(NULL, dst, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) return -1;
   return 0;
+}
+
+value ocagent_mount_jail(value v_work, value v_snap) {
+  CAMLparam2(v_work, v_snap);
+  char work[4096], snap[4096], jail[128];
+  if (copy_path(v_work, work, sizeof work)) CAMLreturn(Val_int(ST_WORK_BIND * 1000 + ENAMETOOLONG));
+  if (copy_path(v_snap, snap, sizeof snap)) CAMLreturn(Val_int(ST_SNAPSHOT_BIND * 1000 + ENAMETOOLONG));
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_PROPAGATION)));
+  snprintf(jail, sizeof jail, "/tmp/ocagent-jail-%d", getpid());
+  if (mkdir(jail, 0700) != 0 && errno != EEXIST) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  if (mount("tmpfs", jail, "tmpfs", 0, "size=64m") != 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_TMPFS)));
+  if (bind_tree(jail, snap) != 0) CAMLreturn(Val_int(stage_errno(ST_SNAPSHOT_BIND)));
+  if (remount_readonly(jail, snap) != 0) CAMLreturn(Val_int(stage_errno(ST_SNAPSHOT_RO)));
+  if (bind_tree(jail, work) != 0) CAMLreturn(Val_int(stage_errno(ST_WORK_BIND)));
+  if (chdir(jail) != 0) CAMLreturn(Val_int(stage_errno(ST_CHDIR)));
+  if (mount(".", "/", NULL, MS_MOVE, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_ROOT_MOVE)));
+  if (chroot(".") != 0) CAMLreturn(Val_int(stage_errno(ST_CHROOT)));
+  if (chdir("/") != 0) CAMLreturn(Val_int(stage_errno(ST_CHDIR)));
+  CAMLreturn(Val_int(0));
 }
 
 value ocagent_clearenv(value unit) {
@@ -202,23 +227,6 @@ value ocagent_write_maps(value v_pid) {
   snprintf(map, sizeof map, "0 %u 1\n", (unsigned)gid);
   if (write_text(path, map) != 0) return Val_int(ST_GID * 1000 + errno);
   return Val_int(0);
-}
-
-value ocagent_mount_jail(value v_work, value v_snap) {
-  CAMLparam2(v_work, v_snap);
-  char work[4096], snap[4096], jail[128];
-  if (copy_path(v_work, work, sizeof work) || copy_path(v_snap, snap, sizeof snap)) CAMLreturn(Val_int(ST_MOUNT * 1000 + ENAMETOOLONG));
-  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  snprintf(jail, sizeof jail, "/tmp/ocagent-jail-%d", getpid());
-  if (mkdir(jail, 0700) != 0 && errno != EEXIST) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  if (mount("tmpfs", jail, "tmpfs", 0, "size=64m") != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  if (bind_at(jail, snap, 1) != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  if (bind_at(jail, work, 0) != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  if (chdir(jail) != 0) CAMLreturn(Val_int(fail_stage(ST_CHDIR)));
-  if (mount(".", "/", NULL, MS_MOVE, NULL) != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
-  if (chroot(".") != 0) CAMLreturn(Val_int(fail_stage(ST_CHROOT)));
-  if (chdir("/") != 0) CAMLreturn(Val_int(fail_stage(ST_CHDIR)));
-  CAMLreturn(Val_int(0));
 }
 
 struct ll_attr6 {

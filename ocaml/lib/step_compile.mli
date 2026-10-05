@@ -73,6 +73,16 @@ val compile_fault :
   input:(string * string) list ->
   (validated_artifact, error) result
 
+val compile_fault_after :
+  int ->
+  setup_fault ->
+  deadline:float ->
+  toolchain ->
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (validated_artifact, error) result
+
 val admit :
   path:string ->
   run_id:string ->
