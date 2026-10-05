@@ -33,23 +33,32 @@ let max_safe = 9007199254740991
 
 let utf8_ok s =
   let n = String.length s in
+  let rec cont s j stop =
+    if j = stop then true
+    else
+      let b = Char.code s.[j] in
+      b land 0xC0 = 0x80 && cont s (j + 1) stop
+  in
   let rec loop i =
     if i >= n then true
     else
       let c = Char.code s.[i] in
       if c < 0x80 then loop (i + 1)
+      else if c < 0xC2 || c > 0xF4 then false
       else
-        let len = if c land 0xE0 = 0xC0 then 2 else if c land 0xF0 = 0xE0 then 3 else if c land 0xF8 = 0xF0 then 4 else 0 in
-        if len = 0 || i + len > n then false
-        else if c = 0xC0 || c = 0xC1 || c >= 0xF5 then false
+        let len, lo, hi =
+          if c <= 0xDF then (2, 0x80, 0xBF)
+          else if c = 0xE0 then (3, 0xA0, 0xBF)
+          else if c = 0xED then (3, 0x80, 0x9F)
+          else if c <= 0xEF then (3, 0x80, 0xBF)
+          else if c = 0xF0 then (4, 0x90, 0xBF)
+          else if c <= 0xF3 then (4, 0x80, 0xBF)
+          else (4, 0x80, 0x8F)
+        in
+        if i + len > n then false
         else
-          let rec cont j =
-            if j = i + len then true
-            else
-              let d = Char.code s.[j] in
-              d land 0xC0 = 0x80 && cont (j + 1)
-          in
-          cont (i + 1) && loop (i + len)
+          let second = Char.code s.[i + 1] in
+          second >= lo && second <= hi && cont s (i + 2) (i + len) && loop (i + len)
   in
   loop 0
 
@@ -187,12 +196,16 @@ let parse_number p =
       | Some n when n > max_safe || n < -max_safe -> Error Bad_number
       | Some n -> Ok (Int n)
 
+let starts p lit =
+  let n = String.length lit in
+  p.i + n <= String.length p.s && String.sub p.s p.i n = lit
+
 let rec parse_value p =
   skip p;
   match peek p with
-  | 'n' -> if String.sub p.s p.i 4 = "null" then (p.i <- p.i + 4; Ok Null) else fail "null"
-  | 't' -> if String.sub p.s p.i 4 = "true" then (p.i <- p.i + 4; Ok (Bool true)) else fail "bool"
-  | 'f' -> if String.sub p.s p.i 5 = "false" then (p.i <- p.i + 5; Ok (Bool false)) else fail "bool"
+  | 'n' -> if starts p "null" then (p.i <- p.i + 4; Ok Null) else fail "null"
+  | 't' -> if starts p "true" then (p.i <- p.i + 4; Ok (Bool true)) else fail "bool"
+  | 'f' -> if starts p "false" then (p.i <- p.i + 5; Ok (Bool false)) else fail "bool"
   | '"' -> (
       match parse_string p with
       | Ok s -> Ok (String s)
@@ -555,6 +568,19 @@ let parse_record text =
   | Error _ as e -> e
   | Ok json -> record_of_json json
 
+let operation_hash ~execution_hash ~step_id ~kind ~codec_version ~approval ~params_hash =
+  sha256
+    (canonical
+       (Obj
+          [
+            ("approval", Bool approval);
+            ("codec_version", Int codec_version);
+            ("execution_hash", String execution_hash);
+            ("kind", String kind);
+            ("params_hash", String params_hash);
+            ("step_id", String step_id);
+          ]))
+
 type module_bytes = {
   name : string;
   source : string;
@@ -584,7 +610,7 @@ let build ~run_id ~step_id ~step_seq (b : bundle) =
       | [] -> Ok (List.rev acc)
       | m :: rest ->
           if not (module_name_ok m.name) then Error (Bad_module m.name)
-          else if not (utf8_ok m.source && utf8_ok m.interface_ && utf8_ok m.artifact) then Error Bad_utf8
+          else if not (utf8_ok m.source && utf8_ok m.interface_) then Error Bad_utf8
           else
             let desc =
               {
@@ -603,7 +629,7 @@ let build ~run_id ~step_id ~step_seq (b : bundle) =
         if List.length names <> List.length (List.sort_uniq String.compare names) then Error (Bad_module "duplicate")
         else if
           not
-            (utf8_ok b.compiler_id && utf8_ok b.runtime_id && utf8_ok b.sdk && utf8_ok b.driver && utf8_ok b.artifact
+            (utf8_ok b.compiler_id && utf8_ok b.runtime_id && utf8_ok b.sdk && utf8_ok b.driver
            && utf8_ok b.base_workspace && utf8_ok b.input_context && utf8_ok b.capability_grant && utf8_ok b.policy_version)
         then Error Bad_utf8
         else

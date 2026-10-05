@@ -100,4 +100,32 @@ let () =
   | Error (M.Bad_module _) -> ()
   | Ok _ -> fail "path escape accepted"
   | Error e -> fail "escape %s" (M.describe e));
+  List.iter
+    (fun bad ->
+      match M.parse bad with
+      | Error _ -> ()
+      | exception exn -> fail "truncated %S raised %s" bad (Printexc.to_string exn)
+      | Ok _ -> fail "accepted truncated %S" bad)
+    [ "n"; "t"; "f"; "tru"; "fals"; "nul" ];
+  List.iter
+    (fun bad ->
+      match M.parse (Printf.sprintf "\"%s\"" bad) with
+      | Error (M.Bad_utf8 | M.Bad_json _) -> ()
+      | exception exn -> fail "utf8 %S raised %s" bad (Printexc.to_string exn)
+      | Ok _ -> fail "accepted bad utf8 %S" bad
+      | Error e -> fail "utf8 %S as %s" bad (M.describe e))
+    [ "\xC0\x80"; "\xED\xA0\x80"; "\xF0\x80\x80\x80" ];
+  (match M.parse "\"\\uD800\"" with
+  | Error _ -> ()
+  | Ok _ -> fail "surrogate escape accepted");
+  let binary = bundle "let run () = Done \"ok\"\n" [ { mod_a with artifact = "\xFF\xFE\x00" } ] in
+  let binary = { binary with M.artifact = "\xFF\xFE not utf8" } in
+  (match M.build ~run_id:"run" ~step_id:"0" ~step_seq:0 binary with
+  | Ok m when m.artifact_hash = M.sha256 "\xFF\xFE not utf8" -> ()
+  | Ok _ -> fail "binary artifact hash"
+  | Error e -> fail "binary artifact rejected: %s" (M.describe e));
+  (match M.build ~run_id:"run" ~step_id:"0" ~step_seq:0 (bundle "\xFF" []) with
+  | Error M.Bad_utf8 -> ()
+  | Ok _ -> fail "bad source accepted"
+  | Error e -> fail "bad source %s" (M.describe e));
   print_endline "step manifest ok"

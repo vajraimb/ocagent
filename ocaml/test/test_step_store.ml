@@ -2,6 +2,7 @@
 
 module S = Ocagent_harness.Store
 module M = Step_manifest
+module Json = Ocagent_harness.Json
 
 let fail fmt = Printf.ksprintf failwith fmt
 
@@ -42,6 +43,11 @@ let bundle source =
 
 let admit path source key =
   S.admit_step ~path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:key (bundle source)
+
+let contains s sub =
+  let n = String.length s and m = String.length sub in
+  let rec at i = i + m <= n && (String.sub s i m = sub || at (i + 1)) in
+  m = 0 || at 0
 
 let () =
   let path = fresh () in
@@ -115,4 +121,81 @@ let () =
   | Ok _ -> fail "missing artifact ran"
   | Error err -> fail "missing %s" (S.describe err));
   if S.file_bytes missing <> kept || (ok (S.read_snapshot missing)).epoch <> kept_epoch then fail "missing artifact wrote the snapshot";
+  let pending = fresh () in
+  let pending_manifest = ok (admit pending "let run () = Done \"ok\"\n" "adm") in
+  let issued = ref None in
+  (match
+     S.with_step_executor ~path:pending ~execution_hash:pending_manifest.execution_hash (fun ex ->
+         let request =
+           {
+             S.seq = 0;
+             kind = "Fetch";
+             label = "Fetch";
+             req_hash = "params";
+             req = Json.String "http://127.0.0.1/spec";
+             recovery = "Manual_only";
+             approval = false;
+           }
+         in
+         match S.prepare_operation ex request with
+         | Ok (S.Execute token) -> (
+             issued := Some token;
+             match S.complete_step ex ~cursor:1 ~reply:"early" ~workspace_hash:"ws" with
+             | Error S.Replay_incomplete -> Ok ()
+             | Ok () -> fail "pending fetch completed"
+             | Error err -> fail "pending %s" (S.describe err))
+         | Ok _ -> fail "fetch was not executable"
+         | Error err -> fail "prepare %s" (S.describe err))
+   with
+  | Ok (S.Resumed ()) -> ()
+  | _ -> fail "pending run");
+  let open_bytes = S.file_bytes pending in
+  (match (ok (S.read_snapshot pending)).step with
+  | Some record when record.state = M.Completed -> fail "pending fetch became completed"
+  | Some _ -> ()
+  | None -> fail "pending lost the step");
+  let token = match !issued with Some token -> token | None -> fail "no issued" in
+  let exported = S.export_issued token in
+  if not (contains exported pending_manifest.execution_hash) then fail "issued is not bound to the step";
+  let other = fresh () in
+  let other_manifest =
+    ok (S.admit_step ~path:other ~run_id:"other-run" ~agent_version:"step-v3" ~admission_key:"adm" (bundle "let run () = Done \"ok\"\n"))
+  in
+  let other_bytes = S.file_bytes other in
+  (match S.commit_result other token (Json.String "spec-body") with
+  | Error S.Manifest_mismatch -> ()
+  | Ok () -> fail "issued committed on another step"
+  | Error err -> fail "cross commit %s" (S.describe err));
+  if S.file_bytes other <> other_bytes then fail "cross commit wrote the other snapshot";
+  ignore other_manifest;
+  ok (S.commit_result pending token (Json.String "spec-body"));
+  (match
+     S.with_step_executor ~path:pending ~execution_hash:pending_manifest.execution_hash (fun ex ->
+         ok (S.complete_step ex ~cursor:1 ~reply:"done" ~workspace_hash:"ws");
+         let request =
+           {
+             S.seq = 1;
+             kind = "Fetch";
+             label = "Fetch";
+             req_hash = "again";
+             req = Json.String "http://127.0.0.1/spec";
+             recovery = "Manual_only";
+             approval = false;
+           }
+         in
+         match S.prepare_operation ex request with
+         | Error (S.Protocol "completed") -> Ok ()
+         | Ok _ -> fail "completed step accepted another operation"
+         | Error err -> fail "after complete %s" (S.describe err))
+   with
+  | Ok (S.Resumed ()) -> ()
+  | Ok (S.Stored_completion _) -> fail "just completed looked already stored"
+  | Error err -> fail "finish %s" (S.describe err));
+  let closed = S.file_bytes pending in
+  (match S.commit_result pending token (Json.String "spec-body") with
+  | Error (S.Protocol "completed") -> ()
+  | Ok () -> fail "completed ledger accepted another commit"
+  | Error err -> fail "late commit %s" (S.describe err));
+  if S.file_bytes pending <> closed then fail "late commit wrote the snapshot";
+  if S.file_bytes pending = open_bytes then fail "completion did not record the result";
   print_endline "step store ok"

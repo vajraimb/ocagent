@@ -51,6 +51,8 @@ type executor = {
   run_id : string;
   agent_version : string;
   epoch : int;
+  execution_hash : string option;
+  step_id : string option;
 }
 
 type issued = {
@@ -59,6 +61,8 @@ type issued = {
   seq : int;
   request_hash : string;
   issued_attempt : int;
+  execution_hash : string option;
+  step_id : string option;
 }
 
 type operation_request = {
@@ -87,14 +91,28 @@ type snapshot = {
 let epoch (executor : executor) = executor.epoch
 
 let export_issued issued =
-  String.concat "\n"
-    [
-      issued.run_id;
-      issued.agent_version;
-      string_of_int issued.seq;
-      issued.request_hash;
-      string_of_int issued.issued_attempt;
-    ]
+  match (issued.execution_hash, issued.step_id) with
+  | None, None ->
+      String.concat "\n"
+        [
+          issued.run_id;
+          issued.agent_version;
+          string_of_int issued.seq;
+          issued.request_hash;
+          string_of_int issued.issued_attempt;
+        ]
+  | Some execution_hash, Some step_id ->
+      String.concat "\n"
+        [
+          issued.run_id;
+          issued.agent_version;
+          string_of_int issued.seq;
+          issued.request_hash;
+          string_of_int issued.issued_attempt;
+          execution_hash;
+          step_id;
+        ]
+  | _ -> raise (Corrupt "issued scope")
 
 let import_issued text =
   match String.split_on_char '\n' text with
@@ -107,6 +125,21 @@ let import_issued text =
             seq = int_of_string seq;
             request_hash;
             issued_attempt = int_of_string attempt;
+            execution_hash = None;
+            step_id = None;
+          }
+      with Failure _ -> Error (Protocol "issued"))
+  | [ run_id; agent_version; seq; request_hash; attempt; execution_hash; step_id ] -> (
+      try
+        Ok
+          {
+            run_id;
+            agent_version;
+            seq = int_of_string seq;
+            request_hash;
+            issued_attempt = int_of_string attempt;
+            execution_hash = Some execution_hash;
+            step_id = Some step_id;
           }
       with Failure _ -> Error (Protocol "issued"))
   | _ -> Error (Protocol "issued")
@@ -321,7 +354,7 @@ let claim path ~run_id ~agent_version =
                 write_snap path { snap with revision = snap.revision + 1; epoch };
                 Ok epoch))
 
-let with_locked ~path ~run_id ~agent_version claim f =
+let with_locked ~path ~run_id ~agent_version ?(execution_hash = None) ?(step_id = None) claim f =
   let path = canonical path in
   if not (try_acquire path) then Error Already_running
   else
@@ -344,7 +377,7 @@ let with_locked ~path ~run_id ~agent_version claim f =
                 (fun () ->
                   match claim path with
                   | Error _ as err -> err
-                  | Ok epoch -> f { path; run_id; agent_version; epoch })))
+                  | Ok epoch -> f { path; run_id; agent_version; epoch; execution_hash; step_id })))
 
 let with_executor ~path ~run_id ~agent_version f =
   with_locked ~path ~run_id ~agent_version (fun path -> claim path ~run_id ~agent_version) f
@@ -371,66 +404,97 @@ let fresh ~run_id seq request ~attempt ~dispatched =
 
 let append journal entry = journal.Journal.entries := !(journal.entries) @ [ entry ]
 
+let completed snap =
+  match snap.step with
+  | Some record when record.Step_manifest.state = Step_manifest.Completed -> true
+  | _ -> false
+
+let step_scope snap ~execution_hash ~step_id =
+  match (snap.step, execution_hash, step_id) with
+  | None, None, None -> Ok None
+  | Some record, Some hash, Some id
+    when record.Step_manifest.manifest.execution_hash = hash && record.manifest.step_id = id ->
+      Ok (Some (hash, id))
+  | _ -> Error Manifest_mismatch
+
+let bound_hash scope request =
+  match scope with
+  | None -> request.req_hash
+  | Some (hash, step_id) ->
+      Step_manifest.operation_hash ~execution_hash:hash ~step_id ~kind:request.kind ~codec_version:1
+        ~approval:request.approval ~params_hash:request.req_hash
+
 let prepare_operation executor request =
   with_store executor.path (fun () ->
       match read_snapshot executor.path with
       | Error _ as err -> err
-      | Ok snap ->
-          if executor.epoch <> snap.epoch then Error Stale_attempt
-          else if snap.journal.run_id <> executor.run_id then Error Run_mismatch
-          else if snap.journal.agent_version <> executor.agent_version then Error Version_mismatch
-          else if request.seq < 0 || request.seq > List.length !(snap.journal.entries) then Error (Protocol "seq")
-          else if request.approval && request.kind <> "Ask_human" then Error (Bad_decision "不是审批")
-          else if (not request.approval) && request.recovery <> "Manual_only" then Error (Protocol "recovery")
-          else
-            let issued =
-              {
-                run_id = executor.run_id;
-                agent_version = executor.agent_version;
-                seq = request.seq;
-                request_hash = request.req_hash;
-                issued_attempt = executor.epoch;
-              }
-            in
-            match Journal.nth snap.journal request.seq with
-            | Some existing when existing.req_hash <> request.req_hash || existing.kind <> request.kind ->
-                Error Request_changed
-            | Some existing when existing.status = Journal.Unknown -> Error Unknown_result
-            | Some existing when existing.status = Journal.Done -> Ok (Replay existing.result)
-            | Some existing when existing.kind = "Ask_human" && (not existing.dispatched) -> Ok Awaiting_approval
-            | Some existing when existing.dispatched -> Ok In_flight
-            | Some _ -> Error (Protocol "status")
-            | None ->
-                let entry =
-                  fresh ~run_id:executor.run_id request.seq request ~attempt:executor.epoch
-                    ~dispatched:(not request.approval)
+      | Ok snap when completed snap -> Error (Protocol "completed")
+      | Ok snap -> (
+          match step_scope snap ~execution_hash:executor.execution_hash ~step_id:executor.step_id with
+          | Error _ as err -> err
+          | Ok scope ->
+              let request = { request with req_hash = bound_hash scope request } in
+              if executor.epoch <> snap.epoch then Error Stale_attempt
+              else if snap.journal.run_id <> executor.run_id then Error Run_mismatch
+              else if snap.journal.agent_version <> executor.agent_version then Error Version_mismatch
+              else if request.seq < 0 || request.seq > List.length !(snap.journal.entries) then Error (Protocol "seq")
+              else if request.approval && request.kind <> "Ask_human" then Error (Bad_decision "不是审批")
+              else if (not request.approval) && request.recovery <> "Manual_only" then Error (Protocol "recovery")
+              else
+                let issued =
+                  {
+                    run_id = executor.run_id;
+                    agent_version = executor.agent_version;
+                    seq = request.seq;
+                    request_hash = request.req_hash;
+                    issued_attempt = executor.epoch;
+                    execution_hash = executor.execution_hash;
+                    step_id = executor.step_id;
+                  }
                 in
-                append snap.journal entry;
-                write_snap executor.path { snap with revision = snap.revision + 1 };
-                Ok (if request.approval then Awaiting_approval else Execute issued))
+                match Journal.nth snap.journal request.seq with
+                | Some existing when existing.req_hash <> request.req_hash || existing.kind <> request.kind ->
+                    Error Request_changed
+                | Some existing when existing.status = Journal.Unknown -> Error Unknown_result
+                | Some existing when existing.status = Journal.Done -> Ok (Replay existing.result)
+                | Some existing when existing.kind = "Ask_human" && (not existing.dispatched) -> Ok Awaiting_approval
+                | Some existing when existing.dispatched -> Ok In_flight
+                | Some _ -> Error (Protocol "status")
+                | None ->
+                    let entry =
+                      fresh ~run_id:executor.run_id request.seq request ~attempt:executor.epoch
+                        ~dispatched:(not request.approval)
+                    in
+                    append snap.journal entry;
+                    write_snap executor.path { snap with revision = snap.revision + 1 };
+                    Ok (if request.approval then Awaiting_approval else Execute issued)))
 
 let commit_result path (issued : issued) result_json =
   with_store path (fun () ->
       match read_snapshot path with
       | Error _ as err -> err
+      | Ok snap when completed snap -> Error (Protocol "completed")
       | Ok snap -> (
-          match Journal.nth snap.journal issued.seq with
-          | None -> Error (Protocol "seq")
-          | Some entry when entry.kind = "Ask_human" -> Error (Bad_decision "审批不能走结果入口")
-          | Some entry
-            when issued.run_id <> snap.journal.run_id
-                 || issued.agent_version <> snap.journal.agent_version
-                 || issued.request_hash <> entry.req_hash ->
-              Error Request_changed
-          | Some _ when issued.issued_attempt <> snap.epoch -> Error Stale_attempt
-          | Some entry when entry.attempt <> issued.issued_attempt -> Error Stale_attempt
-          | Some entry when entry.status = Journal.Done && entry.result = result_json -> Ok ()
-          | Some entry -> (
-              match Journal.commit entry ~attempt:issued.issued_attempt result_json with
-              | Error _ -> Error Stale_attempt
-              | Ok () ->
-                  write_snap path { snap with revision = snap.revision + 1 };
-                  Ok ())))
+          match step_scope snap ~execution_hash:issued.execution_hash ~step_id:issued.step_id with
+          | Error _ as err -> err
+          | Ok _ -> (
+              match Journal.nth snap.journal issued.seq with
+              | None -> Error (Protocol "seq")
+              | Some entry when entry.kind = "Ask_human" -> Error (Bad_decision "审批不能走结果入口")
+              | Some entry
+                when issued.run_id <> snap.journal.run_id
+                     || issued.agent_version <> snap.journal.agent_version
+                     || issued.request_hash <> entry.req_hash ->
+                  Error Request_changed
+              | Some _ when issued.issued_attempt <> snap.epoch -> Error Stale_attempt
+              | Some entry when entry.attempt <> issued.issued_attempt -> Error Stale_attempt
+              | Some entry when entry.status = Journal.Done && entry.result = result_json -> Ok ()
+              | Some entry -> (
+                  match Journal.commit entry ~attempt:issued.issued_attempt result_json with
+                  | Error _ -> Error Stale_attempt
+                  | Ok () ->
+                      write_snap path { snap with revision = snap.revision + 1 };
+                      Ok ()))))
 
 let decision_ok = function
   | Json.Assoc fields ->
@@ -463,6 +527,7 @@ let commit_decision ~path ~run_id ~agent_version ~seq ~callback_id ~expected_req
         with_store path (fun () ->
             match read_snapshot path with
             | Error _ as err -> err
+            | Ok snap when completed snap -> Error (Protocol "completed")
             | Ok snap -> (
                 match check_identity snap ~run_id ~agent_version with
                 | Error _ as err -> err
@@ -499,6 +564,7 @@ let compare_and_save ~path ~expected_revision ~epoch journal =
   with_store path (fun () ->
       match read_snapshot path with
       | Error _ as err -> err
+      | Ok snap when completed snap -> Error (Protocol "completed")
       | Ok snap when snap.revision <> expected_revision -> Error Revision_conflict
       | Ok snap ->
           write_snap path { revision = snap.revision + 1; epoch; journal; step = snap.step };
@@ -645,8 +711,9 @@ let with_step_executor ~path ~execution_hash f =
                  reply = Option.value record.reply ~default:"";
                  workspace = Option.value record.final_workspace ~default:"";
                })
-      | Some _ ->
+      | Some record ->
           with_locked ~path ~run_id:snap.journal.run_id ~agent_version:snap.journal.agent_version
+            ~execution_hash:(Some record.manifest.execution_hash) ~step_id:(Some record.manifest.step_id)
             (fun path -> claim_step path ~execution_hash)
             (fun executor ->
               match f executor with
@@ -656,10 +723,8 @@ let with_step_executor ~path ~execution_hash f =
 let has_unknown journal =
   List.exists (fun entry -> entry.Journal.status = Journal.Unknown) !(journal.Journal.entries)
 
-let has_pending_ask journal =
-  List.exists
-    (fun entry -> entry.Journal.kind = "Ask_human" && entry.status = Journal.Pending)
-    !(journal.Journal.entries)
+let has_pending journal =
+  List.exists (fun entry -> entry.Journal.status = Journal.Pending) !(journal.Journal.entries)
 
 let complete_step executor ~cursor ~reply ~workspace_hash =
   with_store executor.path (fun () ->
@@ -674,7 +739,7 @@ let complete_step executor ~cursor ~reply ~workspace_hash =
               else Error Approval_conflict
           | Some record when record.state <> Step_manifest.Running -> Error (Protocol "state")
           | Some _ when has_unknown snap.journal -> Error Unknown_result
-          | Some _ when has_pending_ask snap.journal -> Error (Protocol "approval")
+          | Some _ when has_pending snap.journal -> Error Replay_incomplete
           | Some _ when cursor <> List.length !(snap.journal.entries) -> Error Replay_incomplete
           | Some record ->
               let step = { record with state = Completed; reply = Some reply; final_workspace = Some workspace_hash } in
@@ -694,6 +759,7 @@ let approve_step ~path ~execution_hash ~seq ~callback_id ~expected_request_hash 
                 match snap.step with
                 | None -> Error Version_unavailable
                 | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
+                | Some record when record.state = Step_manifest.Completed -> Error (Protocol "completed")
                 | Some _ -> (
                     match Journal.nth snap.journal seq with
                     | None -> Error (Protocol "seq")
