@@ -33,7 +33,8 @@ let io_value = function
   | "print_char" | "print_string" | "print_bytes" | "print_int" | "print_float" | "print_endline" | "print_newline"
   | "prerr_char" | "prerr_string" | "prerr_bytes" | "prerr_int" | "prerr_float" | "prerr_endline" | "prerr_newline"
   | "read_line" | "read_int" | "read_int_opt" | "read_float" | "read_float_opt" | "set_binary_mode_in"
-  | "set_binary_mode_out" | "unsafe_really_input" ->
+  | "set_binary_mode_out" | "unsafe_really_input" | "stdin" | "stdout" | "stderr" | "in_channel" | "out_channel"
+  | "add_channel" | "output_buffer" ->
       true
   | _ -> false
 

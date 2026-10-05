@@ -39,7 +39,39 @@ let compile_ok () =
   | Ok artifact -> artifact
   | Error err -> fail "compile %s" (C.describe err)
 
+let vnum () =
+  let ic = Unix.open_process_args_in "ocamlc" [| "ocamlc"; "-vnum" |] in
+  Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic))
+
 let () =
+  let expected = vnum () in
+  Unix.putenv "OCAMLLIB" "/no/such/ocagent-lib";
+  Unix.putenv "OCAMLPATH" "/no/such/ocagent-path";
+  let channel =
+    {|open Step_api
+module Step : STEP = struct
+  let run () =
+    let buf = Buffer.create 8 in
+    Buffer.add_channel buf stdin 1;
+    Done (Buffer.contents buf)
+end
+|}
+  in
+  (match C.compile ~source:channel ~modules:[] ~input:[] with
+  | Error (C.Rejected msg) when String.starts_with ~prefix:"forbidden value" msg -> ()
+  | Ok _ -> fail "channel operation was compiled"
+  | Error err -> fail "channel %s" (C.describe err));
+  let standard_in =
+    {|open Step_api
+module Step : STEP = struct
+  let run () = ignore Stdlib.stdin; Done "x"
+end
+|}
+  in
+  (match C.compile ~source:standard_in ~modules:[] ~input:[] with
+  | Error (C.Rejected msg) when String.starts_with ~prefix:"forbidden value" msg -> ()
+  | Ok _ -> fail "stdin was compiled"
+  | Error err -> fail "stdin %s" (C.describe err));
   let absent = fresh () in
   (match C.compile ~source:"let run () = 1\n" ~modules:[] ~input:[] with
   | Error (C.Rejected _) -> ()
@@ -101,6 +133,10 @@ end
     | Error err -> fail "toolchain %s" (C.describe err)
   in
   if manifest.compiler_id <> compiler_id || manifest.runtime_id <> runtime_id then fail "toolchain id was not bound";
+  if not (String.starts_with ~prefix:("ocamlc " ^ expected ^ " ") compiler_id) then
+    fail "compiler id %s does not use probed %s" compiler_id expected;
+  if not (String.starts_with ~prefix:("ocamlrun " ^ expected ^ " ") runtime_id) then
+    fail "runtime id %s does not use probed %s" runtime_id expected;
   let bytes =
     match S.read_blob ~path ~hash:manifest.artifact_hash ~kind:S.Artifact with
     | Ok bytes -> bytes
@@ -163,6 +199,16 @@ end
   | Ok _ -> fail "oversized source was admitted"
   | Error err -> fail "oversize %s" (S.describe err));
   if Sys.file_exists huge_path then fail "oversized source wrote a snapshot";
+  let shared = String.make 300000 'x' in
+  let shared_path = fresh () in
+  (match
+     S.admit_step ~path:shared_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm"
+       { bundle with M.source = shared; artifact = shared }
+   with
+  | Error (S.Protocol "too big") -> ()
+  | Ok _ -> fail "source reused the artifact size limit"
+  | Error err -> fail "shared size %s" (S.describe err));
+  if Sys.file_exists shared_path then fail "shared source wrote a snapshot";
   let binary = String.make 300000 '\x00' in
   let binary_path = fresh () in
   (match

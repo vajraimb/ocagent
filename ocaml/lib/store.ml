@@ -616,7 +616,10 @@ let put_blob path hash bytes ~limit =
     if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
     let target = blob_file path hash in
     if Sys.file_exists target then
-      if Step_manifest.sha256 (read_file target) <> hash then Error Artifact_corrupt else Ok ()
+      let size = (Unix.stat target).st_size in
+      if size < 0 || size > limit then Error (Protocol "too big")
+      else if Step_manifest.sha256 (read_file target) <> hash then Error Artifact_corrupt
+      else Ok ()
     else (
       write_atomic target bytes;
       Ok ())
@@ -633,28 +636,41 @@ let check_blob path hash ~limit =
       else if Step_manifest.sha256 bytes <> hash then Error Artifact_corrupt
       else Ok bytes
 
-let artifact_hashes (m : Step_manifest.t) =
-  m.artifact_hash :: List.map (fun (item : Step_manifest.module_desc) -> item.artifact_hash) m.modules
-
-let hash_limit manifest hash =
-  if List.mem hash (artifact_hashes manifest) then max_artifact else max_text
-
 let check_manifest_blobs path (m : Step_manifest.t) =
-  let hashes =
-    m.source_hash :: m.sdk_hash :: m.driver_hash :: m.artifact_hash :: m.base_workspace_hash :: m.input_context_hash
+  let text_hashes =
+    m.source_hash :: m.sdk_hash :: m.driver_hash :: m.base_workspace_hash :: m.input_context_hash
     :: m.capability_grant_hash
     :: List.concat_map
-         (fun (item : Step_manifest.module_desc) -> [ item.source_hash; item.interface_hash; item.artifact_hash ])
+         (fun (item : Step_manifest.module_desc) -> [ item.source_hash; item.interface_hash ])
          m.modules
   in
-  let rec go = function
+  let artifact_hashes = m.artifact_hash :: List.map (fun (item : Step_manifest.module_desc) -> item.artifact_hash) m.modules in
+  let rec go limit = function
     | [] -> Ok ()
     | hash :: rest -> (
-        match check_blob path hash ~limit:(hash_limit m hash) with
+        match check_blob path hash ~limit with
         | Error _ as err -> err
-        | Ok _ -> go rest)
+        | Ok _ -> go limit rest)
   in
-  go hashes
+  match go max_text text_hashes with
+  | Error _ as err -> err
+  | Ok () -> go max_artifact artifact_hashes
+
+let role_limits (bundle : Step_manifest.bundle) =
+  let text bytes = String.length bytes <= max_text in
+  let artifact bytes = String.length bytes <= max_artifact in
+  let texts =
+    text bundle.source && text bundle.sdk && text bundle.driver && text bundle.base_workspace && text bundle.input_context
+    && text bundle.capability_grant
+    && List.for_all
+         (fun (item : Step_manifest.module_bytes) -> text item.source && text item.interface_)
+         bundle.modules
+  in
+  let artifacts =
+    artifact bundle.artifact
+    && List.for_all (fun (item : Step_manifest.module_bytes) -> artifact item.artifact) bundle.modules
+  in
+  texts && artifacts
 
 let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
   if admission_key = "" then Error (Protocol "admission")
@@ -663,41 +679,36 @@ let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
     | Error err -> Error (Protocol (Step_manifest.describe err))
     | Ok manifest -> (
         let path = canonical path in
-        let module_pairs =
-          List.concat
-            (List.map2
-               (fun (item : Step_manifest.module_desc) (raw : Step_manifest.module_bytes) ->
-                 [ (item.source_hash, raw.source); (item.interface_hash, raw.interface_); (item.artifact_hash, raw.artifact) ])
-               manifest.modules bundle.modules)
-        in
-        let pairs =
+        if not (role_limits bundle) then Error (Protocol "too big")
+        else
+          let pairs =
           [
-            (manifest.source_hash, bundle.Step_manifest.source);
-            (manifest.sdk_hash, bundle.sdk);
-            (manifest.driver_hash, bundle.driver);
-            (manifest.artifact_hash, bundle.artifact);
-            (manifest.base_workspace_hash, bundle.base_workspace);
-            (manifest.input_context_hash, bundle.input_context);
-            (manifest.capability_grant_hash, bundle.capability_grant);
+            (manifest.source_hash, bundle.Step_manifest.source, max_text);
+            (manifest.sdk_hash, bundle.sdk, max_text);
+            (manifest.driver_hash, bundle.driver, max_text);
+            (manifest.artifact_hash, bundle.artifact, max_artifact);
+            (manifest.base_workspace_hash, bundle.base_workspace, max_text);
+            (manifest.input_context_hash, bundle.input_context, max_text);
+            (manifest.capability_grant_hash, bundle.capability_grant, max_text);
           ]
-          @ module_pairs
-        in
-        let rec sized = function
-          | [] -> Ok ()
-          | (hash, bytes) :: rest ->
-              if String.length bytes > hash_limit manifest hash then Error (Protocol "too big") else sized rest
+          @ List.concat
+              (List.map2
+                 (fun (item : Step_manifest.module_desc) (raw : Step_manifest.module_bytes) ->
+                   [
+                     (item.source_hash, raw.source, max_text);
+                     (item.interface_hash, raw.interface_, max_text);
+                     (item.artifact_hash, raw.artifact, max_artifact);
+                   ])
+                 manifest.modules bundle.modules)
         in
         let rec write = function
           | [] -> Ok ()
-          | (hash, bytes) :: rest -> (
-              match put_blob path hash bytes ~limit:(hash_limit manifest hash) with
+          | (hash, bytes, limit) :: rest -> (
+              match put_blob path hash bytes ~limit with
               | Error _ as err -> err
               | Ok () -> write rest)
         in
-        match sized pairs with
-        | Error _ as err -> err
-        | Ok () -> (
-            match write pairs with
+        match write pairs with
         | Error _ as err -> err
         | Ok () ->
             with_store path (fun () ->
@@ -727,7 +738,7 @@ let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
                           else if snap.journal.agent_version <> agent_version then Error Version_mismatch
                           else Ok existing.manifest
                       | Some existing when existing.admission_key = admission_key -> Error Admission_conflict
-                      | Some _ -> Error Multiple_steps_unsupported))))
+                      | Some _ -> Error Multiple_steps_unsupported)))
 
 type preflight =
   | Ready

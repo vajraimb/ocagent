@@ -1,6 +1,9 @@
 (library
  (name ocagent_harness)
  (public_name ocagent-harness)
- (libraries ocagent-protocol unix compiler-libs.common))
+ (libraries ocagent-protocol unix compiler-libs.common)
+ (foreign_stubs
+  (language c)
+  (names ocagent_limits)))
 
 
