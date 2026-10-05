@@ -221,7 +221,11 @@ let render snap =
       let sum = checksum body in
       Printf.sprintf "OCAGENT 2\nrevision %d\nrecords %d\nepoch %d\nchecksum %s\n%s" snap.revision records snap.epoch sum body
   | Some step ->
-      let raw = Step_manifest.canonical_record step in
+      let raw =
+        match Step_manifest.canonical_record step with
+        | Ok raw -> raw
+        | Error err -> raise (Corrupt (Step_manifest.describe err))
+      in
       let payload = raw ^ body in
       let sum = checksum payload in
       Printf.sprintf "OCAGENT 3\nrevision %d\nrecords %d\nepoch %d\nstep_bytes %d\nchecksum %s\n%s" snap.revision records snap.epoch
@@ -248,8 +252,21 @@ let parse text =
     let journal = try Journal.of_jsonl body with Json.Parse msg -> raise (Corrupt msg) in
     if List.length !(journal.entries) <> records then raise (Corrupt "record count");
     (match step with
-    | Some record when record.Step_manifest.manifest.run_id <> journal.run_id -> raise (Corrupt "step run")
-    | _ -> ());
+    | None -> ()
+    | Some record ->
+        let manifest = record.Step_manifest.manifest in
+        let entries = !(journal.entries) in
+        let rec seq_ok i = function
+          | [] -> true
+          | entry :: rest ->
+              entry.Journal.seq = i && entry.run_id = journal.run_id && seq_ok (i + 1) rest
+        in
+        let open_entry entry = entry.Journal.status <> Journal.Done in
+        if manifest.run_id <> journal.run_id || manifest.step_id = "" || manifest.step_seq <> 0 then
+          raise (Corrupt "step identity")
+        else if not (seq_ok 0 entries) then raise (Corrupt "journal seq")
+        else if record.state = Step_manifest.Completed && List.exists open_entry entries then
+          raise (Corrupt "completion"));
     { revision; epoch; journal; step }
   in
   if magic = "OCAGENT 2" then (
@@ -753,8 +770,11 @@ let complete_step executor ~cursor ~reply ~workspace_hash =
           | Some _ when cursor <> List.length !(snap.journal.entries) -> Error Replay_incomplete
           | Some record ->
               let step = { record with state = Completed; reply = Some reply; final_workspace = Some workspace_hash } in
-              write_snap executor.path { snap with revision = snap.revision + 1; step = Some step };
-              Ok ())))
+              match Step_manifest.canonical_record step with
+              | Error _ -> Error (Protocol "reply")
+              | Ok _ ->
+                  write_snap executor.path { snap with revision = snap.revision + 1; step = Some step };
+                  Ok ())))
 
 let approve_step ~path ~execution_hash ~seq ~callback_id ~expected_request_hash ~decision_json =
   if callback_id = "" || String.length callback_id > 128 then Error (Bad_decision "callback")

@@ -34,6 +34,8 @@ let hash_ok s =
   && String.for_all (fun c -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) s
 
 let max_safe = 9007199254740991
+let max_depth = 32
+let max_bytes = 262144
 
 let utf8_ok s =
   let n = String.length s in
@@ -121,10 +123,49 @@ let rec encode buf = function
         fields;
       Buffer.add_char buf '}'
 
+let rec check depth = function
+  | _ when depth > max_depth -> Error (Bad_json "depth")
+  | Null | Bool _ -> Ok ()
+  | Int n when n > max_safe || n < -max_safe -> Error Bad_number
+  | Int _ -> Ok ()
+  | String s when String.length s > max_bytes -> Error (Bad_json "size")
+  | String s -> if utf8_ok s then Ok () else Error Bad_utf8
+  | Arr xs ->
+      let rec go = function
+        | [] -> Ok ()
+        | item :: rest -> (
+            match check (depth + 1) item with
+            | Error _ as err -> err
+            | Ok () -> go rest)
+      in
+      go xs
+  | Obj fields ->
+      let rec go seen = function
+        | [] -> Ok ()
+        | (key, value) :: rest ->
+            if List.mem key seen then Error (Duplicate_key key)
+            else if String.length key > max_bytes then Error (Bad_json "size")
+            else if not (utf8_ok key) then Error Bad_utf8
+            else
+              match check (depth + 1) value with
+              | Error _ as err -> err
+              | Ok () -> go (key :: seen) rest
+      in
+      go [] fields
+
 let canonical json =
-  let buf = Buffer.create 128 in
-  encode buf json;
-  Buffer.contents buf
+  match check 0 json with
+  | Error _ as err -> err
+  | Ok () ->
+      let buf = Buffer.create 128 in
+      encode buf json;
+      let text = Buffer.contents buf in
+      if String.length text > max_bytes then Error (Bad_json "size") else Ok text
+
+let canonical_text json =
+  match canonical json with
+  | Ok text -> text
+  | Error err -> invalid_arg (describe err)
 
 type parser = { s : string; mutable i : int }
 
@@ -246,8 +287,6 @@ let starts p lit =
   let n = String.length lit in
   p.i + n <= String.length p.s && String.sub p.s p.i n = lit
 
-let max_depth = 32
-
 let rec parse_value p depth =
   if depth > max_depth then fail "depth"
   else (
@@ -323,8 +362,10 @@ and parse_object p depth =
     fields []
 
 let parse text =
-  let p = { s = text; i = 0 } in
-  match parse_value p 0 with
+  if String.length text > max_bytes then Error (Bad_json "size")
+  else
+    let p = { s = text; i = 0 } in
+    match parse_value p 0 with
   | Error _ as e -> e
   | Ok v ->
       skip p;
@@ -464,7 +505,7 @@ let manifest_json m =
   | Obj fields -> Obj (("execution_hash", String m.execution_hash) :: fields)
   | other -> other
 
-let seal m = { m with execution_hash = sha256 (canonical (preimage m)) }
+let seal m = { m with execution_hash = sha256 (canonical_text (preimage m)) }
 
 let reply_json = function
   | Continue text -> Obj [ ("tag", String "Continue"); ("text", String text) ]
@@ -628,7 +669,7 @@ let manifest_of_json = function
                           execution_hash;
                         }
                       in
-                      let expect = sha256 (canonical (preimage m)) in
+                      let expect = sha256 (canonical_text (preimage m)) in
                       if expect <> execution_hash then Error (Bad_json "execution hash") else Ok m)
           | _ -> fail "manifest"))
   | _ -> fail "manifest"
@@ -686,7 +727,7 @@ let parse_record text =
 
 let operation_hash ~execution_hash ~step_id ~kind ~codec_version ~approval ~params_hash =
   sha256
-    (canonical
+    (canonical_text
        (Obj
           [
             ("approval", Bool approval);

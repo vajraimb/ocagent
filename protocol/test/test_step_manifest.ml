@@ -2,6 +2,16 @@ module M = Step_manifest
 
 let fail fmt = Printf.ksprintf failwith fmt
 
+let canon json =
+  match M.canonical json with
+  | Ok text -> text
+  | Error e -> fail "encode %s" (M.describe e)
+
+let record_text r =
+  match M.canonical_record r with
+  | Ok text -> text
+  | Error e -> fail "record %s" (M.describe e)
+
 let bundle source modules =
   {
     M.source;
@@ -31,7 +41,7 @@ let () =
   let record =
     { M.admission_key = "adm"; manifest = built; state = M.Prepared; reply = None; final_workspace = None; error = None }
   in
-  let text = M.canonical_record record in
+  let text = record_text record in
   (match M.parse_record text with
   | Ok got when got.manifest.execution_hash = built.execution_hash && got.manifest.step_seq = 0 -> ()
   | Ok _ -> fail "round trip changed the hash"
@@ -39,11 +49,11 @@ let () =
   let reordered = "{ \"z\": 1, \"a\": [2, 1] }" in
   let reordered_b = "{\"a\":[2,1],\"z\":1}" in
   (match (M.parse reordered, M.parse reordered_b) with
-  | Ok a, Ok b when M.canonical a = M.canonical b -> ()
-  | Ok a, Ok b -> fail "key order %s vs %s" (M.canonical a) (M.canonical b)
+  | Ok a, Ok b when canon a = canon b -> ()
+  | Ok a, Ok b -> fail "key order %s vs %s" (canon a) (canon b)
   | _ -> fail "reordered parse");
   (match (M.parse "{\"a\":[1,2]}", M.parse "{\"a\":[2,1]}") with
-  | Ok a, Ok b when M.canonical a <> M.canonical b -> ()
+  | Ok a, Ok b when canon a <> canon b -> ()
   | _ -> fail "array order was ignored");
   List.iter
     (fun bad ->
@@ -60,7 +70,7 @@ let () =
       "{\"a\":1,}";
     ];
   let tricky = "中\t\"\x00" in
-  let encoded = M.canonical (M.String tricky) in
+  let encoded = canon (M.String tricky) in
   (match M.parse encoded with
   | Ok (M.String got) when got = tricky -> ()
   | Ok _ -> fail "control round trip changed %S" encoded
@@ -135,7 +145,7 @@ let () =
   | Error _ -> ()
   | exception exn -> fail "depth raised %s" (Printexc.to_string exn)
   | Ok _ -> fail "deep json accepted");
-  let prepared = M.canonical_record record in
+  let prepared = record_text record in
   let marked = "\"state\":\"Prepared\"" in
   let completed =
     let n = String.length marked in
@@ -160,4 +170,28 @@ let () =
   | Error M.Bad_utf8 -> ()
   | Ok _ -> fail "bad source accepted"
   | Error e -> fail "bad source %s" (M.describe e));
+  (match M.canonical (M.Obj [ ("a", M.Int 1); ("a", M.Int 2) ]) with
+  | Error (M.Duplicate_key _) -> ()
+  | Ok _ -> fail "duplicate keys were encoded"
+  | Error e -> fail "duplicate %s" (M.describe e));
+  (match M.canonical (M.Int 9007199254740992) with
+  | Error M.Bad_number -> ()
+  | Ok _ -> fail "unsafe int was encoded"
+  | Error e -> fail "unsafe int %s" (M.describe e));
+  (match M.canonical (M.String "\xff") with
+  | Error M.Bad_utf8 -> ()
+  | Ok _ -> fail "bad utf8 was encoded"
+  | Error e -> fail "bad utf8 %s" (M.describe e));
+  let bad_done =
+    {
+      record with
+      state = M.Completed;
+      reply = Some (M.Done "\xff");
+      final_workspace = Some (String.make 64 'a');
+    }
+  in
+  (match M.canonical_record bad_done with
+  | Error M.Bad_utf8 -> ()
+  | Ok _ -> fail "bad completion was encoded"
+  | Error e -> fail "bad completion %s" (M.describe e));
   print_endline "step manifest ok"

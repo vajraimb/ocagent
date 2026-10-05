@@ -237,4 +237,105 @@ let () =
   | Ok _ -> fail "坏 blob 被接纳了"
   | Error err -> fail "坏 blob %s" (S.describe err));
   if Sys.file_exists planted then fail "坏 blob 仍然写了快照";
+  let dirty = fresh () in
+  let dirty_manifest = ok (admit dirty "let run () = Done \"ok\"\n" "adm") in
+  let during = ref "" in
+  (match
+     S.with_step_executor ~path:dirty ~execution_hash:dirty_manifest.execution_hash (fun ex ->
+         during := S.file_bytes dirty;
+         match S.complete_step ex ~cursor:0 ~reply:(M.Done "\xff") ~workspace_hash:workspace with
+         | Error (S.Protocol "reply") ->
+             if S.file_bytes dirty <> !during then fail "非法 reply 改了快照" else Ok ()
+         | Ok () -> fail "非法 reply 被写完了"
+         | Error err -> fail "非法 reply %s" (S.describe err))
+   with
+  | Ok (S.Resumed ()) -> ()
+  | Ok (S.Stored_completion _) -> fail "非法 reply 被当成已完成"
+  | Error err -> fail "非法 reply 运行 %s" (S.describe err));
+  (match S.read_snapshot dirty with
+  | Ok snap -> (
+      match snap.step with
+      | Some record when record.state = M.Running -> ()
+      | _ -> fail "非法 reply 改了 Step 状态")
+  | Error err -> fail "非法 reply 弄坏了旧快照 %s" (S.describe err));
+  let checksum text =
+    let acc = ref 0 in
+    String.iter (fun c -> acc := (!acc * 131 + Char.code c) land 0x3fffffff) text;
+    Printf.sprintf "%08x" !acc
+  in
+  let plant path manifest state reply workspace journal =
+    let record =
+      { M.admission_key = "adm"; manifest; state; reply; final_workspace = workspace; error = None }
+    in
+    let raw =
+      match M.canonical_record record with
+      | Ok raw -> raw
+      | Error e -> fail "fixture %s" (M.describe e)
+    in
+    let body = J.to_jsonl journal in
+    let payload = raw ^ body in
+    let records = List.length !(journal.entries) in
+    let text =
+      Printf.sprintf "OCAGENT 3\nrevision 1\nrecords %d\nepoch 0\nstep_bytes %d\nchecksum %s\n%s" records
+        (String.length raw) (checksum payload) payload
+    in
+    let oc = open_out_bin path in
+    output_string oc text;
+    close_out oc
+  in
+  let good =
+    match M.build ~run_id:"run" ~step_id:"0" ~step_seq:0 (bundle "let run () = Done \"ok\"\n") with
+    | Ok manifest -> manifest
+    | Error e -> fail "fixture manifest %s" (M.describe e)
+  in
+  let shifted seq = M.seal { good with M.step_seq = seq } in
+  let empty = J.create ~run_id:"run" ~agent_version:"step-v3" in
+  let reject name path =
+    let before = S.file_bytes path in
+    match S.read_snapshot path with
+    | Error (S.Corrupt_snapshot _) -> if S.file_bytes path <> before then fail "%s 改写了快照" name
+    | Ok _ -> fail "%s 被读进去了" name
+    | Error err -> fail "%s %s" name (S.describe err)
+  in
+  List.iter
+    (fun seq ->
+      let path = fresh () in
+      plant path (shifted seq) M.Prepared None None empty;
+      reject (Printf.sprintf "step_seq %d" seq) path)
+    [ -1; 1 ];
+  let entry ~seq ~run_id status =
+    {
+      J.run_id;
+      seq;
+      kind = "Fetch";
+      label = "Fetch";
+      req_hash = "h";
+      req = Json.String "q";
+      status;
+      result = Json.Null;
+      idempotency_key = "k";
+      attempt = 0;
+      idempotent = false;
+      dispatched = true;
+      recovery = "Manual_only";
+      callback_id = "";
+      ts = 0;
+      last_hit = J.Suspend;
+    }
+  in
+  let gap = J.create ~run_id:"run" ~agent_version:"step-v3" in
+  gap.entries := [ entry ~seq:1 ~run_id:"run" J.Done ];
+  let gap_path = fresh () in
+  plant gap_path good M.Prepared None None gap;
+  reject "序号" gap_path;
+  let crossed = J.create ~run_id:"run" ~agent_version:"step-v3" in
+  crossed.entries := [ entry ~seq:0 ~run_id:"other" J.Done ];
+  let crossed_path = fresh () in
+  plant crossed_path good M.Prepared None None crossed;
+  reject "run" crossed_path;
+  let pending = J.create ~run_id:"run" ~agent_version:"step-v3" in
+  pending.entries := [ entry ~seq:0 ~run_id:"run" J.Pending ];
+  let pending_path = fresh () in
+  plant pending_path good M.Completed (Some (M.Done "ok")) (Some workspace) pending;
+  reject "未完成账本" pending_path;
   print_endline "step store ok"
