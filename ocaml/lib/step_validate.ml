@@ -10,7 +10,8 @@ let describe = function
 let forbidden_module = function
   | "Unix" | "Sys" | "Obj" | "Marshal" | "Dynlink" | "Filename" | "Random" | "Domain" | "Effect" | "Thread"
   | "Mutex" | "Condition" | "Atomic" | "Gc" | "Weak" | "Ephemeron" | "In_channel" | "Out_channel" | "Format" | "Scanf"
-  | "Printexc" | "Arg" | "Callback" | "Bigarray" | "Str" | "Runtime_events" | "Semaphore" | "ThreadUnix" ->
+  | "Printexc" | "Arg" | "Callback" | "Bigarray" | "Str" | "Runtime_events" | "Semaphore" | "ThreadUnix" | "Step_bridge" | "Step_ipc"
+  | "Step_driver" | "Step_runtime" | "Step_sandbox" | "Durable_dispatch" ->
       true
   | name -> String.starts_with ~prefix:"Camlinternal" name
 

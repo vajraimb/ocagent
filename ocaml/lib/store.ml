@@ -486,6 +486,17 @@ let prepare_operation executor request =
                         ~dispatched:(not request.approval)
                     in
                     append snap.journal entry;
+                    let snap =
+                      if request.approval then
+                        match snap.step with
+                        | Some record
+                          when record.Step_manifest.state = Step_manifest.Running
+                               || record.state = Step_manifest.Prepared
+                               || record.state = Step_manifest.Awaiting_approval ->
+                            { snap with step = Some { record with state = Step_manifest.Awaiting_approval } }
+                        | _ -> snap
+                      else snap
+                    in
                     write_snap executor.path { snap with revision = snap.revision + 1 };
                     Ok (if request.approval then Awaiting_approval else Execute issued)))
 
@@ -781,10 +792,19 @@ let claim_step path ~execution_hash =
               | Error _ as err -> err
               | Ok () ->
                   let epoch = snap.epoch + 1 in
-                  ignore (classify snap.journal ~epoch);
-                  let step = { record with Step_manifest.state = Running } in
+                  let changed = classify snap.journal ~epoch in
+                  let unknown =
+                    changed
+                    || List.exists (fun entry -> entry.Journal.status = Journal.Unknown) !(snap.journal.entries)
+                  in
+                  let step =
+                    {
+                      record with
+                      Step_manifest.state = (if unknown then Step_manifest.Blocked_unknown else Step_manifest.Running);
+                    }
+                  in
                   write_snap path { snap with revision = snap.revision + 1; epoch; step = Some step };
-                  Ok epoch)))
+                  if unknown then Error Unknown_result else Ok epoch)))
 
 let with_step_executor ~path ~execution_hash f =
   let path = canonical path in
@@ -874,5 +894,29 @@ let approve_step ~path ~execution_hash ~seq ~callback_id ~expected_request_hash 
                         entry.callback_id <- callback_id;
                         write_snap path { snap with revision = snap.revision + 1 };
                         Ok ())))
+
+let fail_step executor ~reason =
+  if reason = "" then Error (Protocol "reason")
+  else
+    with_store executor.path (fun () ->
+        match read_snapshot executor.path with
+        | Error _ as err -> err
+        | Ok snap -> (
+            match step_scope snap ~execution_hash:executor.execution_hash ~step_id:executor.step_id with
+            | Error _ as err -> err
+            | Ok _ -> (
+                match snap.step with
+                | None -> Error Version_unavailable
+                | Some _ when executor.epoch <> snap.epoch -> Error Stale_attempt
+                | Some record when record.state = Step_manifest.Failed && record.error = Some reason -> Ok ()
+                | Some record when record.state <> Step_manifest.Running && record.state <> Step_manifest.Awaiting_approval ->
+                    Error (Protocol "state")
+                | Some _ when has_unknown snap.journal || has_pending snap.journal -> Error Unknown_result
+                | Some record ->
+                    let step =
+                      { record with state = Step_manifest.Failed; error = Some reason; reply = None; final_workspace = None }
+                    in
+                    write_snap executor.path { snap with revision = snap.revision + 1; step = Some step };
+                    Ok ())))
 
 

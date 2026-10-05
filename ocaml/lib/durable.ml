@@ -71,19 +71,21 @@ let run ~dir ~run_id ~agent_version ~fetch agent =
                             let decision =
                               try
                                 let seq = next () in
-                                match Store.prepare_operation executor (request e seq ~approval:false) with
-                                | Error err -> Error (Blocked (Store.describe err))
-                                | Ok (Store.Replay json) -> Ok (Proto.decode_result e json)
-                                | Ok Store.Awaiting_approval -> Error (Blocked "不是审批")
-                                | Ok Store.In_flight -> Error (Blocked "In_flight")
-                                | Ok (Store.Execute issued) ->
-                                    kill_if dir "after-dispatch";
-                                    note dir (Proto.kind e);
-                                    let value = exec e fetch in
-                                    kill_if dir "after-provider";
-                                    (match Store.commit_result path issued (Proto.encode_result e value) with
-                                    | Error err -> Error (Blocked (Store.describe err))
-                                    | Ok () -> Ok value)
+                                match
+                                  Durable_dispatch.dispatch ~path executor (request e seq ~approval:false)
+                                    ~after_prepare:(fun () -> kill_if dir "after-dispatch")
+                                    ~provider:(fun () ->
+                                      note dir (Proto.kind e);
+                                      let value = exec e fetch in
+                                      kill_if dir "after-provider";
+                                      Proto.encode_result e value)
+                                with
+                                | Ok (Durable_dispatch.Value json) -> Ok (Proto.decode_result e json)
+                                | Ok Durable_dispatch.Suspended -> Error (Blocked "不是审批")
+                                | Error Durable_dispatch.In_flight -> Error (Blocked "In_flight")
+                                | Error (Durable_dispatch.Store err) -> Error (Blocked (Store.describe err))
+                                | Error (Durable_dispatch.Raised (Halt stop)) -> Error stop
+                                | Error (Durable_dispatch.Raised exn) -> Error (Blocked (Printexc.to_string exn))
                               with
                               | Halt stop -> Error stop
                               | exn -> Error (Blocked (Printexc.to_string exn))
@@ -97,11 +99,17 @@ let run ~dir ~run_id ~agent_version ~fetch agent =
                             let decision =
                               try
                                 let seq = next () in
-                                match Store.prepare_operation executor (request e seq ~approval:true) with
-                                | Ok Store.Awaiting_approval -> Error Suspended
-                                | Ok (Store.Replay json) -> Ok (Proto.decode_result e json)
-                                | Ok (Store.Execute _) | Ok Store.In_flight -> Error (Blocked "审批不能派发")
-                                | Error err -> Error (Blocked (Store.describe err))
+                                match
+                                  Durable_dispatch.dispatch ~path executor (request e seq ~approval:true)
+                                    ~after_prepare:(fun () -> ())
+                                    ~provider:(fun () -> raise (Halt (Blocked "审批不能派发")))
+                                with
+                                | Ok Durable_dispatch.Suspended -> Error Suspended
+                                | Ok (Durable_dispatch.Value json) -> Ok (Proto.decode_result e json)
+                                | Error Durable_dispatch.In_flight -> Error (Blocked "审批不能派发")
+                                | Error (Durable_dispatch.Store err) -> Error (Blocked (Store.describe err))
+                                | Error (Durable_dispatch.Raised (Halt stop)) -> Error stop
+                                | Error (Durable_dispatch.Raised exn) -> Error (Blocked (Printexc.to_string exn))
                               with
                               | Halt stop -> Error stop
                               | exn -> Error (Blocked (Printexc.to_string exn))

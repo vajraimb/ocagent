@@ -264,7 +264,61 @@ type toolchain = {
   runtime_id : string;
 }
 
-let release tools = remove_tree tools.root
+let template = ref None
+
+let rec link_tree src dst =
+  Unix.mkdir dst 0o700;
+  Array.iter
+    (fun name ->
+      let from = Filename.concat src name in
+      let into = Filename.concat dst name in
+      if Sys.is_directory from then link_tree from into else Unix.link from into)
+    (Sys.readdir src)
+
+let retarget from target path =
+  if String.starts_with ~prefix:from path then
+    target ^ String.sub path (String.length from) (String.length path - String.length from)
+  else path
+
+let clone_tools tools =
+  let root = Filename.temp_dir "ocagent-tc" "" in
+  Unix.rmdir root;
+  link_tree tools.root root;
+  let swap = retarget tools.root root in
+  {
+    tools with
+    root;
+    loader = swap tools.loader;
+    libdir = swap tools.libdir;
+    ocamlc = swap tools.ocamlc;
+    ocamlrun = swap tools.ocamlrun;
+    env = Array.map (fun item ->
+      match String.index_opt item '=' with
+      | None -> item
+      | Some i ->
+          let key = String.sub item 0 i in
+          let value = String.sub item (i + 1) (String.length item - i - 1) in
+          key ^ "=" ^ swap value)
+      tools.env;
+  }
+
+let publish tools =
+  match !template with
+  | Some _ -> tools
+  | None ->
+      template := Some tools;
+      clone_tools tools
+
+let release tools =
+  match !template with
+  | Some cached when cached.root = tools.root -> ()
+  | _ -> remove_tree tools.root
+
+let origin_pid = Unix.getpid ()
+
+let () =
+  at_exit (fun () ->
+    if Unix.getpid () = origin_pid then match !template with Some tools -> remove_tree tools.root | None -> ())
 
 let stage_text code =
   let stage =
@@ -390,6 +444,12 @@ let resolve_libraries ~deadline loader bins =
 let select_toolchain ~deadline =
   if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
   else
+    match !template with
+    | Some tools -> (
+        try Ok (clone_tools tools) with
+        | Unix.Unix_error (err, _, path) -> Error (Unavailable (Unix.error_message err ^ " " ^ path))
+        | Sys_error msg -> Error (Unavailable msg))
+    | None -> (
     match (which "ocamlc", which "ocamlrun") with
     | None, _ -> Error (Unavailable "ocamlc")
     | _, None -> Error (Unavailable "ocamlrun")
@@ -444,41 +504,74 @@ let select_toolchain ~deadline =
                     in
                     match copies files with
                     | Error _ as err -> err
-                    | Ok () ->
-                        if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
-                        else
-                          let tools =
-                        {
-                          root;
-                          loader = Filename.concat root "ld-linux";
-                          libdir;
-                          ocamlc = Filename.concat bin "ocamlc";
-                          ocamlrun = Filename.concat bin "ocamlrun";
-                          env = [| "LANG=C"; "OCAMLLIB=" ^ stdlib; "PATH=" ^ bin |];
-                          compiler_id = "";
-                          runtime_id = "";
-                        }
-                      in
-                      let hash = manifest_hash root in
-                      match
-                        ( spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlc [ "-vnum" ]),
-                          spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlrun [ "-vnum" ]) )
-                      with
-                      | Ok compiler_version, Ok runtime_version
-                        when toolchain_acceptable ~compiler:compiler_version ~runtime:runtime_version ->
-                          kept := true;
-                          Ok
-                            {
-                              tools with
-                              compiler_id = Printf.sprintf "ocamlc %s manifest %s" compiler_version hash;
-                              runtime_id = Printf.sprintf "ocamlrun %s manifest %s" runtime_version hash;
-                            }
-                      | Error _ as err, _ -> err
-                      | _, (Error _ as err) -> err
-                      | _ -> Error (Unavailable "toolchain pair")))
+                    | Ok () -> (
+                        let stubs_src = Filename.concat stdlib_src "stublibs" in
+                        let stubs_dst = Filename.concat stdlib "stublibs" in
+                        if not (Sys.file_exists (Filename.concat stubs_src "dllunixbyt.so")) then Error (Unavailable "ocaml stublibs")
+                        else (
+                          Unix.mkdir stubs_dst 0o700;
+                          let stub_files =
+                            Array.to_list (Sys.readdir stubs_src) |> List.filter (fun name -> Filename.check_suffix name ".so")
+                          in
+                          let stub_copies =
+                            List.map (fun name -> (Filename.concat stubs_src name, Filename.concat stubs_dst name)) stub_files
+                          in
+                          match copies stub_copies with
+                          | Error _ as err -> err
+                          | Ok () -> (
+                              let unix_src = Filename.concat stdlib_src "unix" in
+                              let unix_dst = Filename.concat stdlib "unix" in
+                              if not (Sys.file_exists (Filename.concat unix_src "unix.cma")) then Error (Unavailable "unix library")
+                              else (
+                                Unix.mkdir unix_dst 0o700;
+                                let unix_copies =
+                                  List.map (fun name -> (Filename.concat unix_src name, Filename.concat unix_dst name)) (list_files unix_src)
+                                in
+                                match copies unix_copies with
+                                | Error _ as err -> err
+                                | Ok () ->
+                                    write_exact (Filename.concat stdlib "ld.conf") "stublibs\n";
+                                    if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
+                                    else
+                                      let tools =
+                                        {
+                                          root;
+                                          loader = Filename.concat root "ld-linux";
+                                          libdir;
+                                          ocamlc = Filename.concat bin "ocamlc";
+                                          ocamlrun = Filename.concat bin "ocamlrun";
+                                          env =
+                                            [|
+                                              "LANG=C";
+                                              "OCAMLLIB=" ^ stdlib;
+                                              "CAML_LD_LIBRARY_PATH=" ^ stubs_dst;
+                                              "PATH=" ^ bin;
+                                            |];
+                                          compiler_id = "";
+                                          runtime_id = "";
+                                        }
+                                      in
+                                      let hash = manifest_hash root in
+                                      match
+                                        ( spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlc [ "-vnum" ]),
+                                          spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlrun [ "-vnum" ]) )
+                                      with
+                                      | Ok compiler_version, Ok runtime_version
+                                        when toolchain_acceptable ~compiler:compiler_version ~runtime:runtime_version ->
+                                          kept := true;
+                                          Ok
+                                            (publish
+                                               {
+                                                 tools with
+                                                 compiler_id = Printf.sprintf "ocamlc %s manifest %s" compiler_version hash;
+                                                 runtime_id = Printf.sprintf "ocamlrun %s manifest %s" runtime_version hash;
+                                               })
+                                      | Error _ as err, _ -> err
+                                      | _, (Error _ as err) -> err
+                                      | _ -> Error (Unavailable "toolchain pair"))))))))
 
 let toolchain () =
-  match select_toolchain ~deadline:(Unix.gettimeofday () +. 5.) with
+  match select_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
   | Ok tools ->
       let ids = (tools.compiler_id, tools.runtime_id) in
       release tools;
@@ -655,7 +748,7 @@ let run_userns ~deadline ~work ~snap ~setup_fault ~marker ~stdout ~stderr job =
 
 let module_name_ok name =
   let reserved = function
-    | "Step" | "Step_api" | "Stdlib" | "Unix" | "Sys" | "Obj" | "Marshal" -> true
+    | "Step" | "Step_api" | "Step_bridge" | "Step_ipc" | "Stdlib" | "Unix" | "Sys" | "Obj" | "Marshal" -> true
     | _ -> false
   in
   String.length name > 0
@@ -667,7 +760,23 @@ let module_name_ok name =
        name
 
 let policy_text =
-  {|{"compile_timeout_s":30,"log_bytes":1048576,"worker_memory_mib":256,"worker_timeout_s":20}|}
+  {|{"as_bytes":268435456,"compile_timeout_s":30,"driver_ipc":1,"log_bytes":1048576,"runtime_params":"d=1","stop_grace_s":1,"tmp_bytes":1048576,"worker_timeout_s":20}|}
+
+let policy_version = policy_text
+
+let toolchain_root tools = tools.root
+
+let runtime_argv tools ~bytecode =
+  let stdlib = Filename.concat tools.root "stdlib" in
+  let stubs = Filename.concat stdlib "stublibs" in
+  ( loader_argv tools tools.ocamlrun [ bytecode ],
+    [|
+      "LANG=C";
+      "OCAMLLIB=" ^ stdlib;
+      "CAML_LD_LIBRARY_PATH=" ^ stubs;
+      "LD_LIBRARY_PATH=" ^ tools.libdir;
+      "OCAMLRUNPARAM=d=1";
+    |] )
 
 let input_text pairs =
   let fields =
@@ -791,7 +900,15 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
               Fun.protect ~finally:(fun () -> remove_tree dir) (fun () ->
                   let api_mli = read_file (Filename.concat sdk "step_api.mli") in
                   let api_ml = read_file (Filename.concat sdk "step_api.ml") in
+                  let bridge = read_file (Filename.concat sdk "step_bridge.ml") in
                   let driver = read_file (Filename.concat sdk "step_driver.ml") in
+                  let ipc =
+                    match find_root "ocaml/lib/step_ipc.ml" with
+                    | Some root -> read_file (Filename.concat root "ocaml/lib/step_ipc.ml")
+                    | None -> raise (Failure "step ipc")
+                  in
+                  write_exact (Filename.concat dir "step_bridge.ml") bridge;
+                  write_exact (Filename.concat dir "step_ipc.ml") ipc;
                   write_exact (Filename.concat dir "step_api.mli") api_mli;
                   write_exact (Filename.concat dir "step_api.ml") api_ml;
                   write_exact (Filename.concat dir "step.ml") source;
@@ -808,10 +925,16 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                         [ [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".mli" ]; [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".ml" ] ])
                       modules
                   in
+                  let unix_i = Filename.concat (Filename.concat tools.root "stdlib") "unix" in
                   let cmds =
-                    [ [ "-I"; dir; "-bin-annot"; "-c"; "step_api.mli" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_api.ml" ] ]
+                    [
+                      [ "-I"; dir; "-c"; "step_bridge.ml" ];
+                      [ "-I"; dir; "-I"; unix_i; "-c"; "step_ipc.ml" ];
+                      [ "-I"; dir; "-bin-annot"; "-c"; "step_api.mli" ];
+                      [ "-I"; dir; "-bin-annot"; "-c"; "step_api.ml" ];
+                    ]
                     @ user_cmds
-                    @ [ [ "-I"; dir; "-bin-annot"; "-c"; "step.ml" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_check.ml" ]; [ "-I"; dir; "-c"; "step_driver.ml" ] ]
+                    @ [ [ "-I"; dir; "-bin-annot"; "-c"; "step.ml" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_check.ml" ]; [ "-I"; dir; "-I"; unix_i; "-c"; "step_driver.ml" ] ]
                   in
                   let rec build = function
                     | [] -> Ok ()
@@ -830,9 +953,11 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                       | Error _ as err -> err
                       | Ok () -> (
                           let objects =
-                            "step_api.cmo" :: List.map (fun item -> item.name ^ ".cmo") modules @ [ "step.cmo"; "step_check.cmo"; "step_driver.cmo" ]
+                            [ "unix.cma"; "step_bridge.cmo"; "step_ipc.cmo"; "step_api.cmo" ]
+                            @ List.map (fun item -> item.name ^ ".cmo") modules
+                            @ [ "step.cmo"; "step_check.cmo"; "step_driver.cmo" ]
                           in
-                          match launch_compile ~deadline ~work:dir ~tools ~setup_fault ("-I" :: dir :: "-o" :: "worker" :: objects) with
+                          match launch_compile ~deadline ~work:dir ~tools ~setup_fault ("-I" :: dir :: "-I" :: unix_i :: "-o" :: "worker" :: objects) with
                           | Error _ as err -> err
                           | Ok () ->
                               let bytecode = read_file (Filename.concat dir "worker") in
@@ -859,7 +984,7 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                                         compiler_id = tools.compiler_id;
                                         runtime_id = tools.runtime_id;
                                         sdk = api_mli;
-                                        driver = api_ml ^ driver;
+                                        driver = bridge ^ api_ml ^ ipc ^ driver;
                                         artifact = bytecode;
                                         base_workspace = "";
                                         input_context = input_bytes;
@@ -888,9 +1013,27 @@ let compile_fault_after n setup_fault ~deadline tools ~source ~modules ~input =
       compile_with ~setup_fault:(Some setup_fault) ~hang:false ~deadline tools ~source ~modules ~input)
 
 let admit ~path ~run_id ~agent_version ~admission_key artifact =
-  match Store.admit_step ~path ~run_id ~agent_version ~admission_key artifact.bundle with
-  | Ok manifest -> Ok manifest
-  | Error err -> Error (Store err)
+  match Step_manifest.build ~run_id ~step_id:"0" ~step_seq:0 artifact.bundle with
+  | Error err -> Error (Rejected (Step_manifest.describe err))
+  | Ok manifest -> (
+      match Step_ipc.parse_input artifact.bundle.input_context with
+      | Error _ -> Error (Rejected "input")
+      | Ok input -> (
+          match
+            Step_ipc.encode_frame
+              (Step_ipc.Init
+                 {
+                   version = 1;
+                   execution_hash = manifest.execution_hash;
+                   bound_input = input;
+                   limits = Step_ipc.worker_limits;
+                 })
+          with
+          | Error _ -> Error (Rejected "init")
+          | Ok _ -> (
+              match Store.admit_step ~path ~run_id ~agent_version ~admission_key artifact.bundle with
+              | Ok manifest -> Ok manifest
+              | Error err -> Error (Store err))))
 
 let submit ~path ~run_id ~agent_version ~admission_key ~source ~modules ~input =
   match compile ~source ~modules ~input with

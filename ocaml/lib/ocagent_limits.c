@@ -13,6 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -322,3 +329,157 @@ value ocagent_enter_landlock(value v_work, value v_snap) {
   close(ruleset);
   CAMLreturn(Val_int(0));
 }
+
+#define ST_ARTIFACT_BIND 18
+#define ST_ARTIFACT_RO 19
+#define ST_SECCOMP 21
+#define ST_PDEATH 22
+
+value ocagent_mount_worker(value v_snap, value v_art) {
+  CAMLparam2(v_snap, v_art);
+  char snap[4096], art[4096], jail[128], tmp[160];
+  if (copy_path(v_snap, snap, sizeof snap)) CAMLreturn(Val_int(ST_SNAPSHOT_BIND * 1000 + ENAMETOOLONG));
+  if (copy_path(v_art, art, sizeof art)) CAMLreturn(Val_int(ST_ARTIFACT_BIND * 1000 + ENAMETOOLONG));
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_PROPAGATION)));
+  snprintf(jail, sizeof jail, "/tmp/ocagent-wjail-%d", getpid());
+  if (mkdir(jail, 0700) != 0 && errno != EEXIST) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  if (mount("tmpfs", jail, "tmpfs", 0, "size=8m,mode=755") != 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_TMPFS)));
+  if (bind_tree(jail, snap) != 0) CAMLreturn(Val_int(stage_errno(ST_SNAPSHOT_BIND)));
+  if (remount_readonly(jail, snap) != 0) CAMLreturn(Val_int(stage_errno(ST_SNAPSHOT_RO)));
+  if (bind_tree(jail, art) != 0) CAMLreturn(Val_int(stage_errno(ST_ARTIFACT_BIND)));
+  if (remount_readonly(jail, art) != 0) CAMLreturn(Val_int(stage_errno(ST_ARTIFACT_RO)));
+  char devdir[160], devnull[180], devrand[180];
+  if (snprintf(devdir, sizeof devdir, "%s/dev", jail) >= (int)sizeof devdir) CAMLreturn(Val_int(ST_JAIL_MKDIR * 1000 + ENAMETOOLONG));
+  if (mkdir(devdir, 0755) != 0 && errno != EEXIST) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  if (snprintf(devnull, sizeof devnull, "%s/null", devdir) >= (int)sizeof devnull) CAMLreturn(Val_int(ST_JAIL_MKDIR * 1000 + ENAMETOOLONG));
+  if (snprintf(devrand, sizeof devrand, "%s/urandom", devdir) >= (int)sizeof devrand) CAMLreturn(Val_int(ST_JAIL_MKDIR * 1000 + ENAMETOOLONG));
+  int dev_fd = open(devnull, O_CREAT | O_WRONLY, 0666);
+  if (dev_fd < 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  close(dev_fd);
+  dev_fd = open(devrand, O_CREAT | O_WRONLY, 0666);
+  if (dev_fd < 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  close(dev_fd);
+  if (mount("/dev/null", devnull, NULL, MS_BIND, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_TMPFS)));
+  if (mount("/dev/urandom", devrand, NULL, MS_BIND, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_JAIL_TMPFS)));
+  if (snprintf(tmp, sizeof tmp, "%s/tmp", jail) >= (int)sizeof tmp) CAMLreturn(Val_int(ST_JAIL_MKDIR * 1000 + ENAMETOOLONG));
+  if (mkdir(tmp, 0700) != 0 && errno != EEXIST) CAMLreturn(Val_int(stage_errno(ST_JAIL_MKDIR)));
+  if (chdir(jail) != 0) CAMLreturn(Val_int(stage_errno(ST_CHDIR)));
+  if (mount(".", "/", NULL, MS_MOVE, NULL) != 0) CAMLreturn(Val_int(stage_errno(ST_ROOT_MOVE)));
+  if (chroot(".") != 0) CAMLreturn(Val_int(stage_errno(ST_CHROOT)));
+  if (chdir("/tmp") != 0) CAMLreturn(Val_int(stage_errno(ST_CHDIR)));
+  CAMLreturn(Val_int(0));
+}
+
+value ocagent_limit_worker(value as_bytes, value file_bytes) {
+  struct rlimit limit;
+  limit.rlim_cur = Long_val(as_bytes);
+  limit.rlim_max = Long_val(as_bytes);
+  if (setrlimit(RLIMIT_AS, &limit) != 0) return Val_int(-errno);
+  limit.rlim_cur = Long_val(file_bytes);
+  limit.rlim_max = Long_val(file_bytes);
+  if (setrlimit(RLIMIT_FSIZE, &limit) != 0) return Val_int(-errno);
+  limit.rlim_cur = 20;
+  limit.rlim_max = 20;
+  if (setrlimit(RLIMIT_CPU, &limit) != 0) return Val_int(-errno);
+  return Val_int(0);
+}
+
+value ocagent_setpgid(value pid) {
+  pid_t p = Int_val(pid);
+  if (p == 0) p = getpid();
+  if (setpgid(p, p) != 0) return Val_int(-errno);
+  return Val_int(0);
+}
+
+value ocagent_set_subreaper(value unit) {
+  (void)unit;
+  if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) return Val_int(-errno);
+  return Val_int(0);
+}
+
+static int seccomp_install(void) {
+  /* Deny escapes and prctl (it can clear PDEATHSIG). clone is allowed only
+     with CLONE_THREAD so the OCaml runtime can start threads but not forks.
+     Jump targets: deny is index 18, allow-all is 14, clone allow is 19. */
+  struct sock_filter filter[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsid, 16, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setpgid, 15, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setns, 14, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unshare, 13, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mount, 12, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_umount2, 11, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pivot_root, 10, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_chroot, 9, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fork, 8, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_vfork, 7, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone3, 6, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 5, 0),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+      BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x00010000),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x00010000, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  struct sock_fprog prog = { .len = (unsigned short)(sizeof filter / sizeof filter[0]), .filter = filter };
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
+  if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) return -1;
+  return 0;
+}
+
+value ocagent_confine_worker(value unit) {
+  (void)unit;
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0) return Val_int(ST_PDEATH * 1000 + errno);
+  if (getppid() == 1) return Val_int(ST_PDEATH * 1000 + ECHILD);
+  if (seccomp_install() != 0) return Val_int(ST_SECCOMP * 1000 + errno);
+  return Val_int(0);
+}
+
+value ocagent_worker_probe(value v_art, value v_sentinel, value v_store, value v_port) {
+  CAMLparam4(v_art, v_sentinel, v_store, v_port);
+  char art[4096], sentinel[4096], store[4096];
+  int port = Int_val(v_port);
+  if (copy_path(v_art, art, sizeof art) || copy_path(v_sentinel, sentinel, sizeof sentinel) || copy_path(v_store, store, sizeof store))
+    caml_failwith("probe path");
+  int setsid_err = 0, setpgid_err = 0, fork_err = 0, mount_err = 0, prctl_err = 0, tcp = 0, stat_ok = 0, store_ok = 0, tmp_ok = 0, ro_ok = 0;
+  if (setsid() < 0) setsid_err = errno;
+  if (setpgid(0, 0) < 0) setpgid_err = errno;
+  if (prctl(PR_SET_PDEATHSIG, 0, 0, 0, 0) != 0) prctl_err = errno;
+  pid_t child = fork();
+  if (child < 0) fork_err = errno;
+  else if (child == 0) _exit(0);
+  else {
+    int st = 0;
+    waitpid(child, &st, 0);
+  }
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) mount_err = errno;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr.s_addr = htonl(0x7f000001);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) tcp = 1;
+    close(fd);
+  }
+  struct stat st;
+  if (stat(sentinel, &st) == 0) stat_ok = 1;
+  if (stat(store, &st) == 0) store_ok = 1;
+  int out = open("/tmp/ocagent-probe", O_CREAT | O_EXCL | O_WRONLY, 0600);
+  if (out >= 0) {
+    if (write(out, "x", 1) == 1) tmp_ok = 1;
+    close(out);
+  }
+  int rw = open(art, O_WRONLY);
+  if (rw >= 0) {
+    ro_ok = 1;
+    close(rw);
+  }
+  char line[256];
+  snprintf(line, sizeof line, "setsid=%d setpgid=%d fork=%d mount=%d prctl=%d tcp=%d stat=%d store=%d tmp=%d ro=%d", setsid_err, setpgid_err, fork_err, mount_err, prctl_err, tcp, stat_ok, store_ok, tmp_ok, ro_ok);
+  CAMLreturn(caml_copy_string(line));
+}
+

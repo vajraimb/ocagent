@@ -51,6 +51,12 @@ val toolchain : unit -> (string * string, error) result
 
 val toolchain_acceptable : compiler:string -> runtime:string -> bool
 
+val policy_version : string
+
+val toolchain_root : toolchain -> string
+
+val runtime_argv : toolchain -> bytecode:string -> string array * string array
+
 val hold_toolchain : deadline:float -> (toolchain, error) result
 
 val release : toolchain -> unit

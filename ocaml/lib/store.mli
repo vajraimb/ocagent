@@ -101,6 +101,8 @@ val with_step_executor :
 
 val complete_step : executor -> cursor:int -> reply:Step_manifest.reply -> workspace_hash:string -> (unit, error) result
 
+val fail_step : executor -> reason:string -> (unit, error) result
+
 val approve_step :
   path:string ->
   execution_hash:string ->

@@ -8,25 +8,20 @@ module type STEP = sig
   val run : unit -> reply
 end
 
-let table : (string, string) Hashtbl.t = Hashtbl.create 16
-
-let install pairs =
-  Hashtbl.clear table;
-  List.iter (fun (key, value) -> Hashtbl.replace table key value) pairs
-
 module Input = struct
-  let get key = Hashtbl.find_opt table key
+  let get = Step_bridge.input_get
 end
 
 module Net = struct
-  type response = { status : int; body : string }
-  type error =
+  type response = Step_bridge.response = { status : int; body : string }
+
+  type error = Step_bridge.error =
     | Approval_rejected of string
     | Denied of string
 
-  let get _url = Error (Denied "not dispatched")
+  let get = Step_bridge.net_get
 end
 
 module Trace = struct
-  let note _message = ()
+  let note = Step_bridge.trace
 end

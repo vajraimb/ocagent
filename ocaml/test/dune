@@ -36,6 +36,19 @@
  (name test_step_compile)
  (libraries ocagent-harness unix))
 
+(test
+ (name test_step_ipc)
+ (libraries ocagent-harness))
+
+(test
+ (name test_step_isolation)
+ (libraries ocagent-harness unix))
+
+(test
+ (name test_step_worker_recover)
+ (libraries ocagent-harness unix))
+
+
 
 
 
