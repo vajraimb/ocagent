@@ -10,7 +10,7 @@ let fail fmt = Printf.ksprintf failwith fmt
 let helper =
   {
     C.name = "Helper";
-    source = "let valid material body = String.equal material body\n";
+    source = "let valid material body =\n  let xs = [| material |] in\n  Array.set xs 0 body;\n  String.equal (Array.get xs 0) body\n";
     interface_ = "val valid : string -> string -> bool\n";
   }
 
@@ -43,8 +43,17 @@ let vnum () =
   let ic = Unix.open_process_args_in "ocamlc" [| "ocamlc"; "-vnum" |] in
   Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic))
 
+let stdlib_hash () =
+  let ic = Unix.open_process_args_in "ocamlc" [| "ocamlc"; "-where" |] in
+  let where = Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic)) in
+  let path = Filename.concat where "stdlib.cma" in
+  let ic = open_in_bin path in
+  let bytes = Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic)) in
+  M.sha256 bytes
+
 let () =
   let expected = vnum () in
+  let expected_stdlib = stdlib_hash () in
   Unix.putenv "OCAMLLIB" "/no/such/ocagent-lib";
   Unix.putenv "OCAMLPATH" "/no/such/ocagent-path";
   let channel =
@@ -72,6 +81,88 @@ end
   | Error (C.Rejected msg) when String.starts_with ~prefix:"forbidden value" msg -> ()
   | Ok _ -> fail "stdin was compiled"
   | Error err -> fail "stdin %s" (C.describe err));
+  let reject_unsafe name source =
+    match C.compile ~source ~modules:[] ~input:[] with
+    | Error (C.Rejected msg) when String.starts_with ~prefix:"forbidden value" msg -> ()
+    | Ok _ -> fail "%s was compiled" name
+    | Error err -> fail "%s %s" name (C.describe err)
+  in
+  reject_unsafe "qualified"
+    {|open Step_api
+module Step : STEP = struct
+  let run () = ignore (Stdlib.Array.unsafe_set [| 0 |] 0 1); Done "x"
+end
+|};
+  reject_unsafe "alias"
+    {|open Step_api
+module A = Array
+module Step : STEP = struct
+  let run () = ignore (A.unsafe_get [| 0 |] 0); Done "x"
+end
+|};
+  reject_unsafe "open"
+    {|open Step_api
+module Step : STEP = struct
+  open Array
+  let run () = ignore (unsafe_get [| 0 |] 0); Done "x"
+end
+|};
+  reject_unsafe "higher-order"
+    {|open Step_api
+module Step : STEP = struct
+  let call f = f [| 0 |] 0
+  let run () = ignore (call Array.unsafe_get); Done "x"
+end
+|};
+  let huge_source = String.make 262145 'a' in
+  let huge_compile = fresh () in
+  let t0 = Unix.gettimeofday () in
+  (match C.compile ~source:huge_source ~modules:[] ~input:[] with
+  | Error (C.Rejected "too big") -> ()
+  | Ok _ -> fail "oversized source reached compilation"
+  | Error err -> fail "oversized compile %s" (C.describe err));
+  if Unix.gettimeofday () -. t0 > 2. then fail "oversized source was parsed";
+  if Sys.file_exists huge_compile then fail "oversized source created a snapshot";
+  let nested = String.make 200 '(' ^ String.make 200 ')' in
+  (match C.compile ~source:nested ~modules:[] ~input:[] with
+  | Error (C.Rejected "too big") -> ()
+  | Ok _ -> fail "deep source was compiled"
+  | Error err -> fail "deep %s" (C.describe err));
+  let sleep_started = Unix.gettimeofday () in
+  (match C.bounded_command ~timeout:0.4 [| "/bin/sleep"; "30" |] with
+  | Error _ -> if Unix.gettimeofday () -. sleep_started > 2. then fail "probe wait exceeded the deadline"
+  | Ok _ -> fail "sleeping command returned");
+  let still =
+    Array.exists
+      (fun pid ->
+        let path = "/proc/" ^ pid ^ "/cmdline" in
+        let needle = "/bin/sleep\00030" in
+        try
+          let ic = open_in_bin path in
+          let text = really_input_string ic (in_channel_length ic) in
+          close_in ic;
+          String.length text >= String.length needle && String.sub text 0 (String.length needle) = needle
+        with _ -> false)
+      (Sys.readdir "/proc")
+  in
+  if still then fail "timed-out process is still running";
+  let marker = Filename.temp_file "ocagent-limit" "" in
+  Unix.unlink marker;
+  (match C.limits_failure marker with
+  | Error (C.Unavailable _) when not (Sys.file_exists marker) -> ()
+  | Ok () -> fail "limit failure continued"
+  | Error err -> fail "limit failure %s" (C.describe err));
+  let sentinel = Filename.temp_file "ocagent-sentinel" "" in
+  let oc = open_out sentinel in
+  output_string oc "secret";
+  close_out oc;
+  (match C.isolation_probe ~sentinel with
+  | Ok () -> ()
+  | Error err -> fail "isolation %s" (C.describe err));
+  Unix.unlink sentinel;
+  if not (C.toolchain_acceptable ~compiler:"5.3.0" ~runtime:"5.3.0") then fail "supported pair rejected";
+  if C.toolchain_acceptable ~compiler:"5.3.0" ~runtime:"5.4.0" then fail "mismatched pair accepted";
+  if C.toolchain_acceptable ~compiler:"4.14.2" ~runtime:"4.14.2" then fail "old pair accepted";
   let absent = fresh () in
   (match C.compile ~source:"let run () = 1\n" ~modules:[] ~input:[] with
   | Error (C.Rejected _) -> ()
@@ -135,6 +226,8 @@ end
   if manifest.compiler_id <> compiler_id || manifest.runtime_id <> runtime_id then fail "toolchain id was not bound";
   if not (String.starts_with ~prefix:("ocamlc " ^ expected ^ " ") compiler_id) then
     fail "compiler id %s does not use probed %s" compiler_id expected;
+  if not (String.ends_with ~suffix:("stdlib " ^ expected_stdlib) compiler_id) then
+    fail "compiler id %s does not pin the stdlib" compiler_id;
   if not (String.starts_with ~prefix:("ocamlrun " ^ expected ^ " ") runtime_id) then
     fail "runtime id %s does not use probed %s" runtime_id expected;
   let bytes =

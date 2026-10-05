@@ -51,7 +51,9 @@ let check_value ~users parts =
   match List.rev parts with
   | [] -> Ok ()
   | value :: rev_mods ->
-      if io_value value then Error (Rejected ("forbidden value " ^ value)) else check_modules ~users (List.rev rev_mods)
+      if io_value value || value = "unsafe" || String.starts_with ~prefix:"unsafe_" value then
+        Error (Rejected ("forbidden value " ^ value))
+      else check_modules ~users (List.rev rev_mods)
 
 let rec longident = function
   | Longident.Lident name -> [ name ]

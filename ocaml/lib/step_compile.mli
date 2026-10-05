@@ -15,6 +15,14 @@ type module_source = {
 
 val toolchain : unit -> (string * string, error) result
 
+val toolchain_acceptable : compiler:string -> runtime:string -> bool
+
+val bounded_command : timeout:float -> string array -> (string, error) result
+
+val limits_failure : string -> (unit, error) result
+
+val isolation_probe : sentinel:string -> (unit, error) result
+
 val compile :
   source:string ->
   modules:module_source list ->
