@@ -13,17 +13,60 @@ type module_source = {
   interface_ : string;
 }
 
+type setup_fault =
+  | Rlimit
+  | Descriptors
+  | Isolation
+
+type toolchain
+
+type collect_state = {
+  reaped : Unix.process_status option;
+  eof : bool;
+  length : int;
+}
+
+type collect_event =
+  | Output of int
+  | Pipe_eof
+  | Would_block
+  | Reaped of Unix.process_status
+  | Deadline
+
+type collect_action =
+  | Read
+  | Reap
+  | Wait
+  | Done
+  | Failed of string
+
+val collector_step : collect_state -> collect_event -> collect_state * collect_action
+
 val toolchain : unit -> (string * string, error) result
 
 val toolchain_acceptable : compiler:string -> runtime:string -> bool
 
-val bounded_command : timeout:float -> string array -> (string, error) result
+val hold_toolchain : deadline:float -> (toolchain, error) result
 
-val limits_failure : string -> (unit, error) result
+val release : toolchain -> unit
 
-val isolation_probe : sentinel:string -> (unit, error) result
+val compile_with :
+  setup_fault:setup_fault option ->
+  deadline:float ->
+  toolchain ->
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (validated_artifact, error) result
 
 val compile :
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (validated_artifact, error) result
+
+val compile_fault :
+  setup_fault ->
   source:string ->
   modules:module_source list ->
   input:(string * string) list ->
@@ -36,3 +79,30 @@ val admit :
   admission_key:string ->
   validated_artifact ->
   (Step_manifest.t, error) result
+
+val submit :
+  path:string ->
+  run_id:string ->
+  agent_version:string ->
+  admission_key:string ->
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (Step_manifest.t, error) result
+
+val submit_fault :
+  setup_fault ->
+  path:string ->
+  run_id:string ->
+  agent_version:string ->
+  admission_key:string ->
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (Step_manifest.t, error) result
+
+val command : timeout:float -> string array -> int * int * (string, error) result
+
+val probe_isolation : toolchain -> sentinel:string -> port:int -> (unit, error) result
+
+val getpgid : int -> int

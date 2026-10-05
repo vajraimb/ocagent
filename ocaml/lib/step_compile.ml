@@ -19,14 +19,44 @@ type module_source = {
   interface_ : string;
 }
 
+type setup_fault =
+  | Rlimit
+  | Descriptors
+  | Isolation
+
+type collect_state = {
+  reaped : Unix.process_status option;
+  eof : bool;
+  length : int;
+}
+
+type collect_event =
+  | Output of int
+  | Pipe_eof
+  | Would_block
+  | Reaped of Unix.process_status
+  | Deadline
+
+type collect_action =
+  | Read
+  | Reap
+  | Wait
+  | Done
+  | Failed of string
+
 let max_output = 262144
 let compile_timeout = 30.0
 let compile_as_bytes = 1024 * 1024 * 1024
 let compile_file_bytes = 16 * 1024 * 1024
+let max_text = 262144
 
 external limit_compiler : int -> int -> int -> int = "ocagent_limit_compiler"
-external close_extra_fds : unit -> int = "ocagent_close_extra_fds"
+external close_extra_fds : int -> int = "ocagent_close_extra_fds"
 external kill_group : int -> int = "ocagent_kill_group"
+external getpgid : int -> int = "ocagent_getpgid"
+external realpath : string -> string = "ocagent_realpath"
+external enter_userns : string -> string -> int = "ocagent_enter_userns"
+external enter_landlock : string -> string -> int = "ocagent_enter_landlock"
 
 let which name =
   match Sys.getenv_opt "PATH" with
@@ -35,7 +65,7 @@ let which name =
       let rec go = function
         | [] -> None
         | dir :: rest ->
-            let candidate = Filename.concat dir name in
+            let candidate = if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) (Filename.concat dir name) else Filename.concat dir name in
             if Sys.file_exists candidate then Some candidate else go rest
       in
       go (String.split_on_char ':' path)
@@ -64,14 +94,91 @@ let sdk_dir () =
   | Some root -> Ok (Filename.concat root "ocaml/step-sdk")
   | None -> Error (Unavailable "step sdk sources")
 
-external enter_jail : string -> string -> string -> string -> int = "ocagent_enter_jail"
-external limits_must_fail : unit -> int = "ocagent_limits_must_fail"
+let rec remove_tree dir =
+  if Sys.file_exists dir then (
+    let entries = Sys.readdir dir in
+    Array.iter
+      (fun name ->
+        let path = Filename.concat dir name in
+        if Sys.is_directory path then remove_tree path else Unix.unlink path)
+      entries;
+    Unix.rmdir dir)
 
-let restricted_env ocamlc =
-  let bindir = Filename.dirname ocamlc in
-  let stdlib = Filename.concat (Filename.dirname bindir) "lib/ocaml" in
-  if not (Sys.file_exists (Filename.concat stdlib "stdlib.cma")) then Error (Unavailable "ocaml stdlib")
-  else Ok (stdlib, [| "LANG=C"; "OCAMLLIB=" ^ stdlib; "PATH=" ^ bindir |])
+let collector_step state = function
+  | Deadline -> state, Failed "compile timeout"
+  | Reaped status ->
+      if state.reaped <> None then state, Failed "collector"
+      else
+        let state = { state with reaped = Some status } in
+        if state.eof then state, Done else state, Read
+  | Pipe_eof ->
+      let state = { state with eof = true } in
+      if state.reaped = None then state, Reap else state, Done
+  | Output n ->
+      let length = state.length + n in
+      if length > max_output then { state with length }, Failed "compiler output" else { state with length }, Read
+  | Would_block -> if state.reaped = None then state, Reap else if state.eof then state, Done else state, Wait
+
+let empty_collect = { reaped = None; eof = false; length = 0 }
+
+let read_some fd buf =
+  try Some (Unix.read fd buf 0 (Bytes.length buf)) with
+  | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> None
+
+let kill_collected pid =
+  ignore (kill_group pid);
+  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ())
+
+let collect_child ~deadline pid fd =
+  Unix.set_nonblock fd;
+  let buf = Buffer.create 64 in
+  let bytes = Bytes.create 256 in
+  let state = ref empty_collect in
+  let finished = ref false in
+  Fun.protect
+    ~finally:(fun () ->
+      if not !finished then (
+        kill_collected pid;
+        if !state.reaped = None then (try ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ());
+        try Unix.close fd with Unix.Unix_error _ -> ())
+      else (try Unix.close fd with Unix.Unix_error _ -> ()))
+    (fun () ->
+      let rec apply event =
+        let next, action = collector_step !state event in
+        state := next;
+        match action with
+        | Failed msg -> Error (Rejected msg)
+        | Done -> (
+            match next.reaped with
+            | Some status when next.eof ->
+                finished := true;
+                Ok (Buffer.contents buf, status)
+            | _ -> Error (Unavailable "collector"))
+        | Read -> loop ()
+        | Wait ->
+            Unix.sleepf 0.02;
+            loop ()
+        | Reap -> (
+            if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
+            else
+              match Unix.waitpid [ Unix.WNOHANG ] pid with
+              | exception Unix.Unix_error (Unix.ECHILD, _, _) -> Error (Unavailable "collector")
+              | 0, _ ->
+                  Unix.sleepf 0.02;
+                  loop ()
+              | _, status -> apply (Reaped status))
+      and loop () =
+        if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
+        else if not !state.eof then
+          match read_some fd bytes with
+          | Some 0 -> apply Pipe_eof
+          | Some n ->
+              Buffer.add_subbytes buf bytes 0 n;
+              apply (Output n)
+          | None -> apply Would_block
+        else apply Would_block
+      in
+      loop ())
 
 let version_parts text =
   match String.split_on_char '.' text with
@@ -86,71 +193,63 @@ let toolchain_acceptable ~compiler ~runtime =
   | Some (5, minor, _), Some (5, minor2, _) when minor >= 3 && (minor, compiler) = (minor2, runtime) -> true
   | _ -> false
 
-let read_some fd buf =
-  try Some (Unix.read fd buf 0 (Bytes.length buf)) with
-  | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> None
+type toolchain = {
+  root : string;
+  loader : string;
+  libdir : string;
+  ocamlc : string;
+  ocamlrun : string;
+  env : string array;
+  compiler_id : string;
+  runtime_id : string;
+}
 
-let stop_child pid fd =
-  ignore (kill_group pid);
-  (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
-  (try ignore (Unix.waitpid [] pid) with Unix.Unix_error _ -> ());
-  (try Unix.close fd with Unix.Unix_error _ -> ())
+let release tools = remove_tree tools.root
 
-let collect_child ~deadline pid fd =
-  Unix.set_nonblock fd;
-  let buf = Buffer.create 64 in
-  let bytes = Bytes.create 256 in
-  let finished = ref false in
-  Fun.protect
-    ~finally:(fun () -> if not !finished then stop_child pid fd else (try Unix.close fd with Unix.Unix_error _ -> ()))
-    (fun () ->
-      let rec loop () =
-        if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
-        else
-          match read_some fd bytes with
-          | Some 0 -> (
-              match Unix.waitpid [ Unix.WNOHANG ] pid with
-              | 0, _ ->
-                  Unix.sleepf 0.02;
-                  loop ()
-              | _, Unix.WEXITED 0 ->
-                  finished := true;
-                  Ok (Buffer.contents buf)
-              | _, Unix.WEXITED 125 ->
-                  finished := true;
-                  Error (Unavailable "compiler limits")
-              | _, Unix.WEXITED 126 ->
-                  finished := true;
-                  Error (Unavailable "compiler isolation")
-              | _, Unix.WEXITED 127 ->
-                  finished := true;
-                  Error (Unavailable "compiler exec")
-              | _, _ ->
-                  finished := true;
-                  Error (Rejected "compiler failed"))
-          | Some n ->
-              Buffer.add_subbytes buf bytes 0 n;
-              if Buffer.length buf > 256 then Error (Rejected "compiler output") else loop ()
-          | None -> (
-              match Unix.waitpid [ Unix.WNOHANG ] pid with
-              | 0, _ ->
-                  Unix.sleepf 0.02;
-                  loop ()
-              | _, Unix.WEXITED 0 -> loop ()
-              | _, Unix.WEXITED 125 ->
-                  finished := true;
-                  Error (Unavailable "compiler limits")
-              | _, Unix.WEXITED 126 ->
-                  finished := true;
-                  Error (Unavailable "compiler isolation")
-              | _, Unix.WEXITED 127 ->
-                  finished := true;
-                  Error (Unavailable "compiler exec")
-              | _, _ ->
-                  finished := true;
-                  Error (Rejected "compiler failed"))
-      in
-      loop ())
+let stage_text code =
+  let stage =
+    match code / 1000 with
+    | 3 -> "namespace"
+    | 4 -> "uid"
+    | 5 -> "gid"
+    | 6 -> "mount"
+    | 7 -> "chroot"
+    | 8 -> "chdir"
+    | 9 -> "landlock"
+    | n -> "stage" ^ string_of_int n
+  in
+  stage ^ " " ^ string_of_int (code mod 1000)
+
+let copy_file src dst =
+  write_exact dst (read_file src);
+  Unix.chmod dst (Unix.stat src).st_perm
+
+let list_files dir =
+  let skip name =
+    Filename.check_suffix name ".o" || Filename.check_suffix name ".a" || Filename.check_suffix name ".cmx"
+    || Filename.check_suffix name ".cmxa" || Filename.check_suffix name ".cmxs"
+  in
+  Array.to_list (Sys.readdir dir)
+  |> List.filter (fun name ->
+         let path = Filename.concat dir name in
+         (not (Sys.is_directory path)) && not (skip name))
+  |> List.sort String.compare
+
+let manifest_hash root =
+  let rec walk rel =
+    let dir = if rel = "" then root else Filename.concat root rel in
+    let names = Array.to_list (Sys.readdir dir) |> List.sort String.compare in
+    List.concat_map
+      (fun name ->
+        let child = if rel = "" then name else Filename.concat rel name in
+        let path = Filename.concat root child in
+        if Sys.is_directory path then walk child else [ child ])
+      names
+  in
+  let lines = List.map (fun rel -> rel ^ " " ^ hash_file (Filename.concat root rel)) (walk "") in
+  Step_manifest.sha256 (String.concat "\n" lines ^ "\n")
+
+let loader_argv tools bin args = Array.of_list (tools.loader :: "--library-path" :: tools.libdir :: bin :: args)
 
 let spawn ~deadline ~env argv =
   if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
@@ -165,61 +264,126 @@ let spawn ~deadline ~env argv =
           Unix.dup2 write_fd Unix.stderr;
           Unix.close read_fd;
           if limit_compiler 5 compile_as_bytes compile_file_bytes <> 0 then exit 125;
-          if close_extra_fds () <> 0 then exit 125;
+          if close_extra_fds (-1) <> 0 then exit 125;
           Unix.execve argv.(0) argv env
         with _ -> exit 127)
-    | pid ->
+    | pid -> (
         Unix.close write_fd;
-        collect_child ~deadline pid read_fd
-
-let probe ~deadline env bin args = spawn ~deadline ~env (Array.append [| bin |] args)
-
-type tools = {
-  ocamlc : string;
-  ocamlrun : string;
-  stdlib : string;
-  env : string array;
-  compiler_id : string;
-  runtime_id : string;
-}
+        match collect_child ~deadline pid read_fd with
+        | Ok (text, Unix.WEXITED 0) -> Ok (String.trim text)
+        | Ok _ -> Error (Unavailable "compiler version")
+        | Error _ as err -> err)
 
 let select_toolchain ~deadline =
-  match (which "ocamlc", which "ocamlrun") with
-  | None, _ -> Error (Unavailable "ocamlc")
-  | _, None -> Error (Unavailable "ocamlrun")
-  | Some ocamlc, Some ocamlrun -> (
-      match restricted_env ocamlc with
-      | Error _ as err -> err
-      | Ok (stdlib, env) -> (
-          match (probe ~deadline env ocamlc [| "-vnum" |], probe ~deadline env ocamlrun [| "-vnum" |]) with
-          | Ok compiler_version, Ok runtime_version when toolchain_acceptable ~compiler:(String.trim compiler_version) ~runtime:(String.trim runtime_version) ->
-              let compiler_version = String.trim compiler_version in
-              let runtime_version = String.trim runtime_version in
-              Ok
+  if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
+  else
+    match (which "ocamlc", which "ocamlrun") with
+    | None, _ -> Error (Unavailable "ocamlc")
+    | _, None -> Error (Unavailable "ocamlrun")
+    | Some ocamlc_path, Some ocamlrun_path -> (
+        match (realpath ocamlc_path, realpath ocamlrun_path) with
+        | exception Failure _ -> Error (Unavailable "toolchain path")
+        | ocamlc_path, ocamlrun_path ->
+            let stdlib_src = Filename.concat (Filename.dirname (Filename.dirname ocamlc_path)) "lib/ocaml" in
+            let loader_src = "/lib64/ld-linux-x86-64.so.2" in
+            let libc_src = "/lib/x86_64-linux-gnu/libc.so.6" in
+            let libm_src = "/lib/x86_64-linux-gnu/libm.so.6" in
+            if not (Sys.file_exists (Filename.concat stdlib_src "stdlib.cma") && Sys.file_exists loader_src && Sys.file_exists libc_src) then
+              Error (Unavailable "ocaml stdlib")
+            else
+              let root = Filename.temp_dir "ocagent-tc" "" in
+              let bin = Filename.concat root "bin" in
+              let libdir = Filename.concat root "lib" in
+              let stdlib = Filename.concat root "stdlib" in
+              Unix.mkdir bin 0o700;
+              Unix.mkdir libdir 0o700;
+              Unix.mkdir stdlib 0o700;
+              copy_file ocamlc_path (Filename.concat bin "ocamlc");
+              copy_file ocamlrun_path (Filename.concat bin "ocamlrun");
+              copy_file loader_src (Filename.concat root "ld-linux");
+              copy_file libc_src (Filename.concat libdir "libc.so.6");
+              copy_file libm_src (Filename.concat libdir "libm.so.6");
+              List.iter (fun name -> copy_file (Filename.concat stdlib_src name) (Filename.concat stdlib name)) (list_files stdlib_src);
+              let tools =
                 {
-                  ocamlc;
-                  ocamlrun;
-                  stdlib;
-                  env;
-                  compiler_id =
-                    Printf.sprintf "ocamlc %s %s stdlib %s" compiler_version (hash_file ocamlc)
-                      (hash_file (Filename.concat stdlib "stdlib.cma"));
-                  runtime_id = Printf.sprintf "ocamlrun %s %s" runtime_version (hash_file ocamlrun);
+                  root;
+                  loader = Filename.concat root "ld-linux";
+                  libdir;
+                  ocamlc = Filename.concat bin "ocamlc";
+                  ocamlrun = Filename.concat bin "ocamlrun";
+                  env = [| "LANG=C"; "OCAMLLIB=" ^ stdlib; "PATH=" ^ bin |];
+                  compiler_id = "";
+                  runtime_id = "";
                 }
-          | Error _ as err, _ -> err
-          | _, (Error _ as err) -> err
-          | _ -> Error (Unavailable "toolchain pair")))
+              in
+              let hash = manifest_hash root in
+              match
+                ( spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlc [ "-vnum" ]),
+                  spawn ~deadline ~env:tools.env (loader_argv tools tools.ocamlrun [ "-vnum" ]) )
+              with
+              | Ok compiler_version, Ok runtime_version
+                when toolchain_acceptable ~compiler:compiler_version ~runtime:runtime_version ->
+                  Ok
+                    {
+                      tools with
+                      compiler_id = Printf.sprintf "ocamlc %s manifest %s" compiler_version hash;
+                      runtime_id = Printf.sprintf "ocamlrun %s manifest %s" runtime_version hash;
+                    }
+              | Error _ as err, _ ->
+                  remove_tree root;
+                  err
+              | _, (Error _ as err) ->
+                  remove_tree root;
+                  err
+              | _ ->
+                  remove_tree root;
+                  Error (Unavailable "toolchain pair"))
 
 let toolchain () =
   match select_toolchain ~deadline:(Unix.gettimeofday () +. 5.) with
-  | Ok tools -> Ok (tools.compiler_id, tools.runtime_id)
+  | Ok tools ->
+      let ids = (tools.compiler_id, tools.runtime_id) in
+      release tools;
+      Ok ids
   | Error _ as err -> err
 
-let run ~dir ~deadline ~env ~ocamlc ~ocamlrun ~stdlib argv =
+let hold_toolchain ~deadline = select_toolchain ~deadline
+
+let status_of text =
+  match String.trim text with
+  | "OK" -> Ok ()
+  | text when String.starts_with ~prefix:"FAIL " text -> Error (Unavailable (String.sub text 5 (String.length text - 5)))
+  | _ -> Error (Unavailable "status")
+
+external to_int : Unix.file_descr -> int = "%identity"
+
+let isolate ~work ~snap =
+  let userns = enter_userns work snap in
+  if userns = 0 then Ok ()
+  else if userns / 1000 = 3 then
+    let other = enter_landlock work snap in
+    if other = 0 then Ok () else Error (stage_text userns ^ " " ^ stage_text other)
+  else Error (stage_text userns)
+
+let become_isolated ~setup_fault ~work ~snap =
+  let rc = limit_compiler 30 compile_as_bytes compile_file_bytes in
+  match setup_fault with
+  | Some Rlimit -> Error "rlimit 1"
+  | Some Descriptors -> Error "fd 1"
+  | Some Isolation -> (
+      match isolate ~work:"/no/such-ocagent-work" ~snap:"/no/such-ocagent-snap" with
+      | Ok () -> Error "isolation 0"
+      | Error _ as err -> err)
+  | None when rc <> 0 -> Error ("rlimit " ^ string_of_int (abs rc))
+  | None -> isolate ~work ~snap
+
+let launch ~deadline ~work ~tools ~setup_fault args =
   if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
   else
-    let stdout_path = Filename.concat dir "tool.out" in
-    let stderr_path = Filename.concat dir "tool.err" in
+    let stdout_path = Filename.concat work "tool.out" in
+    let stderr_path = Filename.concat work "tool.err" in
+    let marker = Filename.concat work "exec-marker" in
+    let read_fd, write_fd = Unix.pipe ~cloexec:true () in
     match Unix.fork () with
     | 0 -> (
         try
@@ -229,112 +393,55 @@ let run ~dir ~deadline ~env ~ocamlc ~ocamlrun ~stdlib argv =
           Unix.dup2 null Unix.stdin;
           Unix.dup2 out Unix.stdout;
           Unix.dup2 err Unix.stderr;
-          if limit_compiler 30 compile_as_bytes compile_file_bytes <> 0 then exit 125;
-          if close_extra_fds () <> 0 then exit 125;
-          if enter_jail dir ocamlc ocamlrun stdlib <> 0 then exit 126;
-          Unix.chdir dir;
-          Unix.execve argv.(0) argv env
+          let keep = to_int write_fd in
+          let report msg =
+            let bytes = Bytes.of_string msg in
+            ignore (Unix.write write_fd bytes 0 (Bytes.length bytes))
+          in
+          (match setup_fault with
+          | Some Descriptors -> if close_extra_fds keep <> 0 then ()
+          | _ -> if close_extra_fds keep <> 0 then (report "FAIL fd 1\n"; exit 126));
+          (match become_isolated ~setup_fault ~work ~snap:tools.root with
+          | Error msg ->
+              report ("FAIL " ^ msg ^ "\n");
+              exit 126
+          | Ok () -> ());
+          Unix.chdir work;
+          write_exact marker "exec";
+          report "OK\n";
+          Unix.close write_fd;
+          let argv = loader_argv tools tools.ocamlc args in
+          Unix.execve argv.(0) argv tools.env
         with _ -> exit 127)
     | pid -> (
-        let rec wait () =
-          match Unix.waitpid [ Unix.WNOHANG ] pid with
-          | 0, _ when Unix.gettimeofday () >= deadline ->
-              ignore (kill_group pid);
-              (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ());
-              ignore (Unix.waitpid [] pid);
-              Error (Rejected "compile timeout")
-          | 0, _ ->
-              Unix.sleepf 0.02;
-              wait ()
-          | _, Unix.WEXITED 0 ->
-              let out_len = (Unix.stat stdout_path).st_size in
-              let err_len = (Unix.stat stderr_path).st_size in
-              if out_len > max_output || err_len > max_output then Error (Rejected "compiler output") else Ok ()
-          | _, Unix.WEXITED 125 -> Error (Unavailable "compiler limits")
-          | _, Unix.WEXITED 126 -> Error (Unavailable "compiler isolation")
-          | _, Unix.WEXITED 127 -> Error (Unavailable "compiler exec")
-          | _, _ ->
-              let message =
-                if Sys.file_exists stderr_path then
-                  let text = read_file stderr_path in
-                  if String.length text > 500 then String.sub text 0 500 else text
-                else "compiler failed"
-              in
-              Error (Rejected message)
-        in
+        Unix.close write_fd;
         Fun.protect
-          ~finally:(fun () ->
-            let jail = Printf.sprintf "/tmp/ocagent-jail-%d" pid in
-            try Unix.rmdir jail with Unix.Unix_error _ -> ())
-          wait)
-
-let bounded_command ~timeout argv =
-  match spawn ~deadline:(Unix.gettimeofday () +. timeout) ~env:[| "LANG=C" |] argv with
-  | Ok _ as ok -> ok
-  | Error _ as err -> err
-
-let limits_failure marker =
-  match Unix.fork () with
-  | 0 -> if limits_must_fail () = 0 then (let oc = open_out marker in output_string oc "ran"; close_out oc; exit 0) else exit 125
-  | pid -> (
-      let _, status = Unix.waitpid [] pid in
-      if Sys.file_exists marker then Error (Rejected "fallback")
-      else
-        match status with
-        | Unix.WEXITED 125 -> Error (Unavailable "compiler limits")
-        | _ -> Error (Unavailable "compiler limits"))
-
-let isolation_probe ~sentinel =
-  let rec cleanup dir =
-    if Sys.file_exists dir then (
-      Array.iter
-        (fun name ->
-          let path = Filename.concat dir name in
-          if Sys.is_directory path then cleanup path else Unix.unlink path)
-        (Sys.readdir dir);
-      Unix.rmdir dir)
-  in
-  let dir = Filename.temp_dir "ocagent-iso" "" in
-  Fun.protect ~finally:(fun () -> cleanup dir) (fun () ->
-      match select_toolchain ~deadline:(Unix.gettimeofday () +. 5.) with
-      | Error _ as err -> err
-      | Ok tools -> (
-          match Unix.fork () with
-          | 0 -> (
-              try
-                if enter_jail dir tools.ocamlc tools.ocamlrun tools.stdlib <> 0 then exit 126;
-                if Sys.file_exists sentinel then exit 3;
-                (try
-                   let oc = open_out (Filename.concat dir "proof") in
-                   output_string oc "ok";
-                   close_out oc
-                 with _ -> exit 5);
-                let connected =
-                  try
-                    let socket = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
-                    Unix.connect socket (Unix.ADDR_INET (Unix.inet_addr_of_string "127.0.0.1", 9));
-                    true
-                  with _ -> false
+          ~finally:(fun () -> try Unix.rmdir (Printf.sprintf "/tmp/ocagent-jail-%d" pid) with Unix.Unix_error _ -> ())
+          (fun () ->
+            match collect_child ~deadline pid read_fd with
+            | Error _ as err -> err
+            | Ok (text, Unix.WEXITED 0) -> (
+                match status_of text with
+                | Ok () ->
+                    let out_len = (Unix.stat stdout_path).st_size in
+                    let err_len = (Unix.stat stderr_path).st_size in
+                    if out_len > max_output || err_len > max_output then Error (Rejected "compiler output") else Ok ()
+                | Error _ as err -> err)
+            | Ok (text, Unix.WEXITED 126) -> (
+                match status_of text with
+                | Error (Unavailable _) as err -> if Sys.file_exists marker then Error (Rejected "fallback") else err
+                | Error _ as err -> err
+                | Ok () -> Error (Unavailable "status"))
+            | Ok (text, Unix.WEXITED 127) -> Error (Unavailable ("compiler exec " ^ String.trim text))
+            | Ok (_, Unix.WEXITED _) ->
+                let message =
+                  if Sys.file_exists stderr_path then
+                    let text = read_file stderr_path in
+                    if String.length text > 500 then String.sub text 0 500 else text
+                  else "compiler failed"
                 in
-                exit (if connected then 4 else 0)
-              with _ -> exit 126)
-          | pid -> (
-              let _, status = Unix.waitpid [] pid in
-              (try Unix.rmdir (Printf.sprintf "/tmp/ocagent-jail-%d" pid) with Unix.Unix_error _ -> ());
-              match status with
-              | Unix.WEXITED 0 when Sys.file_exists (Filename.concat dir "proof") -> Ok ()
-              | Unix.WEXITED 126 -> Error (Unavailable "compiler isolation")
-              | _ -> Error (Unavailable "compiler isolation"))))
-
-let rec remove_tree dir =
-  if Sys.file_exists dir then (
-    let entries = Sys.readdir dir in
-    Array.iter
-      (fun name ->
-        let path = Filename.concat dir name in
-        if Sys.is_directory path then remove_tree path else Unix.unlink path)
-      entries;
-    Unix.rmdir dir)
+                Error (Rejected message)
+            | Ok _ -> Error (Rejected "compiler failed")))
 
 let module_name_ok name =
   let reserved = function
@@ -360,152 +467,266 @@ let input_text pairs =
   | Ok text -> Ok text
   | Error err -> Error (Rejected (Step_manifest.describe err))
 
-let bounded text =
-  if String.length text > 262144 then false
-  else
-    let depth = ref 0 in
-    let max_depth = ref 0 in
-    String.iter
-      (fun c ->
-        match c with
-        | '(' | '{' | '[' ->
-            incr depth;
-            if !depth > !max_depth then max_depth := !depth
-        | ')' | '}' | ']' -> if !depth > 0 then decr depth
-        | _ -> ())
-      text;
-    !max_depth <= 128
+let text_ok text = String.length text <= max_text
 
-let compile ~source ~modules ~input =
-  if List.length modules > 16 then Error (Rejected "too many modules")
-  else if not (bounded source) || List.exists (fun item -> not (bounded item.source && bounded item.interface_)) modules then
-    Error (Rejected "too big")
-  else if List.exists (fun (key, value) -> not (bounded key && bounded value)) input then Error (Rejected "too big")
+let validate_child ~deadline ~users source modules =
+  if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
   else
-    let deadline = Unix.gettimeofday () +. compile_timeout in
-    match (sdk_dir (), select_toolchain ~deadline, input_text input) with
-    | Error _ as err, _, _ | _, (Error _ as err), _ | _, _, (Error _ as err) -> err
-    | Ok sdk, Ok tools, Ok input_bytes -> (
-        let names = List.map (fun item -> item.name) modules in
-        if List.exists (fun name -> not (module_name_ok name)) names then Error (Rejected "module name")
-        else if List.length names <> List.length (List.sort_uniq String.compare names) then Error (Rejected "duplicate module")
-        else
-          let users = "Step" :: names in
+    let read_fd, write_fd = Unix.pipe ~cloexec:true () in
+    match Unix.fork () with
+    | 0 -> (
+        try
+          if limit_compiler 30 compile_as_bytes compile_file_bytes <> 0 then exit 125;
+          Unix.dup2 write_fd Unix.stdout;
+          Unix.close read_fd;
+          let say msg =
+            let msg = if String.length msg > 500 then String.sub msg 0 500 else msg in
+            output_string stdout (msg ^ "\n");
+            flush stdout
+          in
+          let rec mods = function
+            | [] -> say "OK"; exit 0
+            | item :: rest -> (
+                match Step_validate.interface ~users item.interface_ with
+                | Error (Step_validate.Rejected msg) -> say msg; exit 2
+                | Ok () -> (
+                    match Step_validate.implementation ~users item.source with
+                    | Error (Step_validate.Rejected msg) -> say msg; exit 2
+                    | Ok () -> mods rest))
+          in
           match Step_validate.implementation ~users source with
-          | Error (Step_validate.Rejected msg) -> Error (Rejected msg)
+          | Error (Step_validate.Rejected msg) -> say msg; exit 2
+          | Ok () -> mods modules
+        with _ -> exit 2)
+    | pid -> (
+        Unix.close write_fd;
+        match collect_child ~deadline pid read_fd with
+        | Ok (text, Unix.WEXITED 0) when String.trim text = "OK" -> Ok ()
+        | Ok (text, Unix.WEXITED 2) -> Error (Rejected (String.trim text))
+        | Ok (_, Unix.WEXITED 125) -> Error (Unavailable "validator limits")
+        | Error (Rejected "compile timeout") -> Error (Rejected "compile timeout")
+        | Error (Rejected "compiler output") -> Error (Rejected "validator output")
+        | Ok _ -> Error (Rejected "validator")
+        | Error _ as err -> err)
+
+let validate_cmt ~deadline ~users dir names =
+  if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
+  else
+    let read_fd, write_fd = Unix.pipe ~cloexec:true () in
+    match Unix.fork () with
+    | 0 -> (
+        try
+          if limit_compiler 30 compile_as_bytes compile_file_bytes <> 0 then exit 125;
+          Unix.dup2 write_fd Unix.stdout;
+          Unix.close read_fd;
+          let rec go = function
+            | [] -> output_string stdout "OK\n"; exit 0
+            | name :: rest -> (
+                match Step_validate.scan_cmt ~users (Filename.concat dir (name ^ ".cmt")) with
+                | Error (Step_validate.Rejected msg) ->
+                    output_string stdout ((if String.length msg > 500 then String.sub msg 0 500 else msg) ^ "\n");
+                    exit 2
+                | Ok () -> go rest)
+          in
+          go names
+        with _ -> exit 2)
+    | pid -> (
+        Unix.close write_fd;
+        match collect_child ~deadline pid read_fd with
+        | Ok (text, Unix.WEXITED 0) when String.trim text = "OK" -> Ok ()
+        | Ok (text, Unix.WEXITED 2) -> Error (Rejected (String.trim text))
+        | Error _ as err -> err
+        | Ok _ -> Error (Rejected "validator"))
+
+let compile_with ~setup_fault ~deadline tools ~source ~modules ~input =
+  match (sdk_dir (), input_text input) with
+  | Error _ as err, _ | _, (Error _ as err) -> err
+  | Ok sdk, Ok input_bytes -> (
+      let dir = Filename.temp_dir "ocagent-step" "" in
+      Fun.protect ~finally:(fun () -> remove_tree dir) (fun () ->
+          let api_mli = read_file (Filename.concat sdk "step_api.mli") in
+          let api_ml = read_file (Filename.concat sdk "step_api.ml") in
+          let driver = read_file (Filename.concat sdk "step_driver.ml") in
+          write_exact (Filename.concat dir "step_api.mli") api_mli;
+          write_exact (Filename.concat dir "step_api.ml") api_ml;
+          write_exact (Filename.concat dir "step.ml") source;
+          write_exact (Filename.concat dir "step_driver.ml") driver;
+          write_exact (Filename.concat dir "step_check.ml") "module _ : Step_api.STEP = Step.Step\n";
+          List.iter
+            (fun item ->
+              write_exact (Filename.concat dir (item.name ^ ".mli")) item.interface_;
+              write_exact (Filename.concat dir (item.name ^ ".ml")) item.source)
+            modules;
+          let user_cmds =
+            List.concat_map
+              (fun item -> [ [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".mli" ]; [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".ml" ] ])
+              modules
+          in
+          let cmds =
+            [ [ "-I"; dir; "-bin-annot"; "-c"; "step_api.mli" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_api.ml" ] ]
+            @ user_cmds
+            @ [ [ "-I"; dir; "-bin-annot"; "-c"; "step.ml" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_check.ml" ]; [ "-I"; dir; "-c"; "step_driver.ml" ] ]
+          in
+          let rec build = function
+            | [] -> Ok ()
+            | args :: rest -> (
+                match launch ~deadline ~work:dir ~tools ~setup_fault args with
+                | Error _ as err -> err
+                | Ok () -> build rest)
+          in
+          match build cmds with
+          | Error _ as err -> err
           | Ok () -> (
-              let rec mods = function
-                | [] -> Ok ()
-                | item :: rest -> (
-                    match Step_validate.interface ~users item.interface_ with
-                    | Error (Step_validate.Rejected msg) -> Error (Rejected msg)
-                    | Ok () -> (
-                        match Step_validate.implementation ~users item.source with
-                        | Error (Step_validate.Rejected msg) -> Error (Rejected msg)
-                        | Ok () -> mods rest))
-              in
-              match mods modules with
+              match validate_cmt ~deadline ~users:("Step" :: List.map (fun item -> item.name) modules) dir ("step" :: List.map (fun item -> item.name) modules) with
               | Error _ as err -> err
               | Ok () -> (
-                  let dir = Filename.temp_dir "ocagent-step" "" in
-                  Fun.protect ~finally:(fun () -> remove_tree dir) (fun () ->
-                      let api_mli = read_file (Filename.concat sdk "step_api.mli") in
-                      let api_ml = read_file (Filename.concat sdk "step_api.ml") in
-                      let driver = read_file (Filename.concat sdk "step_driver.ml") in
-                      write_exact (Filename.concat dir "step_api.mli") api_mli;
-                      write_exact (Filename.concat dir "step_api.ml") api_ml;
-                      write_exact (Filename.concat dir "step.ml") source;
-                      write_exact (Filename.concat dir "step_driver.ml") driver;
-                      write_exact (Filename.concat dir "step_check.ml") "module _ : Step_api.STEP = Step.Step\n";
-                      List.iter
-                        (fun item ->
-                          write_exact (Filename.concat dir (item.name ^ ".mli")) item.interface_;
-                          write_exact (Filename.concat dir (item.name ^ ".ml")) item.source)
-                        modules;
-                      match tools.ocamlc with
-                      | ocamlc -> (
-                          let rec build = function
-                            | [] -> Ok ()
-                            | args :: rest -> (
-                                match run ~dir ~deadline ~env:tools.env ~ocamlc ~ocamlrun:tools.ocamlrun ~stdlib:tools.stdlib (Array.of_list (ocamlc :: args)) with
-                                | Error _ as err -> err
-                                | Ok () -> build rest)
-                          in
-                          let user_cmds =
-                            List.concat_map
-                              (fun item ->
-                                [
-                                  [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".mli" ];
-                                  [ "-I"; dir; "-bin-annot"; "-c"; item.name ^ ".ml" ];
-                                ])
-                              modules
-                          in
-                          let cmds =
-                            [ [ "-I"; dir; "-bin-annot"; "-c"; "step_api.mli" ]; [ "-I"; dir; "-bin-annot"; "-c"; "step_api.ml" ] ]
-                            @ user_cmds
-                            @ [
-                                [ "-I"; dir; "-bin-annot"; "-c"; "step.ml" ];
-                                [ "-I"; dir; "-bin-annot"; "-c"; "step_check.ml" ];
-                                [ "-I"; dir; "-c"; "step_driver.ml" ];
-                              ]
-                          in
-                          match build cmds with
-                          | Error _ as err -> err
-                          | Ok () -> (
-                              let rec typed = function
-                                | [] -> Ok ()
-                                | name :: rest -> (
-                                    match Step_validate.scan_cmt ~users (Filename.concat dir (name ^ ".cmt")) with
-                                    | Error (Step_validate.Rejected msg) -> Error (Rejected msg)
-                                    | Ok () -> typed rest)
-                              in
-                              match typed ("step" :: names) with
-                              | Error _ as err -> err
-                              | Ok () -> (
-                                  let objects =
-                                    "step_api.cmo"
-                                    :: List.map (fun item -> item.name ^ ".cmo") modules
-                                    @ [ "step.cmo"; "step_check.cmo"; "step_driver.cmo" ]
-                                  in
-                                  match run ~dir ~deadline ~env:tools.env ~ocamlc ~ocamlrun:tools.ocamlrun ~stdlib:tools.stdlib (Array.of_list (ocamlc :: ("-I" :: dir :: "-o" :: "worker" :: objects))) with
-                                  | Error _ as err -> err
-                                  | Ok () ->
-                                      let bytecode = read_file (Filename.concat dir "worker") in
-                                      if String.length bytecode > (16 * 1024 * 1024) then Error (Rejected "artifact")
-                                      else if not (String.starts_with ~prefix:"#!" bytecode) then Error (Rejected "bytecode")
-                                      else
-                                        let module_bytes =
-                                          List.map
-                                            (fun item ->
-                                              let object_bytes = read_file (Filename.concat dir (item.name ^ ".cmo")) in
-                                              {
-                                                Step_manifest.name = item.name;
-                                                source = item.source;
-                                                interface_ = item.interface_;
-                                                artifact = object_bytes;
-                                              })
-                                            modules
-                                        in
-                                        Ok
-                                          {
-                                            bundle =
-                                              {
-                                                Step_manifest.source;
-                                                modules = module_bytes;
-                                                compiler_id = tools.compiler_id;
-                                                runtime_id = tools.runtime_id;
-                                                sdk = api_mli;
-                                                driver = api_ml ^ driver;
-                                                artifact = bytecode;
-                                                base_workspace = "";
-                                                input_context = input_bytes;
-                                                capability_grant = {|{"net":"get"}|};
-                                                policy_version = policy_text;
-                                              };
-                                          })))))))
+                  let objects = "step_api.cmo" :: List.map (fun item -> item.name ^ ".cmo") modules @ [ "step.cmo"; "step_check.cmo"; "step_driver.cmo" ] in
+                  match launch ~deadline ~work:dir ~tools ~setup_fault ("-I" :: dir :: "-o" :: "worker" :: objects) with
+                  | Error _ as err -> err
+                  | Ok () ->
+                      let bytecode = read_file (Filename.concat dir "worker") in
+                      if String.length bytecode > 16 * 1024 * 1024 then Error (Rejected "artifact")
+                      else if not (String.starts_with ~prefix:"#!" bytecode) then Error (Rejected "bytecode")
+                      else
+                        let module_bytes =
+                          List.map
+                            (fun item ->
+                              {
+                                Step_manifest.name = item.name;
+                                source = item.source;
+                                interface_ = item.interface_;
+                                artifact = read_file (Filename.concat dir (item.name ^ ".cmo"));
+                              })
+                            modules
+                        in
+                        Ok
+                          {
+                            bundle =
+                              {
+                                Step_manifest.source;
+                                modules = module_bytes;
+                                compiler_id = tools.compiler_id;
+                                runtime_id = tools.runtime_id;
+                                sdk = api_mli;
+                                driver = api_ml ^ driver;
+                                artifact = bytecode;
+                                base_workspace = "";
+                                input_context = input_bytes;
+                                capability_grant = {|{"net":"get"}|};
+                                policy_version = policy_text;
+                              };
+                          }))))
+
+let compile_go ~setup_fault ~source ~modules ~input =
+  if List.length modules > 16 then Error (Rejected "too many modules")
+  else if (not (text_ok source)) || List.exists (fun item -> not (text_ok item.source && text_ok item.interface_)) modules then Error (Rejected "too big")
+  else if List.exists (fun (key, value) -> not (text_ok key && text_ok value)) input then Error (Rejected "too big")
+  else
+    let names = List.map (fun item -> item.name) modules in
+    if List.exists (fun name -> not (module_name_ok name)) names then Error (Rejected "module name")
+    else if List.length names <> List.length (List.sort_uniq String.compare names) then Error (Rejected "duplicate module")
+    else
+      let deadline = Unix.gettimeofday () +. compile_timeout in
+      let users = "Step" :: names in
+      match validate_child ~deadline ~users source modules with
+      | Error _ as err -> err
+      | Ok () -> (
+          match select_toolchain ~deadline with
+          | Error _ as err -> err
+          | Ok tools -> Fun.protect ~finally:(fun () -> release tools) (fun () -> compile_with ~setup_fault ~deadline tools ~source ~modules ~input))
+
+let compile ~source ~modules ~input = compile_go ~setup_fault:None ~source ~modules ~input
+
+let compile_fault setup_fault ~source ~modules ~input = compile_go ~setup_fault:(Some setup_fault) ~source ~modules ~input
 
 let admit ~path ~run_id ~agent_version ~admission_key artifact =
   match Store.admit_step ~path ~run_id ~agent_version ~admission_key artifact.bundle with
   | Ok manifest -> Ok manifest
   | Error err -> Error (Store err)
 
+let submit ~path ~run_id ~agent_version ~admission_key ~source ~modules ~input =
+  match compile ~source ~modules ~input with
+  | Error _ as err -> err
+  | Ok artifact -> admit ~path ~run_id ~agent_version ~admission_key artifact
+
+let submit_fault setup_fault ~path ~run_id ~agent_version ~admission_key ~source ~modules ~input =
+  match compile_fault setup_fault ~source ~modules ~input with
+  | Error _ as err -> err
+  | Ok artifact -> admit ~path ~run_id ~agent_version ~admission_key artifact
+
+let command ~timeout argv =
+  let deadline = Unix.gettimeofday () +. timeout in
+  let read_fd, write_fd = Unix.pipe ~cloexec:true () in
+  match Unix.fork () with
+  | 0 -> (
+      try
+        let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
+        Unix.dup2 null Unix.stdin;
+        Unix.dup2 write_fd Unix.stdout;
+        Unix.dup2 write_fd Unix.stderr;
+        Unix.close read_fd;
+        if limit_compiler 5 compile_as_bytes compile_file_bytes <> 0 then exit 125;
+        if close_extra_fds (-1) <> 0 then exit 125;
+        Unix.execve argv.(0) argv [| "LANG=C" |]
+      with _ -> exit 127)
+  | pid ->
+      Unix.close write_fd;
+      let rec settle n =
+        match getpgid pid with
+        | pgid when pgid = pid -> pgid
+        | _ when n = 0 -> pid
+        | _ ->
+            Unix.sleepf 0.01;
+            settle (n - 1)
+        | exception Failure _ -> pid
+      in
+      let pgid = settle 20 in
+      let result =
+        match collect_child ~deadline pid read_fd with
+        | Ok (text, Unix.WEXITED 0) -> Ok text
+        | Ok _ -> Error (Rejected "compiler failed")
+        | Error _ as err -> err
+      in
+      (pid, pgid, result)
+
+let probe_isolation tools ~sentinel ~port =
+  let work = Filename.temp_dir "ocagent-probe" "" in
+  Fun.protect ~finally:(fun () -> remove_tree work) (fun () ->
+      match Unix.fork () with
+      | 0 -> (
+          try
+            match become_isolated ~setup_fault:None ~work ~snap:tools.root with
+            | Error _ -> exit 126
+            | Ok () ->
+                if Sys.file_exists sentinel then exit 3;
+                let wrote_snap =
+                  try
+                    let oc = open_out (Filename.concat tools.root "ro-test") in
+                    output_string oc "x";
+                    close_out oc;
+                    true
+                  with _ -> false
+                in
+                if wrote_snap then exit 6;
+                (try
+                   let oc = open_out (Filename.concat work "proof") in
+                   output_string oc "ok";
+                   close_out oc
+                 with _ -> exit 5);
+                let connected =
+                  try
+                    let socket = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
+                    Unix.connect socket (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+                    true
+                  with _ -> false
+                in
+                exit (if connected then 4 else 0)
+          with _ -> exit 126)
+      | pid -> (
+          let _, status = Unix.waitpid [] pid in
+          (try Unix.rmdir (Printf.sprintf "/tmp/ocagent-jail-%d" pid) with Unix.Unix_error _ -> ());
+          match status with
+          | Unix.WEXITED 0 when Sys.file_exists (Filename.concat work "proof") -> Ok ()
+          | Unix.WEXITED 126 -> Error (Unavailable "isolation")
+          | Unix.WEXITED code -> Error (Unavailable ("isolation " ^ string_of_int code))
+          | _ -> Error (Unavailable "isolation")))

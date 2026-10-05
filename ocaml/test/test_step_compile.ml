@@ -7,6 +7,34 @@ module M = Step_manifest
 
 let fail fmt = Printf.ksprintf failwith fmt
 
+let () =
+  match Array.to_list Sys.argv with
+  | [ _; "--grandchild"; path ] ->
+      let pid = Unix.getpid () in
+      let pgid = C.getpgid pid in
+      let oc = open_out path in
+      Printf.fprintf oc "%d %d\n" pid pgid;
+      close_out oc;
+      if Unix.fork () = 0 then Unix.sleep 30;
+      exit 0
+  | _ -> ()
+
+let read_all path =
+  let ic = open_in_bin path in
+  let buf = Buffer.create 64 in
+  let bytes = Bytes.create 64 in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+      let rec go () =
+        match input ic bytes 0 64 with
+        | 0 -> Buffer.contents buf
+        | n ->
+            Buffer.add_subbytes buf bytes 0 n;
+            go ()
+      in
+      go ())
+
+let alive pid = Sys.file_exists ("/proc/" ^ string_of_int pid)
+
 let helper =
   {
     C.name = "Helper";
@@ -43,17 +71,8 @@ let vnum () =
   let ic = Unix.open_process_args_in "ocamlc" [| "ocamlc"; "-vnum" |] in
   Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic))
 
-let stdlib_hash () =
-  let ic = Unix.open_process_args_in "ocamlc" [| "ocamlc"; "-where" |] in
-  let where = Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic)) in
-  let path = Filename.concat where "stdlib.cma" in
-  let ic = open_in_bin path in
-  let bytes = Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic)) in
-  M.sha256 bytes
-
 let () =
   let expected = vnum () in
-  let expected_stdlib = stdlib_hash () in
   Unix.putenv "OCAMLLIB" "/no/such/ocagent-lib";
   Unix.putenv "OCAMLPATH" "/no/such/ocagent-path";
   let channel =
@@ -117,49 +136,156 @@ end
   let huge_source = String.make 262145 'a' in
   let huge_compile = fresh () in
   let t0 = Unix.gettimeofday () in
-  (match C.compile ~source:huge_source ~modules:[] ~input:[] with
+  (match
+     C.submit ~path:huge_compile ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:huge_source ~modules:[]
+       ~input:[]
+   with
   | Error (C.Rejected "too big") -> ()
   | Ok _ -> fail "oversized source reached compilation"
   | Error err -> fail "oversized compile %s" (C.describe err));
   if Unix.gettimeofday () -. t0 > 2. then fail "oversized source was parsed";
   if Sys.file_exists huge_compile then fail "oversized source created a snapshot";
-  let nested = String.make 200 '(' ^ String.make 200 ')' in
-  (match C.compile ~source:nested ~modules:[] ~input:[] with
-  | Error (C.Rejected "too big") -> ()
-  | Ok _ -> fail "deep source was compiled"
-  | Error err -> fail "deep %s" (C.describe err));
-  let sleep_started = Unix.gettimeofday () in
-  (match C.bounded_command ~timeout:0.4 [| "/bin/sleep"; "30" |] with
-  | Error _ -> if Unix.gettimeofday () -. sleep_started > 2. then fail "probe wait exceeded the deadline"
-  | Ok _ -> fail "sleeping command returned");
-  let still =
-    Array.exists
-      (fun pid ->
-        let path = "/proc/" ^ pid ^ "/cmdline" in
-        let needle = "/bin/sleep\00030" in
-        try
-          let ic = open_in_bin path in
-          let text = really_input_string ic (in_channel_length ic) in
-          close_in ic;
-          String.length text >= String.length needle && String.sub text 0 (String.length needle) = needle
-        with _ -> false)
-      (Sys.readdir "/proc")
+  let quoted = String.make 129 '(' in
+  let commented =
+    Printf.sprintf
+      {|open Step_api
+module Step : STEP = struct
+  let run () =
+    let text = "%s" in
+    (* %s *)
+    ignore text;
+    Done "x"
+end
+|}
+      quoted quoted
   in
-  if still then fail "timed-out process is still running";
-  let marker = Filename.temp_file "ocagent-limit" "" in
-  Unix.unlink marker;
-  (match C.limits_failure marker with
-  | Error (C.Unavailable _) when not (Sys.file_exists marker) -> ()
-  | Ok () -> fail "limit failure continued"
-  | Error err -> fail "limit failure %s" (C.describe err));
+  (match C.compile ~source:commented ~modules:[] ~input:[ ("notes", quoted) ] with
+  | Ok _ -> ()
+  | Error err -> fail "quoted parens %s" (C.describe err));
+  let rec begun n = if n = 0 then "Done \"x\"" else "begin " ^ begun (n - 1) ^ " end" in
+  let deep =
+    "open Step_api\nmodule Step : STEP = struct\n let run () = " ^ begun 40 ^ "\nend\n"
+  in
+  (match C.compile ~source:deep ~modules:[] ~input:[] with
+  | Ok _ -> ()
+  | Error (C.Rejected _ | C.Unavailable _) -> ()
+  | Error err -> fail "deep %s" (C.describe err));
+  let step_state events =
+    let rec go state count = function
+      | [] -> state, count
+      | event :: rest -> (
+          let state, action = C.collector_step state event in
+          match action with
+          | C.Reap -> go state (count + 1) rest
+          | C.Failed "collector" -> fail "collector reaped twice"
+          | _ -> go state count rest)
+    in
+    go { C.reaped = None; eof = false; length = 0 } 0 events
+  in
+  let _, reaps = step_state [ C.Would_block; C.Reaped (Unix.WEXITED 0); C.Pipe_eof ] in
+  if reaps <> 1 then fail "reap count %d" reaps;
+  let state, _ = step_state [ C.Pipe_eof; C.Reaped (Unix.WEXITED 0) ] in
+  if (not state.C.eof) || state.reaped = None then fail "eof-first state";
+  let state, _ = step_state [ C.Reaped (Unix.WEXITED 0); C.Output 3; C.Pipe_eof ] in
+  if state.C.length <> 3 || state.reaped = None then fail "exit-first dropped output";
+  let _, action = C.collector_step { C.reaped = None; eof = false; length = max_int / 2 } (C.Output 262144) in
+  (match action with C.Failed "compiler output" -> () | _ -> fail "output limit was accepted");
+  let sleep_started = Unix.gettimeofday () in
+  let sleep_pid, sleep_pgid, sleep_result = C.command ~timeout:0.4 [| "/bin/sleep"; "30" |] in
+  (match sleep_result with
+  | Ok _ -> fail "sleeping command returned"
+  | Error _ -> if Unix.gettimeofday () -. sleep_started > 2. then fail "probe wait exceeded the deadline");
+  if alive sleep_pid || alive sleep_pgid then fail "timed-out process is still running";
+  let hand = Filename.temp_file "ocagent-hand" "" in
+  let hold_started = Unix.gettimeofday () in
+  let _, _, hold = C.command ~timeout:0.4 [| Sys.argv.(0); "--grandchild"; hand |] in
+  (match hold with Ok _ -> fail "grandchild returned" | Error _ -> ());
+  if Unix.gettimeofday () -. hold_started > 2. then fail "grandchild held the pipe";
+  let hand_text = read_all hand in
+  let child_pid, child_pgid =
+    Scanf.sscanf hand_text "%d %d" (fun pid pgid -> (pid, pgid))
+  in
+  if alive child_pid || alive child_pgid then fail "grandchild process group is still running";
+  Unix.unlink hand;
+  let fault_path = fresh () in
+  let fault name setup =
+    match
+      C.submit_fault setup ~path:fault_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:step ~modules:[ helper ]
+        ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+    with
+    | Error (C.Unavailable msg) ->
+        if Sys.file_exists fault_path then fail "%s wrote a snapshot" name;
+        if msg = "" then fail "%s had an empty status" name
+    | Ok _ -> fail "%s executed" name
+    | Error err -> fail "%s %s" name (C.describe err)
+  in
+  fault "rlimit" C.Rlimit;
+  fault "fd" C.Descriptors;
+  fault "isolation" C.Isolation;
+  let tools =
+    match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
+    | Ok tools -> tools
+    | Error err -> fail "hold %s" (C.describe err)
+  in
   let sentinel = Filename.temp_file "ocagent-sentinel" "" in
   let oc = open_out sentinel in
   output_string oc "secret";
   close_out oc;
-  (match C.isolation_probe ~sentinel with
+  let host_secret = read_all sentinel in
+  if host_secret <> "secret" then fail "host sentinel unreadable";
+  let listen = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.bind listen (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  Unix.listen listen 1;
+  let port = match Unix.getsockname listen with Unix.ADDR_INET (_, port) -> port | _ -> fail "port" in
+  let client = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_STREAM 0 in
+  Unix.connect client (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+  let accepted, _ = Unix.accept ~cloexec:true listen in
+  ignore (Unix.write accepted (Bytes.of_string "ok") 0 2);
+  Unix.close accepted;
+  Unix.close client;
+  (match C.probe_isolation tools ~sentinel ~port with
   | Ok () -> ()
   | Error err -> fail "isolation %s" (C.describe err));
+  let waiting, _, _ = Unix.select [ listen ] [] [] 0.2 in
+  if waiting <> [] then fail "isolated probe reached the listener";
+  Unix.close listen;
   Unix.unlink sentinel;
+  let saved_path = Sys.getenv "PATH" in
+  let saved_cwd = Sys.getcwd () in
+  let prefix = Filename.temp_dir "ocagent-prefix" "" in
+  let bindir = Filename.concat prefix "bin" in
+  Unix.mkdir bindir 0o700;
+  let find_on path name =
+    let rec go = function
+      | [] -> fail "missing %s" name
+      | dir :: rest ->
+          let candidate = Filename.concat dir name in
+          if Sys.file_exists candidate then candidate else go rest
+    in
+    go (String.split_on_char ':' path)
+  in
+  let real_ocamlc = Unix.realpath (find_on saved_path "ocamlc") in
+  let real_ocamlrun = Unix.realpath (Filename.concat (Filename.dirname real_ocamlc) "ocamlrun") in
+  Unix.symlink real_ocamlc (Filename.concat bindir "ocamlc");
+  Unix.symlink real_ocamlrun (Filename.concat bindir "ocamlrun");
+  Sys.chdir prefix;
+  Unix.putenv "PATH" "bin";
+  let pinned =
+    match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
+    | Ok tools -> tools
+    | Error err -> fail "relative toolchain %s" (C.describe err)
+  in
+  Unix.unlink (Filename.concat bindir "ocamlc");
+  let oc = open_out (Filename.concat bindir "ocamlc") in
+  output_string oc "not-a-compiler";
+  close_out oc;
+  Sys.chdir saved_cwd;
+  Unix.putenv "PATH" saved_path;
+  (match C.compile_with ~setup_fault:None ~deadline:(Unix.gettimeofday () +. 20.) pinned ~source:step ~modules:[ helper ] ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ] with
+  | Ok _ -> ()
+  | Error err -> fail "snapshot compile %s" (C.describe err));
+  C.release pinned;
+  C.release tools;
   if not (C.toolchain_acceptable ~compiler:"5.3.0" ~runtime:"5.3.0") then fail "supported pair rejected";
   if C.toolchain_acceptable ~compiler:"5.3.0" ~runtime:"5.4.0" then fail "mismatched pair accepted";
   if C.toolchain_acceptable ~compiler:"4.14.2" ~runtime:"4.14.2" then fail "old pair accepted";
@@ -224,11 +350,9 @@ end
     | Error err -> fail "toolchain %s" (C.describe err)
   in
   if manifest.compiler_id <> compiler_id || manifest.runtime_id <> runtime_id then fail "toolchain id was not bound";
-  if not (String.starts_with ~prefix:("ocamlc " ^ expected ^ " ") compiler_id) then
+  if not (String.starts_with ~prefix:("ocamlc " ^ expected ^ " manifest ") compiler_id) then
     fail "compiler id %s does not use probed %s" compiler_id expected;
-  if not (String.ends_with ~suffix:("stdlib " ^ expected_stdlib) compiler_id) then
-    fail "compiler id %s does not pin the stdlib" compiler_id;
-  if not (String.starts_with ~prefix:("ocamlrun " ^ expected ^ " ") runtime_id) then
+  if not (String.starts_with ~prefix:("ocamlrun " ^ expected ^ " manifest ") runtime_id) then
     fail "runtime id %s does not use probed %s" runtime_id expected;
   let bytes =
     match S.read_blob ~path ~hash:manifest.artifact_hash ~kind:S.Artifact with
