@@ -32,5 +32,5 @@ let () =
       match P.of_name bad with
       | Error _ -> ()
       | Ok p -> fail "accepted %S as %s" bad (P.name p))
-    [ ""; "nope"; "Read_retryable:"; "Read_retryable:-1"; "Read_retryable:+1"; "Read_retryable:101"; "Read_retryable:01"; "Read_retryable:1x"; "Read_retryable: 1"; " Read_retryable:1" ];
+    [ ""; "nope"; "Read_retryable:"; "Read_retryable:-1"; "Read_retryable:+1"; "Read_retryable:101"; "Read_retryable:01"; "Read_retryable:1x"; "Read_retryable: 1"; " Read_retryable:1"; "Read_retryable:" ^ String.make 40 '9' ];
   print_endline "policy ok"

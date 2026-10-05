@@ -107,6 +107,8 @@ let canonical path =
 
 let registry_mu = Mutex.create ()
 let registry : (string, unit) Hashtbl.t = Hashtbl.create 16
+let store_mus_mu = Mutex.create ()
+let store_mus : (string, Mutex.t) Hashtbl.t = Hashtbl.create 16
 
 let try_acquire key =
   Mutex.lock registry_mu;
@@ -119,6 +121,20 @@ let release_key key =
   Mutex.lock registry_mu;
   Hashtbl.remove registry key;
   Mutex.unlock registry_mu
+
+let store_mutex path =
+  let key = canonical path in
+  Mutex.lock store_mus_mu;
+  let mu =
+    match Hashtbl.find_opt store_mus key with
+    | Some mu -> mu
+    | None ->
+        let mu = Mutex.create () in
+        Hashtbl.add store_mus key mu;
+        mu
+  in
+  Mutex.unlock store_mus_mu;
+  mu
 
 let read_file path =
   let ic = open_in_bin path in
@@ -196,14 +212,17 @@ let load path =
   | Error err -> raise (Corrupt (describe err))
 
 let with_store path f =
-  let fd = Unix.openfile (lock_path path) [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o600 in
-  Unix.set_close_on_exec fd;
-  Unix.lockf fd Unix.F_LOCK 0;
-  Fun.protect
-    ~finally:(fun () ->
-      (try Unix.lockf fd Unix.F_ULOCK 0 with Unix.Unix_error _ -> ());
-      Unix.close fd)
-    f
+  let mu = store_mutex path in
+  Mutex.lock mu;
+  Fun.protect ~finally:(fun () -> Mutex.unlock mu) (fun () ->
+      let fd = Unix.openfile (lock_path path) [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o600 in
+      Unix.set_close_on_exec fd;
+      Unix.lockf fd Unix.F_LOCK 0;
+      Fun.protect
+        ~finally:(fun () ->
+          (try Unix.lockf fd Unix.F_ULOCK 0 with Unix.Unix_error _ -> ());
+          Unix.close fd)
+        f)
 
 let write_snap path snap =
   write_atomic path (render snap.journal ~revision:snap.revision ~epoch:snap.epoch)
@@ -264,28 +283,29 @@ let with_executor ~path ~run_id ~agent_version f =
   let path = canonical path in
   if not (try_acquire path) then Error Already_running
   else
-    let fd = Unix.openfile (executor_path path) [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o600 in
-    Unix.set_close_on_exec fd;
-    let locked =
-      try
-        Unix.lockf fd Unix.F_TLOCK 0;
-        true
-      with Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES | Unix.EWOULDBLOCK), _, _) -> false
-    in
-    if not locked then (
-      Unix.close fd;
-      release_key path;
-      Error Already_running)
-    else
-      Fun.protect
-        ~finally:(fun () ->
-          (try Unix.lockf fd Unix.F_ULOCK 0 with Unix.Unix_error _ -> ());
+    Fun.protect ~finally:(fun () -> release_key path) (fun () ->
+        let fd =
+          Unix.openfile (executor_path path) [ Unix.O_RDWR; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o600
+        in
+        Unix.set_close_on_exec fd;
+        let locked =
+          try
+            Unix.lockf fd Unix.F_TLOCK 0;
+            true
+          with Unix.Unix_error ((Unix.EAGAIN | Unix.EACCES | Unix.EWOULDBLOCK), _, _) -> false
+        in
+        if not locked then (
           Unix.close fd;
-          release_key path)
-        (fun () ->
-          match claim path ~run_id ~agent_version with
-          | Error _ as err -> err
-          | Ok epoch -> f { path; run_id; agent_version; epoch })
+          Error Already_running)
+        else
+          Fun.protect
+            ~finally:(fun () ->
+              (try Unix.lockf fd Unix.F_ULOCK 0 with Unix.Unix_error _ -> ());
+              Unix.close fd)
+            (fun () ->
+              match claim path ~run_id ~agent_version with
+              | Error _ as err -> err
+              | Ok epoch -> f { path; run_id; agent_version; epoch }))
 
 let fresh ~run_id seq request ~attempt ~dispatched =
   {

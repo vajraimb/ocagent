@@ -132,9 +132,12 @@ module Policy = struct
       | Error _ as err -> err
       | Ok () ->
           if n > 1 && rest.[0] = '0' then Error "leading zero"
+          else if n > 3 then Error "out of range"
           else
-            let value = int_of_string rest in
-            if value > 100 then Error "out of range" else Ok value
+            match int_of_string_opt rest with
+            | None -> Error "not a number"
+            | Some value when value > 100 -> Error "out of range"
+            | Some value -> Ok value
 
   let of_name s =
     match s with

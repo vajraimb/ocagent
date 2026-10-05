@@ -343,6 +343,83 @@ let test_parallel path =
   let ask1 = List.nth !(snap.journal.entries) 1 in
   if ask0.J.callback_id <> "par-a" || ask1.J.callback_id <> "par-b" then fail "并行批准丢了更新"
 
+let test_same_process_store path =
+  ok
+    (S.with_executor ~path ~run_id ~agent_version:version (fun ex ->
+         (match S.prepare_operation ex (ask_req 0) with
+         | Ok S.Awaiting_approval -> ()
+         | _ -> fail "同进程审批 0");
+         (match S.prepare_operation ex (ask_req 1) with
+         | Ok S.Awaiting_approval -> ()
+         | _ -> fail "同进程审批 1");
+         Ok ()));
+  let before = (snapshot path).revision in
+  let go = Atomic.make false in
+  let ready = Atomic.make 0 in
+  let one seq callback =
+    Domain.spawn (fun () ->
+        Atomic.incr ready;
+        let deadline = Unix.gettimeofday () +. 3. in
+        while (not (Atomic.get go)) && Unix.gettimeofday () < deadline do
+          Domain.cpu_relax ()
+        done;
+        decision path seq callback approved)
+  in
+  let left = one 0 "dom-a" in
+  let right = one 1 "dom-b" in
+  let deadline = Unix.gettimeofday () +. 3. in
+  while Atomic.get ready < 2 && Unix.gettimeofday () < deadline do
+    Domain.cpu_relax ()
+  done;
+  if Atomic.get ready < 2 then fail "同进程批准没有同时到达";
+  Atomic.set go true;
+  (match Domain.join left with
+  | Ok () -> ()
+  | Error err -> fail "同进程批准 0 %s" (S.describe err));
+  (match Domain.join right with
+  | Ok () -> ()
+  | Error err -> fail "同进程批准 1 %s" (S.describe err));
+  let snap = snapshot path in
+  if snap.revision <> before + 2 then fail "同进程批准 revision %d -> %d" before snap.revision;
+  let ask0 = List.nth !(snap.journal.entries) 0 in
+  let ask1 = List.nth !(snap.journal.entries) 1 in
+  if ask0.J.callback_id <> "dom-a" || ask1.J.callback_id <> "dom-b" then fail "同进程批准丢了更新"
+
+let test_open_failure () =
+  let path =
+    Filename.concat
+      (Filename.concat (Filename.get_temp_dir_name ()) ("ocagent-missing-" ^ string_of_int (Unix.getpid ())))
+      "snapshot.json"
+  in
+  let once () =
+    try
+      match S.with_executor ~path ~run_id ~agent_version:version (fun _ -> Ok ()) with
+      | Ok _ -> `ran
+      | Error err -> `err err
+    with Unix.Unix_error (code, _, _) -> `unix code
+  in
+  match (once (), once ()) with
+  | `unix _, `unix _ -> ()
+  | _, `err S.Already_running -> fail "打开失败后执行者登记没释放"
+  | _ -> fail "打开失败的结果不对"
+
+let test_provider dir =
+  let fetch _ = failwith "provider boom" in
+  let agent () =
+    let _ = Effect.perform (P.Fetch { url = "http://127.0.0.1/x" }) in
+    "no"
+  in
+  (match D.run ~dir ~run_id ~agent_version:version ~fetch agent with
+  | D.Blocked msg when P.contains msg "provider boom" -> ()
+  | D.Blocked msg -> fail "provider 异常 %s" msg
+  | D.Finished _ -> fail "provider 异常被当成完成"
+  | D.Suspended -> fail "provider 异常变成挂起");
+  match D.run ~dir ~run_id ~agent_version:version ~fetch agent with
+  | D.Blocked msg when P.contains msg "Already_running" -> fail "provider 异常后执行者没释放"
+  | D.Blocked _ -> ()
+  | D.Finished _ -> fail "第二次完成了"
+  | D.Suspended -> fail "第二次挂起"
+
 let parent () =
   let dir, path = fresh_path "rev" in
   test_revision path;
@@ -359,6 +436,11 @@ let parent () =
   test_approval path;
   let _, path = fresh_path "par" in
   test_parallel path;
+  let _, path = fresh_path "dom-store" in
+  test_same_process_store path;
+  test_open_failure ();
+  let boom, _ = fresh_path "boom-provider" in
+  test_provider boom;
   let _, path = fresh_path "boom" in
   test_raise path;
   let tail_dir, _ = fresh_path "tail" in

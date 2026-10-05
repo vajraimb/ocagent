@@ -74,14 +74,24 @@ let run ~dir ~run_id ~agent_version ~fetch agent =
                             | Ok (Store.Replay json) -> Deep.continue k (Proto.decode_result e json)
                             | Ok Store.Awaiting_approval -> Deep.discontinue k (Halt (Blocked "不是审批"))
                             | Ok Store.In_flight -> Deep.discontinue k (Halt (Blocked "In_flight"))
-                            | Ok (Store.Execute issued) ->
-                                kill_if dir "after-dispatch";
-                                note dir (Proto.kind e);
-                                let value = exec e fetch in
-                                kill_if dir "after-provider";
-                                (match Store.commit_result path issued (Proto.encode_result e value) with
-                                | Error err -> Deep.discontinue k (Halt (Blocked (Store.describe err)))
-                                | Ok () -> Deep.continue k value))
+                            | Ok (Store.Execute issued) -> (
+                                let outcome =
+                                  try
+                                    kill_if dir "after-dispatch";
+                                    note dir (Proto.kind e);
+                                    let value = exec e fetch in
+                                    kill_if dir "after-provider";
+                                    Ok value
+                                  with
+                                  | Halt stop -> Error stop
+                                  | exn -> Error (Blocked (Printexc.to_string exn))
+                                in
+                                match outcome with
+                                | Error stop -> Deep.discontinue k (Halt stop)
+                                | Ok value -> (
+                                    match Store.commit_result path issued (Proto.encode_result e value) with
+                                    | Error err -> Deep.discontinue k (Halt (Blocked (Store.describe err)))
+                                    | Ok () -> Deep.continue k value)))
                     | Proto.Ask_human _ ->
                         Some
                           (fun k ->
