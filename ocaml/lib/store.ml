@@ -592,7 +592,16 @@ let compare_and_save ~path ~expected_revision ~epoch journal =
 
 let file_bytes path = read_file path
 
-let max_blob = 262144
+let max_text = 262144
+let max_artifact = 16 * 1024 * 1024
+
+type blob_kind =
+  | Text
+  | Artifact
+
+let blob_limit = function
+  | Text -> max_text
+  | Artifact -> max_artifact
 
 type 'a step_run =
   | Stored_completion of { reply : Step_manifest.reply; workspace : string }
@@ -600,8 +609,8 @@ type 'a step_run =
 
 let blob_file path hash = Filename.concat (Filename.concat (Filename.dirname path) "step-blobs") hash
 
-let put_blob path hash bytes =
-  if String.length bytes > max_blob then Error (Protocol "too big")
+let put_blob path hash bytes ~limit =
+  if String.length bytes > limit then Error (Protocol "too big")
   else
     let dir = Filename.dirname (blob_file path hash) in
     if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
@@ -612,24 +621,38 @@ let put_blob path hash bytes =
       write_atomic target bytes;
       Ok ())
 
-let check_blob path hash =
+let check_blob path hash ~limit =
   let target = blob_file path hash in
   if not (Sys.file_exists target) then Error Artifact_missing
-  else if Step_manifest.sha256 (read_file target) <> hash then Error Artifact_corrupt
-  else Ok ()
+  else
+    let size = (Unix.stat target).st_size in
+    if size < 0 || size > limit then Error (Protocol "too big")
+    else
+      let bytes = read_file target in
+      if String.length bytes > limit then Error (Protocol "too big")
+      else if Step_manifest.sha256 bytes <> hash then Error Artifact_corrupt
+      else Ok bytes
+
+let artifact_hashes (m : Step_manifest.t) =
+  m.artifact_hash :: List.map (fun (item : Step_manifest.module_desc) -> item.artifact_hash) m.modules
+
+let hash_limit manifest hash =
+  if List.mem hash (artifact_hashes manifest) then max_artifact else max_text
 
 let check_manifest_blobs path (m : Step_manifest.t) =
   let hashes =
     m.source_hash :: m.sdk_hash :: m.driver_hash :: m.artifact_hash :: m.base_workspace_hash :: m.input_context_hash
     :: m.capability_grant_hash
-    :: List.concat_map (fun (item : Step_manifest.module_desc) -> [ item.source_hash; item.interface_hash; item.artifact_hash ]) m.modules
+    :: List.concat_map
+         (fun (item : Step_manifest.module_desc) -> [ item.source_hash; item.interface_hash; item.artifact_hash ])
+         m.modules
   in
   let rec go = function
     | [] -> Ok ()
     | hash :: rest -> (
-        match check_blob path hash with
+        match check_blob path hash ~limit:(hash_limit m hash) with
         | Error _ as err -> err
-        | Ok () -> go rest)
+        | Ok _ -> go rest)
   in
   go hashes
 
@@ -659,14 +682,22 @@ let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
           ]
           @ module_pairs
         in
+        let rec sized = function
+          | [] -> Ok ()
+          | (hash, bytes) :: rest ->
+              if String.length bytes > hash_limit manifest hash then Error (Protocol "too big") else sized rest
+        in
         let rec write = function
           | [] -> Ok ()
           | (hash, bytes) :: rest -> (
-              match put_blob path hash bytes with
+              match put_blob path hash bytes ~limit:(hash_limit manifest hash) with
               | Error _ as err -> err
               | Ok () -> write rest)
         in
-        match write pairs with
+        match sized pairs with
+        | Error _ as err -> err
+        | Ok () -> (
+            match write pairs with
         | Error _ as err -> err
         | Ok () ->
             with_store path (fun () ->
@@ -696,7 +727,32 @@ let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
                           else if snap.journal.agent_version <> agent_version then Error Version_mismatch
                           else Ok existing.manifest
                       | Some existing when existing.admission_key = admission_key -> Error Admission_conflict
-                      | Some _ -> Error Multiple_steps_unsupported)))
+                      | Some _ -> Error Multiple_steps_unsupported))))
+
+type preflight =
+  | Ready
+  | Stored of { reply : Step_manifest.reply; workspace : string }
+
+let read_blob ~path ~hash ~kind = check_blob path hash ~limit:(blob_limit kind)
+
+let preflight ~path ~execution_hash ~compiler_id ~runtime_id =
+  let path = canonical path in
+  match read_snapshot path with
+  | Error _ as err -> err
+  | Ok snap -> (
+      match snap.step with
+      | None -> Error Version_unavailable
+      | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
+      | Some record when record.state = Step_manifest.Completed -> (
+          match (record.reply, record.final_workspace) with
+          | Some reply, Some workspace -> Ok (Stored { reply; workspace })
+          | _ -> Error (Corrupt_snapshot "completion"))
+      | Some record when record.manifest.compiler_id <> compiler_id || record.manifest.runtime_id <> runtime_id ->
+          Error Version_mismatch
+      | Some record -> (
+          match check_manifest_blobs path record.manifest with
+          | Error _ as err -> err
+          | Ok _ -> Ok Ready))
 
 let claim_step path ~execution_hash =
   with_store path (fun () ->

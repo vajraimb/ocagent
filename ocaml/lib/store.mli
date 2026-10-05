@@ -110,3 +110,20 @@ val approve_step :
   decision_json:Json.t ->
   (unit, error) result
 
+type blob_kind =
+  | Text
+  | Artifact
+
+val read_blob : path:string -> hash:string -> kind:blob_kind -> (string, error) result
+
+type preflight =
+  | Ready
+  | Stored of { reply : Step_manifest.reply; workspace : string }
+
+val preflight :
+  path:string ->
+  execution_hash:string ->
+  compiler_id:string ->
+  runtime_id:string ->
+  (preflight, error) result
+

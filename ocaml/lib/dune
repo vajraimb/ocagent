@@ -1,6 +1,6 @@
 (library
  (name ocagent_harness)
  (public_name ocagent-harness)
- (libraries ocagent-protocol unix))
+ (libraries ocagent-protocol unix compiler-libs.common))
 
 
