@@ -114,5 +114,14 @@ jobs:
                   print(cmd[0], "unreadable", type(exc).__name__, exc)
           PY
       - name: ocaml and dsh-ocaml
-        run: opam exec -- dune runtest --root .
-
+        run: |
+          set -euo pipefail
+          key=kernel.apparmor_restrict_unprivileged_userns
+          original=$(sysctl -n "$key")
+          restore_policy() {
+            sudo sysctl -w "$key=$original"
+          }
+          trap restore_policy EXIT
+          sudo sysctl -w "$key=0"
+          opam exec -- dune build --force --root . @all
+          opam exec -- dune runtest --force --root .
