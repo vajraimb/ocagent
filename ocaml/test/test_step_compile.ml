@@ -15,7 +15,15 @@ let () =
       let oc = open_out path in
       Printf.fprintf oc "%d %d\n" pid pgid;
       close_out oc;
-      if Unix.fork () = 0 then Unix.sleep 30;
+      if Unix.fork () = 0 then (
+        let oc = open_out_gen [ Open_wronly; Open_append ] 0o600 path in
+        Printf.fprintf oc "%d\n" (Unix.getpid ());
+        close_out oc;
+        Unix.sleep 30);
+      exit 0
+  | [ _; "--spam" ] ->
+      output_string stdout (String.make 300000 'x');
+      flush stdout;
       exit 0
   | _ -> ()
 
@@ -34,6 +42,35 @@ let read_all path =
       go ())
 
 let alive pid = Sys.file_exists ("/proc/" ^ string_of_int pid)
+
+let proc_fields text =
+  match String.rindex_opt text ')' with
+  | None -> None
+  | Some index -> (
+      let rest = String.trim (String.sub text (index + 1) (String.length text - index - 1)) in
+      match String.split_on_char ' ' rest with
+      | state :: _ppid :: group :: _ -> Some (state, int_of_string group)
+      | _ -> None)
+
+let running pid =
+  match proc_fields (try read_all ("/proc/" ^ string_of_int pid ^ "/stat") with _ -> "") with
+  | Some ("Z", _) -> false
+  | Some _ -> true
+  | None -> false
+
+let live_group_members pgid =
+  Array.fold_left
+    (fun count name ->
+      match int_of_string_opt name with
+      | None -> count
+      | Some _ -> (
+          try
+            match proc_fields (read_all ("/proc/" ^ name ^ "/stat")) with
+            | Some (state, group) when group = pgid && state <> "Z" -> count + 1
+            | _ -> count
+          with _ -> count))
+    0
+    (Sys.readdir "/proc")
 
 let helper =
   {
@@ -168,8 +205,16 @@ end
   in
   (match C.compile ~source:deep ~modules:[] ~input:[] with
   | Ok _ -> ()
-  | Error (C.Rejected _ | C.Unavailable _) -> ()
   | Error err -> fail "deep %s" (C.describe err));
+  let hang_path = fresh () in
+  let hang_started = Unix.gettimeofday () in
+  (match
+     C.submit_hang ~budget:0.4 ~path:hang_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:step ~modules:[ helper ]
+       ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+   with
+  | Error (C.Rejected "compile timeout") when Unix.gettimeofday () -. hang_started < 2. && not (Sys.file_exists hang_path) -> ()
+  | Ok _ -> fail "hung validator was admitted"
+  | Error err -> fail "hang %s" (C.describe err));
   let step_state events =
     let rec go state count = function
       | [] -> state, count
@@ -190,6 +235,9 @@ end
   if state.C.length <> 3 || state.reaped = None then fail "exit-first dropped output";
   let _, action = C.collector_step { C.reaped = None; eof = false; length = max_int / 2 } (C.Output 262144) in
   (match action with C.Failed "compiler output" -> () | _ -> fail "output limit was accepted");
+  let spam_pid, _, spam = C.command ~timeout:2. [| Sys.argv.(0); "--spam" |] in
+  (match spam with Error (C.Rejected "compiler output") -> () | Ok _ -> fail "spam was accepted" | Error err -> fail "spam %s" (C.describe err));
+  if alive spam_pid then fail "spam process is still running";
   let sleep_started = Unix.gettimeofday () in
   let sleep_pid, sleep_pgid, sleep_result = C.command ~timeout:0.4 [| "/bin/sleep"; "30" |] in
   (match sleep_result with
@@ -202,26 +250,25 @@ end
   (match hold with Ok _ -> fail "grandchild returned" | Error _ -> ());
   if Unix.gettimeofday () -. hold_started > 2. then fail "grandchild held the pipe";
   let hand_text = read_all hand in
-  let child_pid, child_pgid =
-    Scanf.sscanf hand_text "%d %d" (fun pid pgid -> (pid, pgid))
+  let child_pid, child_pgid, grandchild =
+    Scanf.sscanf hand_text "%d %d\n%d" (fun pid pgid grand -> (pid, pgid, grand))
   in
-  if alive child_pid || alive child_pgid then fail "grandchild process group is still running";
+  if alive child_pid || running grandchild || live_group_members child_pgid <> 0 then fail "grandchild process group is still running";
   Unix.unlink hand;
   let fault_path = fresh () in
-  let fault name setup =
+  let fault name setup expect =
     match
       C.submit_fault setup ~path:fault_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:step ~modules:[ helper ]
         ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
     with
-    | Error (C.Unavailable msg) ->
-        if Sys.file_exists fault_path then fail "%s wrote a snapshot" name;
-        if msg = "" then fail "%s had an empty status" name
+    | Error (C.Unavailable msg) when String.starts_with ~prefix:expect msg ->
+        if Sys.file_exists fault_path then fail "%s wrote a snapshot" name
     | Ok _ -> fail "%s executed" name
     | Error err -> fail "%s %s" name (C.describe err)
   in
-  fault "rlimit" C.Rlimit;
-  fault "fd" C.Descriptors;
-  fault "isolation" C.Isolation;
+  fault "rlimit" C.Rlimit "rlimit 13";
+  fault "fd" C.Descriptors "fd 13";
+  fault "isolation" C.Isolation "mount ";
   let tools =
     match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
     | Ok tools -> tools
@@ -243,18 +290,31 @@ end
   ignore (Unix.write accepted (Bytes.of_string "ok") 0 2);
   Unix.close accepted;
   Unix.close client;
-  (match C.probe_isolation tools ~sentinel ~port with
+  let udp = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_DGRAM 0 in
+  Unix.bind udp (Unix.ADDR_INET (Unix.inet_addr_loopback, 0));
+  let udp_port = match Unix.getsockname udp with Unix.ADDR_INET (_, port) -> port | _ -> fail "udp" in
+  let udp_client = Unix.socket ~cloexec:true Unix.PF_INET Unix.SOCK_DGRAM 0 in
+  Unix.connect udp_client (Unix.ADDR_INET (Unix.inet_addr_loopback, udp_port));
+  ignore (Unix.write udp_client (Bytes.of_string "hi") 0 2);
+  Unix.close udp_client;
+  (match C.probe_isolation tools ~sentinel ~tcp_port:port ~udp_port with
   | Ok () -> ()
   | Error err -> fail "isolation %s" (C.describe err));
-  let waiting, _, _ = Unix.select [ listen ] [] [] 0.2 in
-  if waiting <> [] then fail "isolated probe reached the listener";
+  (match C.probe_landlock ~work:(Filename.dirname sentinel) ~snap:(Filename.dirname sentinel) ~sentinel ~tcp_port:port ~udp_port with
+  | Error (C.Unavailable msg) when String.starts_with ~prefix:"landlock" msg || String.starts_with ~prefix:"FAIL landlock" msg -> ()
+  | Ok () -> fail "partial landlock was accepted as the contract"
+  | Error err -> fail "landlock %s" (C.describe err));
   Unix.close listen;
+  Unix.close udp;
   Unix.unlink sentinel;
   let saved_path = Sys.getenv "PATH" in
   let saved_cwd = Sys.getcwd () in
   let prefix = Filename.temp_dir "ocagent-prefix" "" in
   let bindir = Filename.concat prefix "bin" in
+  let libdir = Filename.concat prefix "lib/ocaml" in
   Unix.mkdir bindir 0o700;
+  Unix.mkdir (Filename.concat prefix "lib") 0o700;
+  Unix.mkdir libdir 0o700;
   let find_on path name =
     let rec go = function
       | [] -> fail "missing %s" name
@@ -264,10 +324,29 @@ end
     in
     go (String.split_on_char ':' path)
   in
+  let copy_bytes src dst =
+    let ic = open_in_bin src in
+    let bytes = Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic)) in
+    let oc = open_out_bin dst in
+    Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc bytes);
+    Unix.chmod dst (Unix.stat src).st_perm
+  in
   let real_ocamlc = Unix.realpath (find_on saved_path "ocamlc") in
-  let real_ocamlrun = Unix.realpath (Filename.concat (Filename.dirname real_ocamlc) "ocamlrun") in
-  Unix.symlink real_ocamlc (Filename.concat bindir "ocamlc");
-  Unix.symlink real_ocamlrun (Filename.concat bindir "ocamlrun");
+  let real_root = Filename.dirname (Filename.dirname real_ocamlc) in
+  let real_lib = Filename.concat real_root "lib/ocaml" in
+  copy_bytes real_ocamlc (Filename.concat bindir "ocamlc.real");
+  copy_bytes (Unix.realpath (Filename.concat (Filename.dirname real_ocamlc) "ocamlrun")) (Filename.concat bindir "ocamlrun");
+  Unix.symlink "ocamlc.real" (Filename.concat bindir "ocamlc");
+  Array.iter
+    (fun name ->
+      let src = Filename.concat real_lib name in
+      if Sys.file_exists src && not (Sys.is_directory src) then
+        let skip =
+          Filename.check_suffix name ".o" || Filename.check_suffix name ".a" || Filename.check_suffix name ".cmx"
+          || Filename.check_suffix name ".cmxa" || Filename.check_suffix name ".cmxs"
+        in
+        if not skip then copy_bytes src (Filename.concat libdir name))
+    (Sys.readdir real_lib);
   Sys.chdir prefix;
   Unix.putenv "PATH" "bin";
   let pinned =
@@ -275,13 +354,56 @@ end
     | Ok tools -> tools
     | Error err -> fail "relative toolchain %s" (C.describe err)
   in
-  Unix.unlink (Filename.concat bindir "ocamlc");
-  let oc = open_out (Filename.concat bindir "ocamlc") in
-  output_string oc "not-a-compiler";
-  close_out oc;
+  let junk path =
+    let oc = open_out path in
+    output_string oc "broken";
+    close_out oc
+  in
+  junk (Filename.concat bindir "ocamlc.real");
+  junk (Filename.concat libdir "stdlib.cmi");
+  junk (Filename.concat libdir "stdlib.cma");
   Sys.chdir saved_cwd;
   Unix.putenv "PATH" saved_path;
-  (match C.compile_with ~setup_fault:None ~deadline:(Unix.gettimeofday () +. 20.) pinned ~source:step ~modules:[ helper ] ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ] with
+  let init_source =
+    {|open Step_api
+module Step : STEP = struct
+  let warm = Input.get "material"
+  let run () = Partial "no"
+end
+|}
+  in
+  (match
+     C.compile_with ~setup_fault:None ~hang:false ~deadline:(Unix.gettimeofday () +. 20.) tools ~source:init_source ~modules:[] ~input:[]
+   with
+  | Error (C.Rejected _) -> ()
+  | Ok _ -> fail "compile_with accepted initialization"
+  | Error err -> fail "compile_with init %s" (C.describe err));
+  (match
+     C.compile_with ~setup_fault:None ~hang:false ~deadline:(Unix.gettimeofday () +. 5.) tools ~source:(String.make 262145 'a') ~modules:[]
+       ~input:[]
+   with
+  | Error (C.Rejected "too big") -> ()
+  | Ok _ -> fail "compile_with accepted a huge source"
+  | Error err -> fail "compile_with huge %s" (C.describe err));
+  (match
+     C.compile_with ~setup_fault:None ~hang:false ~deadline:(Unix.gettimeofday () +. 5.) tools ~source:step
+       ~modules:[ { helper with C.name = "Unix" } ]
+       ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+   with
+  | Error (C.Rejected "module name") -> ()
+  | Ok _ -> fail "compile_with accepted a reserved module"
+  | Error err -> fail "compile_with name %s" (C.describe err));
+  (match
+     C.compile_with ~setup_fault:None ~hang:false ~deadline:(Unix.gettimeofday () +. 5.) tools ~source:step ~modules:[ helper; helper ]
+       ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+   with
+  | Error (C.Rejected "duplicate module") -> ()
+  | Ok _ -> fail "compile_with accepted a duplicate module"
+  | Error err -> fail "compile_with duplicate %s" (C.describe err));
+  (match
+     C.compile_with ~setup_fault:None ~hang:false ~deadline:(Unix.gettimeofday () +. 20.) pinned ~source:step ~modules:[ helper ]
+       ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+   with
   | Ok _ -> ()
   | Error err -> fail "snapshot compile %s" (C.describe err));
   C.release pinned;

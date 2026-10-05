@@ -27,6 +27,7 @@
 #define ST_CHROOT 7
 #define ST_CHDIR 8
 #define ST_LANDLOCK 9
+#define ST_SETGROUPS 10
 
 #ifndef __NR_landlock_create_ruleset
 #define __NR_landlock_create_ruleset 444
@@ -74,8 +75,10 @@ value ocagent_limit_compiler(value cpu_seconds, value as_bytes, value file_bytes
   return Val_int(0);
 }
 
-value ocagent_close_extra_fds(value keep) {
-  int keep_fd = Int_val(keep);
+value ocagent_close_extra_fds(value keep_a, value keep_b, value keep_c) {
+  int keep0 = Int_val(keep_a);
+  int keep1 = Int_val(keep_b);
+  int keep2 = Int_val(keep_c);
   DIR *dir = opendir("/proc/self/fd");
   if (dir == NULL) return Val_int(-errno);
   int self = dirfd(dir);
@@ -84,7 +87,7 @@ value ocagent_close_extra_fds(value keep) {
     char *end = NULL;
     long fd = strtol(ent->d_name, &end, 10);
     if (end == ent->d_name || *end != '\0') continue;
-    if (fd > 2 && fd != self && fd != keep_fd) close((int)fd);
+    if (fd > 2 && fd != self && fd != keep0 && fd != keep1 && fd != keep2) close((int)fd);
   }
   closedir(dir);
   return Val_int(0);
@@ -173,18 +176,38 @@ static int bind_at(const char *jail, const char *src, int readonly) {
   return 0;
 }
 
-value ocagent_enter_userns(value v_work, value v_snap) {
-  CAMLparam2(v_work, v_snap);
-  char work[4096], snap[4096], jail[128], map[64];
-  if (copy_path(v_work, work, sizeof work) || copy_path(v_snap, snap, sizeof snap)) CAMLreturn(Val_int(ST_MOUNT * 1000 + ENAMETOOLONG));
+value ocagent_clearenv(value unit) {
+  (void)unit;
+  clearenv();
+  return Val_unit;
+}
+
+value ocagent_unshare_user(value unit) {
+  (void)unit;
+  if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET) != 0) return Val_int(fail_stage(ST_NAMESPACE));
+  return Val_int(0);
+}
+
+value ocagent_write_maps(value v_pid) {
+  int pid = Int_val(v_pid);
+  char path[128], map[64];
   uid_t uid = getuid();
   gid_t gid = getgid();
-  if (unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET) != 0) CAMLreturn(Val_int(fail_stage(ST_NAMESPACE)));
-  if (write_text("/proc/self/setgroups", "deny") != 0) CAMLreturn(Val_int(fail_stage(ST_GID)));
-  snprintf(map, sizeof map, "0 %u 1\n", uid);
-  if (write_text("/proc/self/uid_map", map) != 0) CAMLreturn(Val_int(fail_stage(ST_UID)));
-  snprintf(map, sizeof map, "0 %u 1\n", gid);
-  if (write_text("/proc/self/gid_map", map) != 0) CAMLreturn(Val_int(fail_stage(ST_GID)));
+  snprintf(path, sizeof path, "/proc/%d/setgroups", pid);
+  if (write_text(path, "deny\n") != 0) return Val_int(ST_SETGROUPS * 1000 + errno);
+  snprintf(path, sizeof path, "/proc/%d/uid_map", pid);
+  snprintf(map, sizeof map, "0 %u 1\n", (unsigned)uid);
+  if (write_text(path, map) != 0) return Val_int(ST_UID * 1000 + errno);
+  snprintf(path, sizeof path, "/proc/%d/gid_map", pid);
+  snprintf(map, sizeof map, "0 %u 1\n", (unsigned)gid);
+  if (write_text(path, map) != 0) return Val_int(ST_GID * 1000 + errno);
+  return Val_int(0);
+}
+
+value ocagent_mount_jail(value v_work, value v_snap) {
+  CAMLparam2(v_work, v_snap);
+  char work[4096], snap[4096], jail[128];
+  if (copy_path(v_work, work, sizeof work) || copy_path(v_snap, snap, sizeof snap)) CAMLreturn(Val_int(ST_MOUNT * 1000 + ENAMETOOLONG));
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
   snprintf(jail, sizeof jail, "/tmp/ocagent-jail-%d", getpid());
   if (mkdir(jail, 0700) != 0 && errno != EEXIST) CAMLreturn(Val_int(fail_stage(ST_MOUNT)));
@@ -244,15 +267,15 @@ value ocagent_enter_landlock(value v_work, value v_snap) {
     attr.handled_access_net = LL_NET_BIND_TCP | LL_NET_CONNECT_TCP;
     attr.scoped = LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL;
     ruleset = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof attr, 0);
-  }
-  if (ruleset < 0) {
+    if (ruleset < 0) CAMLreturn(Val_int(fail_stage(ST_LANDLOCK)));
+  } else {
     struct ll_attr4 attr;
     memset(&attr, 0, sizeof attr);
     attr.handled_access_fs = fs;
     attr.handled_access_net = LL_NET_BIND_TCP | LL_NET_CONNECT_TCP;
     ruleset = (int)syscall(__NR_landlock_create_ruleset, &attr, sizeof attr, 0);
+    if (ruleset < 0) CAMLreturn(Val_int(fail_stage(ST_LANDLOCK)));
   }
-  if (ruleset < 0) CAMLreturn(Val_int(fail_stage(ST_LANDLOCK)));
   int snap_fd = open(snap, O_PATH | O_CLOEXEC | O_DIRECTORY);
   int work_fd = open(work, O_PATH | O_CLOEXEC | O_DIRECTORY);
   if (snap_fd < 0 || work_fd < 0) {

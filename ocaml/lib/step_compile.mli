@@ -52,6 +52,7 @@ val release : toolchain -> unit
 
 val compile_with :
   setup_fault:setup_fault option ->
+  hang:bool ->
   deadline:float ->
   toolchain ->
   source:string ->
@@ -101,8 +102,21 @@ val submit_fault :
   input:(string * string) list ->
   (Step_manifest.t, error) result
 
+val submit_hang :
+  budget:float ->
+  path:string ->
+  run_id:string ->
+  agent_version:string ->
+  admission_key:string ->
+  source:string ->
+  modules:module_source list ->
+  input:(string * string) list ->
+  (Step_manifest.t, error) result
+
 val command : timeout:float -> string array -> int * int * (string, error) result
 
-val probe_isolation : toolchain -> sentinel:string -> port:int -> (unit, error) result
+val probe_isolation : toolchain -> sentinel:string -> tcp_port:int -> udp_port:int -> (unit, error) result
+
+val probe_landlock : work:string -> snap:string -> sentinel:string -> tcp_port:int -> udp_port:int -> (unit, error) result
 
 val getpgid : int -> int
