@@ -83,6 +83,18 @@ let write_exact path bytes =
 
 let hash_file path = Step_manifest.sha256 (read_file path)
 
+let read_prefix path limit =
+  let ic = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in ic) (fun () ->
+      let bytes = Bytes.create limit in
+      let count = input ic bytes 0 limit in
+      Bytes.sub_string bytes 0 count)
+
+let compiler_diagnostic message stderr =
+  let detail = String.trim stderr in
+  let detail = if String.length detail > 500 then String.sub detail 0 500 else detail in
+  if detail = "" then message else message ^ ": " ^ detail
+
 let find_root marker =
   let rec up dir =
     if Sys.file_exists (Filename.concat dir marker) then Some dir
@@ -327,8 +339,53 @@ let spawn ~deadline ~env argv =
         Unix.close write_fd;
         match collect_child ~deadline pid read_fd with
         | Ok (text, Unix.WEXITED 0) -> Ok (String.trim text)
-        | Ok _ -> Error (Unavailable "compiler version")
+        | Ok (text, _) -> Error (Unavailable (compiler_diagnostic "toolchain command failed" text))
         | Error _ as err -> err)
+
+(* The trusted ELF loader lists the transitive dependency closure without running
+   the compiler. Keep SONAMEs as destinations, but copy resolved file contents. *)
+let loader_dependencies text =
+  let strip_address text =
+    let text = String.trim text in
+    match String.rindex_opt text '(' with
+    | Some i when i > 0 && text.[i - 1] = ' ' -> String.trim (String.sub text 0 i)
+    | _ -> text
+  in
+  let rec lines acc = function
+    | [] -> Ok (List.sort_uniq compare acc)
+    | line :: rest ->
+        let line = String.trim line in
+        if line = "" || String.starts_with ~prefix:"linux-vdso." line then lines acc rest
+        else
+          let name, path =
+            match String.index_opt line '>' with
+            | Some i when i > 0 && line.[i - 1] = '=' ->
+                ( String.trim (String.sub line 0 (i - 1)),
+                  strip_address (String.sub line (i + 1) (String.length line - i - 1)) )
+            | _ ->
+                let path = strip_address line in
+                Filename.basename path, path
+          in
+          let name = if Filename.is_relative name then name else Filename.basename name in
+          if path = "" || Filename.is_relative path || name = "." || name = ".."
+             || name = "" || Filename.basename name <> name then
+            Error (Unavailable ("unresolved toolchain dependency: " ^ line))
+          else
+            match List.assoc_opt name acc with
+            | Some previous when previous <> path -> Error (Unavailable ("conflicting toolchain dependency: " ^ name))
+            | _ -> lines ((name, path) :: acc) rest
+  in
+  lines [] (String.split_on_char '\n' text)
+
+let resolve_libraries ~deadline loader bins =
+  let rec resolve acc = function
+    | [] -> loader_dependencies (String.concat "\n" (List.rev acc))
+    | bin :: rest -> (
+        match spawn ~deadline ~env:[| "LANG=C" |] [| loader; "--list"; bin |] with
+        | Error _ as err -> err
+        | Ok text -> resolve (text :: acc) rest)
+  in
+  resolve [] bins
 
 let select_toolchain ~deadline =
   if Unix.gettimeofday () >= deadline then Error (Rejected "compile timeout")
@@ -342,9 +399,7 @@ let select_toolchain ~deadline =
         | ocamlc_path, ocamlrun_path ->
             let stdlib_src = Filename.concat (Filename.dirname (Filename.dirname ocamlc_path)) "lib/ocaml" in
             let loader_src = "/lib64/ld-linux-x86-64.so.2" in
-            let libc_src = "/lib/x86_64-linux-gnu/libc.so.6" in
-            let libm_src = "/lib/x86_64-linux-gnu/libm.so.6" in
-            if not (Sys.file_exists (Filename.concat stdlib_src "stdlib.cma") && Sys.file_exists loader_src && Sys.file_exists libc_src) then
+            if not (Sys.file_exists (Filename.concat stdlib_src "stdlib.cma") && Sys.file_exists loader_src) then
               Error (Unavailable "ocaml stdlib")
             else
               let root = Filename.temp_dir "ocagent-tc" "" in
@@ -375,14 +430,16 @@ let select_toolchain ~deadline =
                           | Error _ as err -> err
                           | Ok () -> copies rest)
                     in
+                    match resolve_libraries ~deadline loader_src [ ocamlc_path; ocamlrun_path ] with
+                    | Error _ as err -> err
+                    | Ok libraries ->
                     let files =
                       [
                         (ocamlc_path, Filename.concat bin "ocamlc");
                         (ocamlrun_path, Filename.concat bin "ocamlrun");
                         (loader_src, Filename.concat root "ld-linux");
-                        (libc_src, Filename.concat libdir "libc.so.6");
-                        (libm_src, Filename.concat libdir "libm.so.6");
                       ]
+                      @ List.map (fun (name, src) -> (src, Filename.concat libdir name)) libraries
                       @ List.map (fun name -> (Filename.concat stdlib_src name, Filename.concat stdlib name)) (list_files stdlib_src)
                     in
                     match copies files with
@@ -495,7 +552,7 @@ let finish_status ~marker text status =
       | Error _ as err -> err
       | Ok () -> Error (Unavailable "status"))
   | Unix.WEXITED 125 -> Error (Unavailable "rlimit")
-  | Unix.WEXITED 127 -> Error (Unavailable ("compiler exec " ^ String.trim text))
+  | Unix.WEXITED 127 -> Error (Unavailable ("compiler execution exited 127: " ^ String.trim text))
   | Unix.WEXITED _ -> Error (Rejected (if text = "" then "compiler failed" else text))
   | _ -> Error (Rejected "compiler failed")
 
@@ -553,8 +610,12 @@ let run_userns ~deadline ~work ~snap ~setup_fault ~marker ~stdout ~stderr job =
           | Exec (argv, env) ->
               write_exact marker "exec";
               report_fd status_w "OK\n";
-              Unix.close status_w;
-              Unix.execve argv.(0) argv env
+              (* CLOEXEC closes this pipe on success; preserve it for errno on failure. *)
+              (try Unix.execve argv.(0) argv env with
+              | Unix.Unix_error (err, operation, path) ->
+                  report_fd status_w
+                    (Printf.sprintf "EXEC_ERROR %s %s: %s\n" operation path (Unix.error_message err));
+                  exit 127)
           | Call fn ->
               Unix.dup2 status_w Unix.stdout;
               (try fn () with _ -> report_fd status_w "FAIL validator\n"; exit 2);
@@ -707,6 +768,9 @@ let launch_compile ~deadline ~work ~tools ~setup_fault args =
           let err_len = (Unix.stat stderr_path).st_size in
           if out_len > max_output || err_len > max_output then Error (Rejected "compiler output") else Ok ()
       | Error (Unavailable msg) when userns_setup_failure msg -> !landlock_note ~work ~snap:tools.root msg
+      | Error (Unavailable msg) when String.starts_with ~prefix:"compiler execution exited 127:" msg ->
+          let detail = if Sys.file_exists stderr_path then read_prefix stderr_path 500 else "" in
+          Error (Unavailable (compiler_diagnostic msg detail))
       | Error (Rejected _) as err when Sys.file_exists stderr_path ->
           let message = read_file stderr_path in
           let message = if String.length message > 500 then String.sub message 0 500 else message in

@@ -8,6 +8,29 @@ module M = Step_manifest
 let fail fmt = Printf.ksprintf failwith fmt
 
 let () =
+  let listed =
+    "\tlinux-vdso.so.1 (0x01)\n\
+     \tlibzstd.so.1 => /usr/lib/libzstd.so.1 (0x02)\n\
+     \tlibc.so.6 => /usr/lib/libc.so.6 (0x03)\n\
+     \t/lib64/ld-linux-x86-64.so.2 (0x04)\n\
+     \tlibzstd.so.1 => /usr/lib/libzstd.so.1 (0x05)\n"
+  in
+  (match C.loader_dependencies listed with
+  | Ok paths when List.length paths = 3 && List.assoc "libzstd.so.1" paths = "/usr/lib/libzstd.so.1" -> ()
+  | _ -> fail "dynamic dependencies were not preserved");
+  (match C.loader_dependencies "libmissing.so.1 => not found\n" with
+  | Error (C.Unavailable _) -> ()
+  | _ -> fail "unresolved dependency was accepted");
+  (match C.loader_dependencies "libx.so => /first/libx.so (0x1)\nlibx.so => /second/libx.so (0x2)\n" with
+  | Error (C.Unavailable _) -> ()
+  | _ -> fail "conflicting dependency was accepted");
+  let message = C.compiler_diagnostic "compiler execution exited 127: OK" "libzstd.so.1: cannot open shared object file\n" in
+  if not (String.ends_with ~suffix:"libzstd.so.1: cannot open shared object file" message) then
+    fail "loader stderr was lost";
+  if String.length (C.compiler_diagnostic "exec" (String.make 1000 'x')) <> 506 then
+    fail "compiler diagnostic was not bounded"
+
+let () =
   match Array.to_list Sys.argv with
   | [ _; "--grandchild"; path ] ->
       let pid = Unix.getpid () in

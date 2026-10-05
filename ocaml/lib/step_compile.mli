@@ -7,6 +7,11 @@ type error =
 
 val describe : error -> string
 
+(** Pure dependency/diagnostic helpers, exposed for regression tests. *)
+val loader_dependencies : string -> ((string * string) list, error) result
+
+val compiler_diagnostic : string -> string -> string
+
 type module_source = {
   name : string;
   source : string;
