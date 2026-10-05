@@ -3,6 +3,7 @@
 module S = Ocagent_harness.Store
 module M = Step_manifest
 module Json = Ocagent_harness.Json
+module J = Ocagent_harness.Journal
 
 let fail fmt = Printf.ksprintf failwith fmt
 
@@ -198,4 +199,35 @@ let () =
   | Error err -> fail "late commit %s" (S.describe err));
   if S.file_bytes pending <> closed then fail "late commit wrote the snapshot";
   if S.file_bytes pending = open_bytes then fail "completion did not record the result";
+  let gated = fresh () in
+  let _ = ok (admit gated "let run () = Done \"ok\"\n" "adm") in
+  let gated_bytes = S.file_bytes gated in
+  let gated_epoch = (ok (S.read_snapshot gated)).epoch in
+  let foreign = J.create ~run_id:"run" ~agent_version:"step-v3" in
+  (match S.compare_and_save ~path:gated ~expected_revision:1 ~epoch:9 foreign with
+  | Error S.Manifest_mismatch -> ()
+  | Ok () -> fail "旧入口改写了未完成的 Step"
+  | Error err -> fail "旧入口 %s" (S.describe err));
+  (match
+     S.commit_decision ~path:gated ~run_id:"run" ~agent_version:"step-v3" ~seq:0 ~callback_id:"c"
+       ~expected_request_hash:"h"
+       ~decision_json:(Json.Assoc [ ("tag", Json.String "Approved") ])
+   with
+  | Error S.Manifest_mismatch -> ()
+  | Ok () -> fail "旧审批改写了 Step"
+  | Error err -> fail "旧审批 %s" (S.describe err));
+  if S.file_bytes gated <> gated_bytes || (ok (S.read_snapshot gated)).epoch <> gated_epoch then
+    fail "旧入口改了未完成的快照";
+  let planted = fresh () in
+  let source = "let run () = Done \"ok\"\n" in
+  let dir = Filename.concat (Filename.dirname planted) "step-blobs" in
+  Unix.mkdir dir 0o700;
+  let oc = open_out (Filename.concat dir (M.sha256 source)) in
+  output_string oc "not-the-source";
+  close_out oc;
+  (match admit planted source "adm" with
+  | Error S.Artifact_corrupt -> ()
+  | Ok _ -> fail "坏 blob 被接纳了"
+  | Error err -> fail "坏 blob %s" (S.describe err));
+  if Sys.file_exists planted then fail "坏 blob 仍然写了快照";
   print_endline "step store ok"

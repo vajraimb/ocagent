@@ -155,17 +155,21 @@ let parse_string p =
             | 't' ->
                 Buffer.add_char buf '\t';
                 loop ()
-            | 'u' ->
+            | 'u' -> (
                 if p.i + 4 > String.length p.s then fail "escape"
                 else
                   let hex = String.sub p.s p.i 4 in
                   p.i <- p.i + 4;
-                  (match int_of_string_opt ("0x" ^ hex) with
-                  | Some code when code >= 0 && code < 32 ->
-                      Buffer.add_char buf (Char.chr code);
-                      loop ()
-                  | Some code when code < 128 ->
-                      Buffer.add_char buf (Char.chr code);
+                  match int_of_string_opt ("0x" ^ hex) with
+                  | Some code when code >= 0 && code <= 0x10FFFF && not (code >= 0xD800 && code <= 0xDFFF) ->
+                      if code < 0x80 then Buffer.add_char buf (Char.chr code)
+                      else if code < 0x800 then (
+                        Buffer.add_char buf (Char.chr (0xC0 lor (code lsr 6)));
+                        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+                      else (
+                        Buffer.add_char buf (Char.chr (0xE0 lor (code lsr 12)));
+                        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+                        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))));
                       loop ()
                   | _ -> fail "escape")
             | _ -> fail "escape")

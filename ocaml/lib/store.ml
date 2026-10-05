@@ -527,7 +527,7 @@ let commit_decision ~path ~run_id ~agent_version ~seq ~callback_id ~expected_req
         with_store path (fun () ->
             match read_snapshot path with
             | Error _ as err -> err
-            | Ok snap when completed snap -> Error (Protocol "completed")
+            | Ok snap when snap.step <> None -> Error Manifest_mismatch
             | Ok snap -> (
                 match check_identity snap ~run_id ~agent_version with
                 | Error _ as err -> err
@@ -564,7 +564,7 @@ let compare_and_save ~path ~expected_revision ~epoch journal =
   with_store path (fun () ->
       match read_snapshot path with
       | Error _ as err -> err
-      | Ok snap when completed snap -> Error (Protocol "completed")
+      | Ok snap when snap.step <> None -> Error Manifest_mismatch
       | Ok snap when snap.revision <> expected_revision -> Error Revision_conflict
       | Ok snap ->
           write_snap path { revision = snap.revision + 1; epoch; journal; step = snap.step };
@@ -586,8 +586,11 @@ let put_blob path hash bytes =
     let dir = Filename.dirname (blob_file path hash) in
     if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
     let target = blob_file path hash in
-    if not (Sys.file_exists target) then write_atomic target bytes;
-    Ok ()
+    if Sys.file_exists target then
+      if Step_manifest.sha256 (read_file target) <> hash then Error Artifact_corrupt else Ok ()
+    else (
+      write_atomic target bytes;
+      Ok ())
 
 let check_blob path hash =
   let target = blob_file path hash in
@@ -704,13 +707,10 @@ let with_step_executor ~path ~execution_hash f =
       match snap.step with
       | None -> Error Version_unavailable
       | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
-      | Some record when record.state = Step_manifest.Completed ->
-          Ok
-            (Stored_completion
-               {
-                 reply = Option.value record.reply ~default:"";
-                 workspace = Option.value record.final_workspace ~default:"";
-               })
+      | Some record when record.state = Step_manifest.Completed -> (
+          match (record.reply, record.final_workspace) with
+          | Some reply, Some workspace -> Ok (Stored_completion { reply; workspace })
+          | _ -> Error (Corrupt_snapshot "completion"))
       | Some record ->
           with_locked ~path ~run_id:snap.journal.run_id ~agent_version:snap.journal.agent_version
             ~execution_hash:(Some record.manifest.execution_hash) ~step_id:(Some record.manifest.step_id)
@@ -731,6 +731,9 @@ let complete_step executor ~cursor ~reply ~workspace_hash =
       match read_snapshot executor.path with
       | Error _ as err -> err
       | Ok snap -> (
+          match step_scope snap ~execution_hash:executor.execution_hash ~step_id:executor.step_id with
+          | Error _ as err -> err
+          | Ok _ -> (
           match snap.step with
           | None -> Error Version_unavailable
           | Some _ when executor.epoch <> snap.epoch -> Error Stale_attempt
@@ -744,7 +747,7 @@ let complete_step executor ~cursor ~reply ~workspace_hash =
           | Some record ->
               let step = { record with state = Completed; reply = Some reply; final_workspace = Some workspace_hash } in
               write_snap executor.path { snap with revision = snap.revision + 1; step = Some step };
-              Ok ()))
+              Ok ())))
 
 let approve_step ~path ~execution_hash ~seq ~callback_id ~expected_request_hash ~decision_json =
   if callback_id = "" || String.length callback_id > 128 then Error (Bad_decision "callback")

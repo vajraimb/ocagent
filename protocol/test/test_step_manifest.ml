@@ -118,6 +118,10 @@ let () =
   (match M.parse "\"\\uD800\"" with
   | Error _ -> ()
   | Ok _ -> fail "surrogate escape accepted");
+  (match M.parse "\"\\u4e2d\"" with
+  | Ok (M.String got) when got = "中" -> ()
+  | Ok _ -> fail "unicode escape decoded wrong"
+  | Error e -> fail "unicode escape %s" (M.describe e));
   let binary = bundle "let run () = Done \"ok\"\n" [ { mod_a with artifact = "\xFF\xFE\x00" } ] in
   let binary = { binary with M.artifact = "\xFF\xFE not utf8" } in
   (match M.build ~run_id:"run" ~step_id:"0" ~step_seq:0 binary with
