@@ -116,15 +116,39 @@ module Policy = struct
     | Reconcile -> "Reconcile"
     | Manual_only -> "Manual_only"
 
+  let prefix = "Read_retryable:"
+
+  let number rest =
+    let n = String.length rest in
+    if n = 0 then Error "empty"
+    else
+      let rec digits i =
+        if i = n then Ok ()
+        else
+          let c = rest.[i] in
+          if c < '0' || c > '9' then Error "not a number" else digits (i + 1)
+      in
+      match digits 0 with
+      | Error _ as err -> err
+      | Ok () ->
+          if n > 1 && rest.[0] = '0' then Error "leading zero"
+          else
+            let value = int_of_string rest in
+            if value > 100 then Error "out of range" else Ok value
+
   let of_name s =
     match s with
-    | "Workspace_transactional" -> Workspace_transactional
-    | "Provider_idempotent" -> Provider_idempotent
-    | "Reconcile" -> Reconcile
-    | "Manual_only" -> Manual_only
-    | other when String.starts_with ~prefix:"Read_retryable:" other ->
-        Read_retryable (int_of_string (String.sub other 16 (String.length other - 16)))
-    | other -> failwith ("unknown recovery " ^ other)
+    | "Workspace_transactional" -> Ok Workspace_transactional
+    | "Provider_idempotent" -> Ok Provider_idempotent
+    | "Reconcile" -> Ok Reconcile
+    | "Manual_only" -> Ok Manual_only
+    | other when String.starts_with ~prefix other -> (
+        let rest = String.sub other (String.length prefix) (String.length other - String.length prefix) in
+        match number rest with
+        | Ok n -> Ok (Read_retryable n)
+        | Error msg -> Error msg)
+    | other -> Error ("unknown recovery " ^ other)
 end
+
 
 

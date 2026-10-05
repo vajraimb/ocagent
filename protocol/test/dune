@@ -1,3 +1,8 @@
 (test
  (name test_matrix)
  (libraries ocagent-protocol))
+
+(test
+ (name test_policy)
+ (libraries ocagent-protocol))
+

@@ -25,8 +25,13 @@ let count_lines path =
     !n
 
 let note path name =
-  let oc = open_out_gen [ Open_append; Open_creat ] 0o644 path in
-  Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (name ^ "\n"))
+  let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_APPEND; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o644 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () ->
+      let line = name ^ "\n" in
+      ignore (Unix.write_substring fd line 0 (String.length line));
+      Unix.fsync fd)
 
 let http_get (req : P.fetch_request) =
   let url = req.url in
@@ -40,6 +45,15 @@ let http_get (req : P.fetch_request) =
     ~finally:(fun () -> Unix.close sock)
     (fun () ->
       Unix.connect sock (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+      (match Sys.getenv_opt "OCAGENT_HTTP_LOG" with
+      | None -> ()
+      | Some path ->
+          let local =
+            match Unix.getsockname sock with
+            | Unix.ADDR_INET (_, p) -> string_of_int p
+            | _ -> "?"
+          in
+          note path local);
       let req =
         Printf.sprintf "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" path
       in
@@ -95,9 +109,11 @@ let serve dir =
     | Unix.ADDR_INET (_, port) -> port
     | _ -> fail "没有端口"
   in
-  let oc = open_out (port_path dir) in
+  let port_tmp = port_path dir ^ ".tmp" in
+  let oc = open_out port_tmp in
   output_string oc (string_of_int port);
   close_out oc;
+  Sys.rename port_tmp (port_path dir);
   let body = "spec-body" in
   let resp =
     Printf.sprintf "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
@@ -106,8 +122,9 @@ let serve dir =
   while true do
     let client, _ = Unix.accept sock in
     let tmp = Bytes.create 1024 in
-    let (_ : int) = Unix.read client tmp 0 1024 in
-    note (http_path dir) "hit";
+    let n = Unix.read client tmp 0 1024 in
+    let request = if n > 0 then Bytes.sub_string tmp 0 n else "" in
+    if String.starts_with ~prefix:"GET /spec " request then note (http_path dir) "hit";
     let rec write_all off len =
       if len > 0 then
         let n = Unix.write_substring client resp off len in
@@ -117,81 +134,77 @@ let serve dir =
     Unix.close client
   done
 
+let run_id = "proc"
+let agent_version = "durable-1"
+
+let go dir url = D.run ~dir ~run_id ~agent_version ~fetch:http_get (agent url)
+
 let worker_a dir url =
-  match D.run ~dir ~fetch:http_get (agent url) with
+  match go dir url with
   | D.Suspended -> exit 0
   | D.Finished text -> fail "A 不应完成：%s" text
   | D.Blocked msg -> fail "A 被阻塞：%s" msg
 
-let ask_seq journal =
+let ask_entry journal =
   match
     List.find_opt
       (fun entry -> entry.J.kind = "Ask_human" && entry.status = J.Pending)
       !(journal.J.entries)
   with
-  | Some entry -> entry.seq
+  | Some entry -> entry
   | None -> fail "没有挂起的审批"
 
 let worker_approve dir =
   let path = journal_path dir in
-  let seq = ask_seq (S.load path) in
+  let entry = ask_entry (S.load path) in
   let decision = P.decision_json P.Approved in
-  (match S.commit_decision path seq decision with
+  let approve callback decision_json =
+    S.commit_decision ~path ~run_id ~agent_version ~seq:entry.seq ~callback_id:callback
+      ~expected_request_hash:entry.req_hash ~decision_json
+  in
+  (match approve "cb-proc" decision with
   | Ok () -> ()
-  | Error msg -> fail "审批写入失败：%s" msg);
-  (match S.commit_decision path seq decision with
+  | Error err -> fail "审批写入失败：%s" (S.describe err));
+  (match approve "cb-proc" decision with
   | Ok () -> ()
-  | Error msg -> fail "重复审批应被接受为同一次：%s" msg);
-  (match S.commit_decision path seq (P.decision_json (P.Rejected "no")) with
+  | Error err -> fail "重复审批应被接受为同一次：%s" (S.describe err));
+  (match approve "cb-proc" (P.decision_json (P.Rejected "no")) with
   | Error _ -> ()
   | Ok () -> fail "冲突的审批决定被接受了");
-  (match S.commit_decision path 0 decision with
+  (match approve "other-cb" decision with
+  | Error _ -> ()
+  | Ok () -> fail "另一个 callback 覆盖了审批");
+  (match
+     S.commit_decision ~path ~run_id ~agent_version ~seq:0 ~callback_id:"cb-proc" ~expected_request_hash:"nope"
+       ~decision_json:decision
+   with
   | Error _ -> ()
   | Ok () -> fail "非审批记录被批准了");
-  (match J.nth (S.load path) seq with
-  | Some entry when entry.status = J.Done -> ()
+  (match J.nth (S.load path) entry.seq with
+  | Some kept when kept.status = J.Done -> ()
   | _ -> fail "审批没有落盘");
   exit 0
 
 let worker_b dir url =
-  match D.run ~dir ~fetch:http_get (agent url) with
+  match go dir url with
   | D.Finished "done" -> exit 0
   | D.Finished text -> fail "B 结果 %s" text
   | D.Suspended -> fail "B 仍挂起"
   | D.Blocked msg -> fail "B 被阻塞：%s" msg
 
 let worker_c dir url =
-  match D.run ~dir ~fetch:http_get (agent url) with
+  match go dir url with
   | D.Finished "done" -> exit 0
   | D.Blocked msg -> fail "C 被阻塞：%s" msg
   | D.Suspended -> fail "C 仍挂起"
   | D.Finished text -> fail "C 结果 %s" text
 
 let worker_resume dir url =
-  match D.run ~dir ~fetch:http_get (agent url) with
+  match go dir url with
   | D.Blocked msg when P.contains msg "结果未知" -> exit 0
   | D.Blocked msg -> fail "恢复没有停在未知：%s" msg
   | D.Finished _ -> fail "未知结果被重做并完成了"
   | D.Suspended -> fail "未知结果变成了挂起"
-
-let worker_stale dir =
-  let path = journal_path dir in
-  let journal = S.load path in
-  let entry =
-    match List.find_opt (fun e -> e.J.kind = "Ask_human") !(journal.entries) with
-    | Some entry -> entry
-    | None -> fail "没有审批"
-  in
-  entry.attempt <- 2;
-  entry.status <- J.Pending;
-  S.save path journal;
-  (match S.commit_result path entry.seq ~attempt:1 (Json.String "late") with
-  | Error _ -> ()
-  | Ok () -> fail "旧 attempt 写进了日志");
-  (match J.nth (S.load path) entry.seq with
-  | Some kept when kept.status = J.Pending && kept.result = Json.Null -> ()
-  | _ -> fail "旧 attempt 改动了记录");
-  exit 0
 
 let spawn args =
   let pid =
@@ -207,14 +220,20 @@ let spawn_kill args =
     Unix.create_process Sys.argv.(0) (Array.of_list (Sys.argv.(0) :: args)) Unix.stdin Unix.stdout Unix.stderr
   in
   match Unix.waitpid [] pid with
-  | _, Unix.WSIGNALED _ -> ()
+  | _, Unix.WSIGNALED signal when signal = Sys.sigkill -> ()
   | _, Unix.WEXITED code -> fail "应被 SIGKILL，实际退出 %d" code
+  | _, Unix.WSIGNALED signal -> fail "信号不是 SIGKILL：%d" signal
   | _, _ -> fail "子进程没有被 SIGKILL"
 
 let wait_port dir =
   let rec loop n =
     if n = 0 then fail "HTTP 计数服务没有起来"
-    else if Sys.file_exists (port_path dir) then int_of_string (In_channel.with_open_text (port_path dir) In_channel.input_all)
+    else if Sys.file_exists (port_path dir) then
+      match int_of_string_opt (String.trim (In_channel.with_open_text (port_path dir) In_channel.input_all)) with
+      | Some port -> port
+      | None ->
+          Unix.sleepf 0.05;
+          loop (n - 1)
     else (
       Unix.sleepf 0.05;
       loop (n - 1))
@@ -231,6 +250,7 @@ let effects_of dir name =
 let parent () =
   let dir = Filename.concat (Filename.get_temp_dir_name ()) ("ocagent-proc-" ^ string_of_int (Unix.getpid ())) in
   Unix.mkdir dir 0o755;
+  Unix.putenv "OCAGENT_HTTP_LOG" (Filename.concat dir "client.log");
   let server =
     Unix.create_process Sys.argv.(0) [| Sys.argv.(0); "serve"; dir |] Unix.stdin Unix.stdout Unix.stderr
   in
@@ -244,11 +264,15 @@ let parent () =
       let url = Printf.sprintf "http://127.0.0.1:%d/spec" port in
       spawn [ "a"; dir; url ];
       if effects_of dir "Llm" <> 1 || effects_of dir "Fetch" <> 0 then fail "A 的执行计数不对";
-      spawn [ "stale"; dir ];
       spawn [ "approve"; dir ];
       spawn [ "b"; dir; url ];
-      if count_lines (http_path dir) <> 1 then fail "B 之后 HTTP 计数不是 1";
-      if effects_of dir "Fetch" <> 1 then fail "Fetch 执行计数不是 1";
+      let fetches = count_lines (http_path dir) in
+      let noted = effects_of dir "Fetch" in
+      if fetches <> 1 || noted <> 1 then
+        fail "B 之后 HTTP=%d Fetch笔记=%d client=%s server=%s" fetches noted
+          (let p = Filename.concat dir "client.log" in
+           if Sys.file_exists p then In_channel.with_open_bin p In_channel.input_all else "none")
+          (if Sys.file_exists (http_path dir) then In_channel.with_open_bin (http_path dir) In_channel.input_all else "none");
       let llm_after_b = effects_of dir "Llm" in
       spawn [ "c"; dir; url ];
       if count_lines (http_path dir) <> 1 then fail "C 又请求了 HTTP";
@@ -274,6 +298,23 @@ let parent () =
       Sys.remove barrier;
       spawn [ "resume"; kill_dir; url ];
       if count_lines (http_path dir) <> before + 1 then fail "Unknown 之后又请求了 HTTP";
+      let early = Filename.concat dir "early" in
+      Unix.mkdir early 0o755;
+      spawn [ "a"; early; url ];
+      spawn [ "approve"; early ];
+      let early_barrier = Filename.concat early "barrier" in
+      let oc = open_out early_barrier in
+      output_string oc "after-dispatch";
+      close_out oc;
+      let before_early = count_lines (http_path dir) in
+      spawn_kill [ "b"; early; url ];
+      let after_early = count_lines (http_path dir) in
+      if after_early <> before_early then
+        fail "派发后、调用前被杀仍打了 HTTP %d -> %d effects=%s" before_early after_early
+          (if Sys.file_exists (effect_path early) then In_channel.with_open_bin (effect_path early) In_channel.input_all else "none");
+      Sys.remove early_barrier;
+      spawn [ "resume"; early; url ];
+      if count_lines (http_path dir) <> before_early then fail "未调用的 Manual_only 被重试了";
       let oc = open_out (journal_path kill_dir) in
       output_string oc "OCAGENT 1\nrevision 1\nrecords 0\nchecksum 00000000\n";
       close_out oc;
@@ -291,5 +332,4 @@ let () =
   | _ :: "b" :: dir :: url :: _ -> worker_b dir url
   | _ :: "c" :: dir :: url :: _ -> worker_c dir url
   | _ :: "resume" :: dir :: url :: _ -> worker_resume dir url
-  | _ :: "stale" :: dir :: _ -> worker_stale dir
   | _ -> parent ()

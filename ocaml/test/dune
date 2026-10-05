@@ -24,4 +24,9 @@
  (name test_process_recover)
  (libraries ocagent-harness unix))
 
+(test
+ (name test_store_concurrency)
+ (libraries ocagent-harness unix))
+
+
 

@@ -25,7 +25,8 @@
 `test_process_recover` 跨过进程边界。快照是带版本、校验和的完整文件：临时文件 fsync 之后才改名，锁文件不会被一起换掉。批准只走 `Store.commit_decision`：同一次决定再写一次不改记录，冲突决定和拿 Llm 记录去批准都会被拒绝。旧 attempt 写不进去。进程 B 向本机 HTTP 计数服务发 Fetch，计数在响应发出前落盘。进程 C 重放时 HTTP 和模型计数都不再增加。在 provider 已确认、Done 还没提交时 SIGKILL，下次打开会把这条 `Manual_only` 记成 Unknown，不再请求。这还不是工作台里的可恢复执行，浏览器那条路径仍是 legacy。
 
 
-这些测试没有覆盖多机选举。幂等的 Pending（例如还没写完 Done 的 GET）恢复时仍会再执行一次。
+`Harness.run` 仍是内存演示，没有执行者锁，也不写这套快照。`Durable.run` 才走磁盘：先非阻塞领取执行者，再在 Store 锁里 prepare / commit。外部调用固定是 `Manual_only`。`Read_retryable` 目前只保证编码能往返，不会自动重试。快照是 `OCAGENT 2`，带 epoch；`OCAGENT 1` 直接拒绝，不会补默认权限再执行。浏览器里的工作台还是 legacy。
+
 
 
 ```sh
