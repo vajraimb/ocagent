@@ -7,4 +7,6 @@
  (synopsis "Shared effect and profile catalogue for the two OCAGENT harnesses")
  (depends
   ocaml
-  dune))
+  dune
+  digestif))
+

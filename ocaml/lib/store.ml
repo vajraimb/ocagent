@@ -17,6 +17,13 @@ type error =
   | Bad_decision of string
   | Corrupt_snapshot of string
   | Protocol of string
+  | Manifest_mismatch
+  | Version_unavailable
+  | Artifact_missing
+  | Artifact_corrupt
+  | Admission_conflict
+  | Multiple_steps_unsupported
+  | Unsupported_capability
 
 let describe = function
   | Already_running -> "Already_running"
@@ -31,6 +38,13 @@ let describe = function
   | Bad_decision msg -> "Bad_decision " ^ msg
   | Corrupt_snapshot msg -> "Corrupt_snapshot " ^ msg
   | Protocol msg -> "Protocol " ^ msg
+  | Manifest_mismatch -> "Manifest_mismatch"
+  | Version_unavailable -> "Version_unavailable"
+  | Artifact_missing -> "Artifact_missing"
+  | Artifact_corrupt -> "Artifact_corrupt"
+  | Admission_conflict -> "Admission_conflict"
+  | Multiple_steps_unsupported -> "Multiple_steps_unsupported"
+  | Unsupported_capability -> "Unsupported_capability"
 
 type executor = {
   path : string;
@@ -67,6 +81,7 @@ type snapshot = {
   revision : int;
   epoch : int;
   journal : Journal.t;
+  step : Step_manifest.record option;
 }
 
 let epoch (executor : executor) = executor.epoch
@@ -165,11 +180,19 @@ let write_atomic path text =
   let dirfd = Unix.openfile (Filename.dirname path) [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
   Fun.protect ~finally:(fun () -> Unix.close dirfd) (fun () -> Unix.fsync dirfd)
 
-let render journal ~revision ~epoch =
-  let body = Journal.to_jsonl journal in
-  let records = List.length !(journal.entries) in
-  let sum = checksum body in
-  Printf.sprintf "OCAGENT 2\nrevision %d\nrecords %d\nepoch %d\nchecksum %s\n%s" revision records epoch sum body
+let render snap =
+  let body = Journal.to_jsonl snap.journal in
+  let records = List.length !(snap.journal.entries) in
+  match snap.step with
+  | None ->
+      let sum = checksum body in
+      Printf.sprintf "OCAGENT 2\nrevision %d\nrecords %d\nepoch %d\nchecksum %s\n%s" snap.revision records snap.epoch sum body
+  | Some step ->
+      let raw = Step_manifest.canonical_record step in
+      let payload = raw ^ body in
+      let sum = checksum payload in
+      Printf.sprintf "OCAGENT 3\nrevision %d\nrecords %d\nepoch %d\nstep_bytes %d\nchecksum %s\n%s" snap.revision records snap.epoch
+        (String.length raw) sum payload
 
 let header_line text i =
   try
@@ -182,20 +205,36 @@ let parse text =
   let rev_line, i2 = header_line text i1 in
   let rec_line, i3 = header_line text i2 in
   let epoch_line, i4 = header_line text i3 in
-  let sum_line, i5 = header_line text i4 in
-  if magic <> "OCAGENT 2" then raise (Corrupt "snapshot version");
   let scan fmt line what =
     try Scanf.sscanf line fmt (fun n -> n) with Scanf.Scan_failure _ | End_of_file -> raise (Corrupt what)
   in
   let revision = scan "revision %d" rev_line "revision" in
   let records = scan "records %d" rec_line "records" in
   let epoch = scan "epoch %d" epoch_line "epoch" in
-  let sum = scan "checksum %s" sum_line "checksum" in
-  let body = String.sub text i5 (String.length text - i5) in
-  if checksum body <> sum then raise (Corrupt "checksum mismatch");
-  let journal = try Journal.of_jsonl body with Json.Parse msg -> raise (Corrupt msg) in
-  if List.length !(journal.entries) <> records then raise (Corrupt "record count");
-  { revision; epoch; journal }
+  let finish body step =
+    let journal = try Journal.of_jsonl body with Json.Parse msg -> raise (Corrupt msg) in
+    if List.length !(journal.entries) <> records then raise (Corrupt "record count");
+    { revision; epoch; journal; step }
+  in
+  if magic = "OCAGENT 2" then (
+    let sum_line, i5 = header_line text i4 in
+    let sum = scan "checksum %s" sum_line "checksum" in
+    let body = String.sub text i5 (String.length text - i5) in
+    if checksum body <> sum then raise (Corrupt "checksum mismatch");
+    finish body None)
+  else if magic = "OCAGENT 3" then (
+    let len_line, i5 = header_line text i4 in
+    let sum_line, i6 = header_line text i5 in
+    let step_len = scan "step_bytes %d" len_line "step_bytes" in
+    let sum = scan "checksum %s" sum_line "checksum" in
+    if step_len < 0 || i6 + step_len > String.length text then raise (Corrupt "step");
+    let raw = String.sub text i6 step_len in
+    let body = String.sub text (i6 + step_len) (String.length text - i6 - step_len) in
+    if checksum (raw ^ body) <> sum then raise (Corrupt "checksum mismatch");
+    match Step_manifest.parse_record raw with
+    | Ok step -> finish body (Some step)
+    | Error err -> raise (Corrupt (Step_manifest.describe err)))
+  else raise (Corrupt "snapshot version")
 
 let read_snapshot path =
   match read_file path with
@@ -227,8 +266,7 @@ let with_store path f =
           Unix.lockf fd Unix.F_LOCK 0;
           Fun.protect ~finally:(fun () -> unlock_fd fd) f))
 
-let write_snap path snap =
-  write_atomic path (render snap.journal ~revision:snap.revision ~epoch:snap.epoch)
+let write_snap path snap = write_atomic path (render snap)
 
 let known_recovery recovery =
   recovery = "AwaitingApproval"
@@ -268,11 +306,12 @@ let claim path ~run_id ~agent_version =
   with_store path (fun () ->
       if not (Sys.file_exists path) then (
         let journal = Journal.create ~run_id ~agent_version in
-        write_snap path { revision = 1; epoch = 1; journal };
+        write_snap path { revision = 1; epoch = 1; journal; step = None };
         Ok 1)
       else
         match read_snapshot path with
         | Error _ as err -> err
+        | Ok snap when snap.step <> None -> Error (Protocol "step snapshot")
         | Ok snap -> (
             match check_identity snap ~run_id ~agent_version with
             | Error _ as err -> err
@@ -282,7 +321,7 @@ let claim path ~run_id ~agent_version =
                 write_snap path { snap with revision = snap.revision + 1; epoch };
                 Ok epoch))
 
-let with_executor ~path ~run_id ~agent_version f =
+let with_locked ~path ~run_id ~agent_version claim f =
   let path = canonical path in
   if not (try_acquire path) then Error Already_running
   else
@@ -303,9 +342,12 @@ let with_executor ~path ~run_id ~agent_version f =
               Fun.protect
                 ~finally:(fun () -> unlock_fd fd)
                 (fun () ->
-                  match claim path ~run_id ~agent_version with
+                  match claim path with
                   | Error _ as err -> err
                   | Ok epoch -> f { path; run_id; agent_version; epoch })))
+
+let with_executor ~path ~run_id ~agent_version f =
+  with_locked ~path ~run_id ~agent_version (fun path -> claim path ~run_id ~agent_version) f
 
 let fresh ~run_id seq request ~attempt ~dispatched =
   {
@@ -459,8 +501,215 @@ let compare_and_save ~path ~expected_revision ~epoch journal =
       | Error _ as err -> err
       | Ok snap when snap.revision <> expected_revision -> Error Revision_conflict
       | Ok snap ->
-          write_snap path { revision = snap.revision + 1; epoch; journal };
+          write_snap path { revision = snap.revision + 1; epoch; journal; step = snap.step };
           Ok ())
 
 let file_bytes path = read_file path
+
+let max_blob = 262144
+
+type 'a step_run =
+  | Stored_completion of { reply : string; workspace : string }
+  | Resumed of 'a
+
+let blob_file path hash = Filename.concat (Filename.concat (Filename.dirname path) "step-blobs") hash
+
+let put_blob path hash bytes =
+  if String.length bytes > max_blob then Error (Protocol "too big")
+  else
+    let dir = Filename.dirname (blob_file path hash) in
+    if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
+    let target = blob_file path hash in
+    if not (Sys.file_exists target) then write_atomic target bytes;
+    Ok ()
+
+let check_blob path hash =
+  let target = blob_file path hash in
+  if not (Sys.file_exists target) then Error Artifact_missing
+  else if Step_manifest.sha256 (read_file target) <> hash then Error Artifact_corrupt
+  else Ok ()
+
+let check_manifest_blobs path (m : Step_manifest.t) =
+  let hashes =
+    m.source_hash :: m.sdk_hash :: m.driver_hash :: m.artifact_hash :: m.base_workspace_hash :: m.input_context_hash
+    :: m.capability_grant_hash
+    :: List.concat_map (fun (item : Step_manifest.module_desc) -> [ item.source_hash; item.interface_hash; item.artifact_hash ]) m.modules
+  in
+  let rec go = function
+    | [] -> Ok ()
+    | hash :: rest -> (
+        match check_blob path hash with
+        | Error _ as err -> err
+        | Ok () -> go rest)
+  in
+  go hashes
+
+let admit_step ~path ~run_id ~agent_version ~admission_key bundle =
+  if admission_key = "" then Error (Protocol "admission")
+  else
+    match Step_manifest.build ~run_id ~step_id:"0" ~step_seq:0 bundle with
+    | Error err -> Error (Protocol (Step_manifest.describe err))
+    | Ok manifest -> (
+        let path = canonical path in
+        let module_pairs =
+          List.concat
+            (List.map2
+               (fun (item : Step_manifest.module_desc) (raw : Step_manifest.module_bytes) ->
+                 [ (item.source_hash, raw.source); (item.interface_hash, raw.interface_); (item.artifact_hash, raw.artifact) ])
+               manifest.modules bundle.modules)
+        in
+        let pairs =
+          [
+            (manifest.source_hash, bundle.Step_manifest.source);
+            (manifest.sdk_hash, bundle.sdk);
+            (manifest.driver_hash, bundle.driver);
+            (manifest.artifact_hash, bundle.artifact);
+            (manifest.base_workspace_hash, bundle.base_workspace);
+            (manifest.input_context_hash, bundle.input_context);
+            (manifest.capability_grant_hash, bundle.capability_grant);
+          ]
+          @ module_pairs
+        in
+        let rec write = function
+          | [] -> Ok ()
+          | (hash, bytes) :: rest -> (
+              match put_blob path hash bytes with
+              | Error _ as err -> err
+              | Ok () -> write rest)
+        in
+        match write pairs with
+        | Error _ as err -> err
+        | Ok () ->
+            with_store path (fun () ->
+                if not (Sys.file_exists path) then (
+                  let journal = Journal.create ~run_id ~agent_version in
+                  let step =
+                    {
+                      Step_manifest.admission_key;
+                      manifest;
+                      state = Prepared;
+                      reply = None;
+                      final_workspace = None;
+                      error = None;
+                    }
+                  in
+                  write_snap path { revision = 1; epoch = 0; journal; step = Some step };
+                  Ok manifest)
+                else
+                  match read_snapshot path with
+                  | Error _ as err -> err
+                  | Ok snap -> (
+                      match snap.step with
+                      | None -> Error Version_unavailable
+                      | Some existing
+                        when existing.admission_key = admission_key && existing.manifest.execution_hash = manifest.execution_hash ->
+                          Ok existing.manifest
+                      | Some existing when existing.admission_key = admission_key -> Error Admission_conflict
+                      | Some _ -> Error Multiple_steps_unsupported)))
+
+let claim_step path ~execution_hash =
+  with_store path (fun () ->
+      match read_snapshot path with
+      | Error _ as err -> err
+      | Ok snap -> (
+          match snap.step with
+          | None -> Error Version_unavailable
+          | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
+          | Some record when record.state = Step_manifest.Completed -> Error (Protocol "completed")
+          | Some record when record.state = Step_manifest.Failed || record.state = Step_manifest.Blocked_unknown ->
+              Error Unknown_result
+          | Some record -> (
+              match check_manifest_blobs path record.manifest with
+              | Error _ as err -> err
+              | Ok () ->
+                  let epoch = snap.epoch + 1 in
+                  ignore (classify snap.journal ~epoch);
+                  let step = { record with Step_manifest.state = Running } in
+                  write_snap path { snap with revision = snap.revision + 1; epoch; step = Some step };
+                  Ok epoch)))
+
+let with_step_executor ~path ~execution_hash f =
+  let path = canonical path in
+  match
+    with_store path (fun () -> if not (Sys.file_exists path) then Error (Protocol "no step") else read_snapshot path)
+  with
+  | Error _ as err -> err
+  | Ok snap -> (
+      match snap.step with
+      | None -> Error Version_unavailable
+      | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
+      | Some record when record.state = Step_manifest.Completed ->
+          Ok
+            (Stored_completion
+               {
+                 reply = Option.value record.reply ~default:"";
+                 workspace = Option.value record.final_workspace ~default:"";
+               })
+      | Some _ ->
+          with_locked ~path ~run_id:snap.journal.run_id ~agent_version:snap.journal.agent_version
+            (fun path -> claim_step path ~execution_hash)
+            (fun executor ->
+              match f executor with
+              | Error _ as err -> err
+              | Ok value -> Ok (Resumed value)))
+
+let has_unknown journal =
+  List.exists (fun entry -> entry.Journal.status = Journal.Unknown) !(journal.Journal.entries)
+
+let has_pending_ask journal =
+  List.exists
+    (fun entry -> entry.Journal.kind = "Ask_human" && entry.status = Journal.Pending)
+    !(journal.Journal.entries)
+
+let complete_step executor ~cursor ~reply ~workspace_hash =
+  with_store executor.path (fun () ->
+      match read_snapshot executor.path with
+      | Error _ as err -> err
+      | Ok snap -> (
+          match snap.step with
+          | None -> Error Version_unavailable
+          | Some _ when executor.epoch <> snap.epoch -> Error Stale_attempt
+          | Some record when record.state = Step_manifest.Completed ->
+              if record.reply = Some reply && record.final_workspace = Some workspace_hash then Ok ()
+              else Error Approval_conflict
+          | Some record when record.state <> Step_manifest.Running -> Error (Protocol "state")
+          | Some _ when has_unknown snap.journal -> Error Unknown_result
+          | Some _ when has_pending_ask snap.journal -> Error (Protocol "approval")
+          | Some _ when cursor <> List.length !(snap.journal.entries) -> Error Replay_incomplete
+          | Some record ->
+              let step = { record with state = Completed; reply = Some reply; final_workspace = Some workspace_hash } in
+              write_snap executor.path { snap with revision = snap.revision + 1; step = Some step };
+              Ok ()))
+
+let approve_step ~path ~execution_hash ~seq ~callback_id ~expected_request_hash ~decision_json =
+  if callback_id = "" || String.length callback_id > 128 then Error (Bad_decision "callback")
+  else
+    match decision_ok decision_json with
+    | Error _ as err -> err
+    | Ok () ->
+        with_store path (fun () ->
+            match read_snapshot path with
+            | Error _ as err -> err
+            | Ok snap -> (
+                match snap.step with
+                | None -> Error Version_unavailable
+                | Some record when record.manifest.execution_hash <> execution_hash -> Error Manifest_mismatch
+                | Some _ -> (
+                    match Journal.nth snap.journal seq with
+                    | None -> Error (Protocol "seq")
+                    | Some entry when entry.kind <> "Ask_human" -> Error (Bad_decision "不是审批记录")
+                    | Some entry when entry.req_hash <> expected_request_hash -> Error Request_changed
+                    | Some _ when callback_used snap.journal seq callback_id -> Error Approval_conflict
+                    | Some entry
+                      when entry.status = Journal.Done && entry.callback_id = callback_id && entry.result = decision_json ->
+                        Ok ()
+                    | Some entry when entry.status = Journal.Done -> Error Approval_conflict
+                    | Some entry when entry.status <> Journal.Pending || entry.dispatched -> Error (Bad_decision "不能批准")
+                    | Some entry ->
+                        entry.status <- Journal.Done;
+                        entry.result <- decision_json;
+                        entry.callback_id <- callback_id;
+                        write_snap path { snap with revision = snap.revision + 1 };
+                        Ok ())))
+
 

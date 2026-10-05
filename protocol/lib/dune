@@ -1,3 +1,7 @@
 (library
  (name ocagent_protocol)
- (public_name ocagent-protocol))
+ (public_name ocagent-protocol)
+ (wrapped false)
+ (libraries digestif.ocaml))
+
+

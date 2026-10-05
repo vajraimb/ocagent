@@ -28,5 +28,10 @@
  (name test_store_concurrency)
  (libraries ocagent-harness unix))
 
+(test
+ (name test_step_store)
+ (libraries ocagent-harness unix))
+
+
 
 

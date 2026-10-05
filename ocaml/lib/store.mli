@@ -13,6 +13,13 @@ type error =
   | Bad_decision of string
   | Corrupt_snapshot of string
   | Protocol of string
+  | Manifest_mismatch
+  | Version_unavailable
+  | Artifact_missing
+  | Artifact_corrupt
+  | Admission_conflict
+  | Multiple_steps_unsupported
+  | Unsupported_capability
 
 val describe : error -> string
 
@@ -39,6 +46,7 @@ type snapshot = {
   revision : int;
   epoch : int;
   journal : Journal.t;
+  step : Step_manifest.record option;
 }
 
 val epoch : executor -> int
@@ -72,3 +80,33 @@ val tail_check : executor -> int -> (unit, error) result
 
 val compare_and_save :
   path:string -> expected_revision:int -> epoch:int -> Journal.t -> (unit, error) result
+
+type 'a step_run =
+  | Stored_completion of { reply : string; workspace : string }
+  | Resumed of 'a
+
+val admit_step :
+  path:string ->
+  run_id:string ->
+  agent_version:string ->
+  admission_key:string ->
+  Step_manifest.bundle ->
+  (Step_manifest.t, error) result
+
+val with_step_executor :
+  path:string ->
+  execution_hash:string ->
+  (executor -> ('a, error) result) ->
+  ('a step_run, error) result
+
+val complete_step : executor -> cursor:int -> reply:string -> workspace_hash:string -> (unit, error) result
+
+val approve_step :
+  path:string ->
+  execution_hash:string ->
+  seq:int ->
+  callback_id:string ->
+  expected_request_hash:string ->
+  decision_json:Json.t ->
+  (unit, error) result
+

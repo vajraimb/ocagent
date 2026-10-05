@@ -6,3 +6,8 @@
  (name test_policy)
  (libraries ocagent-protocol))
 
+(test
+ (name test_step_manifest)
+ (libraries ocagent-protocol))
+
+
