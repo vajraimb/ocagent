@@ -1,0 +1,3 @@
+(library
+ (name ocagent_protocol)
+ (public_name ocagent-protocol))

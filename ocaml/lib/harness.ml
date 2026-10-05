@@ -182,7 +182,7 @@ let with_trace ctx f =
         (fun (type a) (e : a Effect.t) ->
           match e with
           | Proto.Llm _ | Proto.Tool _ | Proto.Ask_human _ | Proto.Checkpoint _ | Proto.Compact _
-          | Proto.Now | Proto.Fresh_id ->
+          | Proto.Now | Proto.Fresh_id | Proto.Fetch _ ->
               Some
                 (fun (k : (a, _) Deep.continuation) ->
                   let label = Proto.name e in
@@ -352,7 +352,7 @@ let with_world ctx f =
       effc =
         (fun (type a) (e : a Effect.t) ->
           match e with
-          | Proto.Llm _ | Proto.Tool _ | Proto.Now | Proto.Fresh_id | Proto.Checkpoint _ ->
+          | Proto.Llm _ | Proto.Tool _ | Proto.Now | Proto.Fresh_id | Proto.Checkpoint _ | Proto.Fetch _ ->
               Some
                 (fun (k : (a, _) Deep.continuation) ->
                   let key = !(ctx.current_key) in
@@ -411,6 +411,8 @@ let prepare (type a) ctx (e : a Effect.t) : a prepare =
       if existing.req_hash <> hash then
         raise
           (Proto.Nondeterminism { seq; expected = existing.req_hash; actual = hash; label });
+      if existing.status = Journal.Unknown then
+        raise (Proto.Harness_error (Printf.sprintf "seq %d 结果未知，不重放也不重做" seq));
       if existing.status = Journal.Done then begin
         incr ctx.replay_stamp;
         existing.last_hit <- Journal.Replay;
@@ -485,7 +487,7 @@ let with_journal (type r) ctx
                       else suspend approval entry.seq entry k
                   | Still_pending entry -> suspend approval entry.seq entry k)
           | Proto.Llm _ | Proto.Tool _ | Proto.Checkpoint _ | Proto.Compact _ | Proto.Now
-          | Proto.Fresh_id ->
+          | Proto.Fresh_id | Proto.Fetch _ ->
               Some
                 (fun (k : (a, r) Deep.continuation) ->
                   match prepare ctx e with

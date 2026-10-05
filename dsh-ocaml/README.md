@@ -54,6 +54,9 @@ dune exec ./bin/main.exe sandbox
 dune exec ./bin/main.exe actors
 ```
 
-M1–M3 are the single-fiber handler stack. M4 adds actors.
+M1–M3 是单 fiber 的 handler 栈。M4 加了 actor。
 
-A new `Eio.Fiber` does not inherit effect handlers. `Spawn` and `Supervise` install the same stack again inside the child, then the child blocks on an `Eio.Stream` mailbox (`Send` / `Receive` / `Self`). Restart policy is on the supervisor, not the clock: `One_for_one`, `One_for_all`, `Rest_for_one`, and `max_restarts`. Past the budget the child raises `Restart_limit` and the parent supervisor sees a normal crash. Mailboxes survive a restart, so a message sent before the next `Receive` is kept. Evaluation still gives every attempt its own copy of the scripted model responses, and the trajectory has no timestamps.
+新的 `Eio.Fiber` 不继承 effect handler。`test_drop_handler` 在父 fiber 里装了 `AskApproval`，子 fiber 直接 `perform`，得到的是 Unhandled。`Spawn` 和 `Supervise` 会在子 fiber 里把整套栈再装一次，然后子 fiber 才在 `Eio.Stream` 邮箱上阻塞（`Send` / `Receive` / `Self`）。监督策略在 supervisor 上，不在时钟上：`One_for_one`、`One_for_all`、`Rest_for_one`，以及 `max_restarts`。超过预算后子 fiber 抛 `Restart_limit`，父 supervisor 看到的是一次普通崩溃。邮箱在重启后还在，所以下一次 `Receive` 之前发出的消息会留下。评测里每一次尝试仍有自己的一份脚本化模型回答，轨迹里没有时间戳。
+
+各 profile 的 handler 对照在仓库根的 [`protocol/`](../protocol/)。Evaluation 和 DryRun 的 `Fetch` / `Web_search` 是离线 handler。
+

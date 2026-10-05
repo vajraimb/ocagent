@@ -102,6 +102,11 @@ let interpret (type a) (e : a Effect.t) w ~sandbox ~llm_mode : a =
   | Proto.Checkpoint _ -> ()
   | Proto.Llm req -> mock_llm req llm_mode
   | Proto.Tool call -> run_tool call.name call.args w sandbox
+  | Proto.Fetch req ->
+      if not sandbox then raise (Proto.Harness_error "Fetch 只在沙箱 profile 里执行")
+      else (
+        w.sandbox_execs <- w.sandbox_execs + 1;
+        { Proto.status = 200; body = "fetched " ^ req.url })
   | Proto.Ask_human _ -> raise (Proto.Harness_error "world 不应直接执行 Ask_human")
   | Proto.Compact _ -> raise (Proto.Harness_error "world 不应直接执行 Compact")
   | _ -> raise (Proto.Harness_error "world 不认识这个 effect")

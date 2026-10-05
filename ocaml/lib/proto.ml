@@ -43,6 +43,13 @@ type llm_response = {
   tool : (string * json) option;
 }
 
+type fetch_request = { url : string }
+
+type fetch_reply = {
+  status : int;
+  body : string;
+}
+
 type _ Effect.t +=
   | Llm : llm_request -> llm_response Effect.t
   | Tool : tool_call -> tool_result Effect.t
@@ -51,6 +58,7 @@ type _ Effect.t +=
   | Compact : msg list -> msg list Effect.t
   | Now : float Effect.t
   | Fresh_id : string Effect.t
+  | Fetch : fetch_request -> fetch_reply Effect.t
 
 exception Budget_exceeded of { used : int; max : int }
 exception Nondeterminism of { seq : int; expected : string; actual : string; label : string }
@@ -75,6 +83,7 @@ let name (type a) (e : a Effect.t) =
   | Compact _ -> "Compact"
   | Now -> "Now"
   | Fresh_id -> "Fresh_id"
+  | Fetch r -> "Fetch · " ^ r.url
   | _ -> "unknown"
 
 let kind (type a) (e : a Effect.t) =
@@ -86,6 +95,7 @@ let kind (type a) (e : a Effect.t) =
   | Compact _ -> "Compact"
   | Now -> "Now"
   | Fresh_id -> "Fresh_id"
+  | Fetch _ -> "Fetch"
   | _ -> "unknown"
 
 let msg_json m = Json.Assoc [ ("role", Json.String m.role); ("content", Json.String m.content) ]
@@ -121,6 +131,7 @@ let request_json (type a) (e : a Effect.t) =
   | Compact ms -> Json.Assoc [ ("tag", Json.String "Compact"); ("messages", msgs_json ms) ]
   | Now -> Json.Assoc [ ("tag", Json.String "Now") ]
   | Fresh_id -> Json.Assoc [ ("tag", Json.String "Fresh_id") ]
+  | Fetch r -> Json.Assoc [ ("tag", Json.String "Fetch"); ("url", Json.String r.url) ]
   | _ -> Json.Assoc [ ("tag", Json.String "unknown") ]
 
 let req_hash e = Json.hash (request_json e)
@@ -202,6 +213,7 @@ let encode_result (type a) (e : a Effect.t) (v : a) : json =
       let n = v in
       if Float.trunc n = n then Json.Int (int_of_float n) else Json.Float n
   | Fresh_id -> Json.String v
+  | Fetch _ -> Json.Assoc [ ("status", Json.Int v.status); ("body", Json.String v.body) ]
   | _ -> raise (Harness_error "无法编码未知 effect")
 
 let decode_result (type a) (e : a Effect.t) (json : json) : a =
@@ -216,4 +228,9 @@ let decode_result (type a) (e : a Effect.t) (json : json) : a =
       (match json with
       | Json.String s -> s
       | _ -> raise (Harness_error "id 记录损坏"))
+  | Fetch _ ->
+      {
+        status = Json.int_field "status" json;
+        body = Json.assoc_string "body" json;
+      }
   | _ -> raise (Harness_error "无法解码未知 effect")

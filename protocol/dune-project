@@ -1,0 +1,10 @@
+(lang dune 3.16)
+
+(name ocagent-protocol)
+
+(package
+ (name ocagent-protocol)
+ (synopsis "Shared effect and profile catalogue for the two OCAGENT harnesses")
+ (depends
+  ocaml
+  dune))

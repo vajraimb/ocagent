@@ -13,3 +13,7 @@
 (test
  (name test_net)
  (libraries dsh-ocaml dsh-ocaml.core dsh-ocaml.harness eio_main))
+
+(test
+ (name test_drop_handler)
+ (libraries dsh-ocaml.core eio_main))

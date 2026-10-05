@@ -3,3 +3,16 @@
  (libraries ocagent-harness)
  (deps
   (file %{project_root}/lib/agent.ml)))
+
+(test
+ (name test_drop_handler)
+ (libraries ocagent-harness))
+
+(test
+ (name test_chain)
+ (libraries ocagent-harness))
+
+(test
+ (name test_faults)
+ (libraries ocagent-harness))
+

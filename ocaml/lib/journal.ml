@@ -5,6 +5,7 @@
 type status =
   | Pending
   | Done
+  | Unknown
 
 type hit =
   | Execute
@@ -47,10 +48,12 @@ let copy j =
 let status_json = function
   | Pending -> Json.String "Pending"
   | Done -> Json.String "Done"
+  | Unknown -> Json.String "Unknown"
 
 let status_of = function
   | "Pending" -> Pending
   | "Done" -> Done
+  | "Unknown" -> Unknown
   | other -> raise (Json.Parse ("status " ^ other))
 
 let hit_json = function
@@ -107,19 +110,37 @@ let to_jsonl j =
   String.concat "\n" lines ^ "\n"
 
 let of_jsonl text =
+  if text = "" || (not (String.ends_with ~suffix:"\n" text)) then
+    raise (Json.Parse "journal tail truncated");
   let lines =
     String.split_on_char '\n' text |> List.filter (fun s -> String.trim s <> "")
   in
   match lines with
   | [] -> raise (Json.Parse "empty journal")
   | header :: rest ->
-      let h = Json.parse header in
-      let entries = List.map (fun line -> entry_of_json (Json.parse line)) rest in
+      let h =
+        try Json.parse header with
+        | Json.Parse _ -> raise (Json.Parse "journal tail truncated")
+      in
+      let entries =
+        List.map
+          (fun line ->
+            try entry_of_json (Json.parse line) with
+            | Json.Parse _ -> raise (Json.Parse "journal tail truncated"))
+          rest
+      in
       {
         run_id = Json.string_field "run_id" h;
         agent_version = Json.string_field "agent_version" h;
         entries = ref entries;
       }
+
+let accept_late entry result =
+  match entry.status with
+  | Done when entry.result = result -> Ok ()
+  | Done -> Error "旧 worker 的结果和已记录的不一致"
+  | Unknown -> Error "结果未知，不接受迟到的写入"
+  | Pending -> Error "还是 Pending，不接受旧 worker 的迟到结果"
 
 let slim_line (e : entry) =
   Json.canonical
