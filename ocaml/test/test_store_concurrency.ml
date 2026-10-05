@@ -386,11 +386,10 @@ let test_same_process_store path =
   if ask0.J.callback_id <> "dom-a" || ask1.J.callback_id <> "dom-b" then fail "同进程批准丢了更新"
 
 let test_open_failure () =
-  let path =
-    Filename.concat
-      (Filename.concat (Filename.get_temp_dir_name ()) ("ocagent-missing-" ^ string_of_int (Unix.getpid ())))
-      "snapshot.json"
+  let parent =
+    Filename.concat (Filename.get_temp_dir_name ()) ("ocagent-missing-" ^ string_of_int (Unix.getpid ()))
   in
+  let path = Filename.concat parent "snapshot.json" in
   let once () =
     try
       match S.with_executor ~path ~run_id ~agent_version:version (fun _ -> Ok ()) with
@@ -398,27 +397,82 @@ let test_open_failure () =
       | Error err -> `err err
     with Unix.Unix_error (code, _, _) -> `unix code
   in
-  match (once (), once ()) with
+  (match (once (), once ()) with
   | `unix _, `unix _ -> ()
   | _, `err S.Already_running -> fail "打开失败后执行者登记没释放"
-  | _ -> fail "打开失败的结果不对"
+  | _ -> fail "打开失败的结果不对");
+  Unix.mkdir parent 0o755;
+  match S.with_executor ~path ~run_id ~agent_version:version (fun ex -> Ok (S.epoch ex)) with
+  | Ok epoch when epoch >= 1 -> ()
+  | Ok _ -> fail "补上目录后 epoch 不对"
+  | Error S.Already_running -> fail "补上目录后仍被登记挡住"
+  | Error err -> fail "补上目录后 %s" (S.describe err)
+  | exception Unix.Unix_error (_, fn, _) -> fail "补上目录后仍然打不开 %s" fn
 
 let test_provider dir =
+  let cleaned = ref false in
   let fetch _ = failwith "provider boom" in
   let agent () =
-    let _ = Effect.perform (P.Fetch { url = "http://127.0.0.1/x" }) in
-    "no"
+    Fun.protect
+      ~finally:(fun () -> cleaned := true)
+      (fun () ->
+        let _ = Effect.perform (P.Fetch { url = "http://127.0.0.1/x" }) in
+        "no")
   in
   (match D.run ~dir ~run_id ~agent_version:version ~fetch agent with
   | D.Blocked msg when P.contains msg "provider boom" -> ()
   | D.Blocked msg -> fail "provider 异常 %s" msg
   | D.Finished _ -> fail "provider 异常被当成完成"
   | D.Suspended -> fail "provider 异常变成挂起");
+  if not !cleaned then fail "provider 异常没有跑到 Agent 的 finally";
   match D.run ~dir ~run_id ~agent_version:version ~fetch agent with
   | D.Blocked msg when P.contains msg "Already_running" -> fail "provider 异常后执行者没释放"
   | D.Blocked _ -> ()
   | D.Finished _ -> fail "第二次完成了"
   | D.Suspended -> fail "第二次挂起"
+
+let test_commit_io dir =
+  let snap = Filename.concat dir "snapshot.json" in
+  let kept = snap ^ ".kept" in
+  let calls = ref 0 in
+  let cleaned = ref false in
+  let restore () =
+    let busy = Filename.concat snap "busy" in
+    if Sys.file_exists busy then Sys.remove busy;
+    if Sys.file_exists snap && Sys.is_directory snap then Unix.rmdir snap;
+    if Sys.file_exists kept then Sys.rename kept snap
+  in
+  let fetch _ =
+    incr calls;
+    Sys.rename snap kept;
+    Unix.mkdir snap 0o755;
+    close_out (open_out (Filename.concat snap "busy"));
+    { P.status = 200; body = "x" }
+  in
+  let agent () =
+    Fun.protect
+      ~finally:(fun () -> cleaned := true)
+      (fun () ->
+        let _ = Effect.perform (P.Fetch { url = "http://127.0.0.1/commit-fault" }) in
+        "no")
+  in
+  Fun.protect ~finally:restore (fun () ->
+      match D.run ~dir ~run_id ~agent_version:version ~fetch agent with
+      | D.Blocked _ -> ()
+      | D.Finished _ -> fail "提交失败被当成完成"
+      | D.Suspended -> fail "提交失败变成挂起");
+  if not !cleaned then fail "提交异常没有跑到 Agent 的 finally";
+  restore ();
+  let fetch_again _ =
+    incr calls;
+    { P.status = 200; body = "again" }
+  in
+  match D.run ~dir ~run_id ~agent_version:version ~fetch:fetch_again agent with
+  | D.Blocked msg when P.contains msg "Already_running" -> fail "提交异常后执行者没释放"
+  | D.Blocked msg when P.contains msg "结果未知" -> if !calls <> 1 then fail "未知结果又执行了 Fetch %d" !calls
+  | D.Blocked msg -> fail "提交失败后的恢复 %s" msg
+  | D.Finished _ -> fail "未知结果被重做并完成"
+  | D.Suspended -> fail "未知结果变成挂起"
 
 let parent () =
   let dir, path = fresh_path "rev" in
@@ -441,6 +495,8 @@ let parent () =
   test_open_failure ();
   let boom, _ = fresh_path "boom-provider" in
   test_provider boom;
+  let io_dir, _ = fresh_path "commit-io" in
+  test_commit_io io_dir;
   let _, path = fresh_path "boom" in
   test_raise path;
   let tail_dir, _ = fresh_path "tail" in
