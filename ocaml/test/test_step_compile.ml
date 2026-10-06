@@ -275,15 +275,33 @@ end
   (match C.compile ~source:deep ~modules:[] ~input:[] with
   | Ok _ -> ()
   | Error err -> fail "deep %s" (C.describe err));
+  let hang_input = [ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ] in
+  let tools =
+    match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 30.) with
+    | Ok tools -> tools
+    | Error err -> fail "hang toolchain %s" (C.describe err)
+  in
+  Fun.protect ~finally:(fun () -> C.release tools) (fun () ->
+      let started = Unix.gettimeofday () in
+      let outcome =
+        C.compile_with ~setup_fault:None ~hang:true ~deadline:(started +. 0.4) tools ~source:step ~modules:[ helper ]
+          ~input:hang_input
+      in
+      let elapsed = Unix.gettimeofday () -. started in
+      match outcome with
+      | Ok _ -> fail "hung validator finished in %.3fs" elapsed
+      | Error (C.Rejected "compile timeout") ->
+          if elapsed >= 2. then fail "hang validator ran %.3fs" elapsed
+      | Error err -> fail "hang phase %s after %.3fs" (C.describe err) elapsed);
   let hang_path = fresh () in
-  let hang_started = Unix.gettimeofday () in
   (match
-     C.submit_hang ~budget:0.4 ~path:hang_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:step ~modules:[ helper ]
-       ~input:[ ("material", "spec-body"); ("fetch_url", "http://127.0.0.1/spec") ]
+     C.submit_hang ~budget:0.4 ~path:hang_path ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:step
+       ~modules:[ helper ] ~input:hang_input
    with
-  | Error (C.Rejected "compile timeout") when Unix.gettimeofday () -. hang_started < 2. && not (Sys.file_exists hang_path) -> ()
   | Ok _ -> fail "hung validator was admitted"
-  | Error err -> fail "hang %s" (C.describe err));
+  | Error (C.Rejected "compile timeout") ->
+      if Sys.file_exists hang_path then fail "hang wrote a snapshot"
+  | Error err -> fail "hang result %s" (C.describe err));
   let step_state events =
     let rec go state count = function
       | [] -> state, count
