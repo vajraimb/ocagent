@@ -270,7 +270,8 @@ let template = ref None
 let rec freeze_tree path =
   if Sys.is_directory path then (
     Array.iter (fun name -> freeze_tree (Filename.concat path name)) (Sys.readdir path);
-    Unix.chmod path 0o555)
+    (* Owner write stays so a SIGKILL'd holder is still removable. File bits stay read-only. *)
+    Unix.chmod path 0o755)
   else Unix.chmod path 0o555
 
 let rec link_tree src dst =
