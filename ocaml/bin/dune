@@ -1,3 +1,7 @@
 (executable
  (name demo)
  (libraries ocagent-harness))
+
+(executable
+ (name workbench_gateway)
+ (libraries ocagent-harness unix))

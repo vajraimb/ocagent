@@ -52,7 +52,9 @@
  (name test_step_defenses)
  (libraries ocagent-harness unix))
 
-
-
-
-
+(test
+ (name test_workbench_phase1)
+ (libraries ocagent-harness ocagent-protocol unix)
+ (deps %{bin:workbench_gateway})
+ (action
+  (run %{test} %{bin:workbench_gateway})))
