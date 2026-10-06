@@ -10,16 +10,20 @@ type failure =
   | Raised of exn
 
 let dispatch ~path executor request ~after_prepare ~provider =
-  match Store.prepare_operation executor request with
-  | Error err -> Error (Store err)
-  | Ok (Store.Replay json) -> Ok (Value json)
-  | Ok Store.Awaiting_approval -> Ok Suspended
-  | Ok Store.In_flight -> Error In_flight
-  | Ok (Store.Execute issued) -> (
-      (try after_prepare () with exn -> raise exn);
-      match provider () with
-      | exception exn -> Error (Raised exn)
-      | value -> (
-          match Store.commit_result path issued value with
-          | Error err -> Error (Store err)
-          | Ok () -> Ok (Value value)))
+  match try Ok (Store.prepare_operation executor request) with exn -> Error (Raised exn) with
+  | Error _ as err -> err
+  | Ok (Error err) -> Error (Store err)
+  | Ok (Ok (Store.Replay json)) -> Ok (Value json)
+  | Ok (Ok Store.Awaiting_approval) -> Ok Suspended
+  | Ok (Ok Store.In_flight) -> Error In_flight
+  | Ok (Ok (Store.Execute issued)) -> (
+      match try Ok (after_prepare ()) with exn -> Error (Raised exn) with
+      | Error _ as err -> err
+      | Ok () -> (
+          match provider () with
+          | exception exn -> Error (Raised exn)
+          | value -> (
+              match try Ok (Store.commit_result path issued value) with exn -> Error (Raised exn) with
+              | Error _ as err -> err
+              | Ok (Error err) -> Error (Store err)
+              | Ok (Ok ()) -> Ok (Value value))))

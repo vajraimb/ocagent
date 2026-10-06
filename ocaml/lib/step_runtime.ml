@@ -22,6 +22,18 @@ let barrier path phase =
   if Sys.file_exists file then
     let text = String.trim (In_channel.with_open_bin file In_channel.input_all) in
     if text = phase then Unix.kill (Unix.getpid ()) Sys.sigkill
+    else if text = "pause:" ^ phase then
+      let until = Step_sandbox.monotonic () +. 12. in
+      let rec wait () =
+        if Step_sandbox.monotonic () >= until then ()
+        else
+          let now = try String.trim (In_channel.with_open_bin file In_channel.input_all) with _ -> "" in
+          if now <> "pause:" ^ phase then ()
+          else (
+            Unix.sleepf 0.02;
+            wait ())
+      in
+      wait ()
 
 let note_worker () =
   match Sys.getenv_opt "OCAGENT_WORKER_LOG" with
@@ -37,11 +49,23 @@ let note_worker () =
 
 let note_pid pid =
   match Sys.getenv_opt "OCAGENT_WORKER_PID" with
-  | None -> ()
+  | None | Some "" -> ()
   | Some file ->
       let oc = open_out file in
       output_string oc (string_of_int pid);
       close_out oc
+
+let note_stop line =
+  match Sys.getenv_opt "OCAGENT_STOP_FILE" with
+  | None | Some "" -> ()
+  | Some path ->
+      let fd = Unix.openfile path [ Unix.O_WRONLY; Unix.O_APPEND; Unix.O_CREAT; Unix.O_CLOEXEC ] 0o644 in
+      Fun.protect
+        ~finally:(fun () -> Unix.close fd)
+        (fun () ->
+          let line = line ^ "\n" in
+          ignore (Unix.write_substring fd line 0 (String.length line));
+          Unix.fsync fd)
 
 let fetch_params url =
   Json.Assoc
@@ -71,7 +95,21 @@ let manifest_reply = function
   | Step_ipc.Ask text -> Step_manifest.Ask text
   | Step_ipc.Partial text -> Step_manifest.Partial text
 
-let http_get url =
+let wait_fd sock mode deadline =
+  if Step_sandbox.monotonic () >= deadline then failwith "deadline"
+  else
+    let timeout = max 0. (deadline -. Step_sandbox.monotonic ()) in
+    let read = if mode = `Read then [ sock ] else [] in
+    let write = if mode = `Write then [ sock ] else [] in
+    match Unix.select read write [] timeout with
+    | [], [], _ -> failwith "deadline"
+    | _ -> (
+        match Unix.getsockopt_error sock with
+        | None -> ()
+        | Some err -> raise (Unix.Unix_error (err, "socket", "")))
+
+let http_get ~deadline url =
+  if Step_sandbox.monotonic () >= deadline then failwith "deadline";
   let rest = String.sub url 7 (String.length url - 7) in
   let colon = String.index rest ':' in
   let slash = String.index rest '/' in
@@ -80,26 +118,39 @@ let http_get url =
   if path <> "/spec" then failwith "target"
   else
     let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    Unix.set_nonblock sock;
     Fun.protect
       ~finally:(fun () -> Unix.close sock)
       (fun () ->
-        Unix.connect sock (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
+        (try Unix.connect sock (Unix.ADDR_INET (Unix.inet_addr_loopback, port)) with
+        | Unix.Unix_error ((Unix.EINPROGRESS | Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> wait_fd sock `Write deadline
+        | Unix.Unix_error (Unix.EISCONN, _, _) -> ());
         let req = Printf.sprintf "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" path in
         let rec write_all off len =
           if len > 0 then
-            let n = Unix.write_substring sock req off len in
-            write_all (off + n) (len - n)
+            match Unix.write_substring sock req off len with
+            | exception Unix.Unix_error (Unix.EINTR, _, _) -> write_all off len
+            | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+                wait_fd sock `Write deadline;
+                write_all off len
+            | n -> write_all (off + n) (len - n)
         in
         write_all 0 (String.length req);
         let buf = Buffer.create 128 in
         let tmp = Bytes.create 512 in
         let rec read () =
+          if Buffer.length buf > Step_ipc.max_frame then failwith "response";
           match Unix.read sock tmp 0 512 with
+          | exception Unix.Unix_error (Unix.EINTR, _, _) -> read ()
+          | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+              wait_fd sock `Read deadline;
+              read ()
+          | exception Unix.Unix_error (Unix.ECONNRESET, _, _) -> ()
           | 0 -> ()
           | n ->
               Buffer.add_subbytes buf tmp 0 n;
+              if Buffer.length buf > Step_ipc.max_frame then failwith "response";
               read ()
-          | exception Unix.Unix_error (Unix.ECONNRESET, _, _) -> ()
         in
         read ();
         let raw = Buffer.contents buf in
@@ -149,8 +200,10 @@ let remove_tree root =
   in
   if Sys.file_exists root then walk root
 
-let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art ~binary ~root executor =
-  let attempt_deadline = Unix.gettimeofday () +. float Step_ipc.worker_limits.timeout_s in
+let drive ~deadline ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art ~binary ~root executor =
+  let attempt_deadline = deadline in
+  let now = Step_sandbox.monotonic in
+  let stop_grace = ref 0. in
   let stdout_path = Filename.concat root "stdout" in
   let stderr_path = Filename.concat root "stderr" in
   let argv, env = Step_compile.runtime_argv tools ~bytecode:binary in
@@ -184,9 +237,21 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
   | Ok launch ->
       note_pid launch.worker;
       Fun.protect
-        ~finally:(fun () -> Step_sandbox.release launch)
+        ~finally:(fun () ->
+          let messages, how = Step_sandbox.release ~grace:!stop_grace launch in
+          List.iter note_stop messages;
+          if !stop_grace > 0. then
+            let status =
+              match how with
+              | `Exited code -> "exit " ^ string_of_int code
+              | `Signaled signal -> "signal " ^ string_of_int signal
+              | `Killed -> "killed"
+            in
+            note_stop status)
         (fun () ->
           let ipc = launch.ipc in
+          let write_msg frame = Step_ipc.write_frame ~now ipc frame attempt_deadline in
+          let read_msg () = Step_ipc.read_frame ~now ipc attempt_deadline in
           let session = ref Step_ipc.session_start in
           let traced = ref 0 in
           let cursor = ref 0 in
@@ -204,14 +269,14 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
             logs > Step_ipc.worker_limits.log_bytes
           in
           let fail_closed reason =
-            ignore (Step_ipc.write_frame ipc (Step_ipc.Stop { version = 1; code = reason }) attempt_deadline);
+            ignore (write_msg (Step_ipc.Stop { version = 1; code = reason }));
             give_up reason
           in
           let rec loop () =
-            if Unix.gettimeofday () >= attempt_deadline then fail_closed "timeout"
+            if now () >= attempt_deadline then fail_closed "timeout"
             else if over_log () then fail_closed "log"
             else
-              match Step_ipc.read_frame ipc attempt_deadline with
+              match read_msg () with
               | Error msg -> fail_closed msg
               | Ok frame -> (
                   match Step_ipc.on_worker !session frame with
@@ -253,8 +318,11 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
               | Ok Durable_dispatch.Suspended ->
                   barrier path "after-approval-save";
                   barrier path "before-stop";
-                  ignore (Step_ipc.write_frame ipc (Step_ipc.Stop { version = 1; code = "approval" }) attempt_deadline);
-                  Ok Awaiting_approval
+                  (match write_msg (Step_ipc.Stop { version = 1; code = "approval" }) with
+                  | Ok () ->
+                      stop_grace := min 1. (max 0. (attempt_deadline -. now ()));
+                      Ok Awaiting_approval
+                  | Error _ -> Error (Store.Protocol "stop"))
               | Ok (Durable_dispatch.Value decision) -> (
                   match decision_of decision with
                   | Error err -> Error err
@@ -274,7 +342,7 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
                 }
                 ~after_prepare:(fun () -> barrier path "after-dispatch")
                 ~provider:(fun () ->
-                  let status, body = http_get url in
+                  let status, body = http_get ~deadline:attempt_deadline url in
                   barrier path "after-provider";
                   let json = Json.Assoc [ ("body", Json.String body); ("status", Json.Int status) ] in
                   if String.length (Json.canonical json) > Step_ipc.max_frame then failwith "response";
@@ -294,7 +362,7 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
                 | _ -> fail_closed "codec")
           and reply request_id result =
             barrier path "before-return";
-            match Step_ipc.write_frame ipc (Step_ipc.Return { version = 1; request_id; result }) attempt_deadline with
+            match write_msg (Step_ipc.Return { version = 1; request_id; result }) with
             | Error _ -> Error (Store.Protocol "return")
             | Ok () -> (
                 match Step_ipc.after_return !session request_id with
@@ -304,21 +372,15 @@ let drive ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~tools ~art 
                     loop ())
           and finish reply =
             barrier path "before-complete";
-            match Store.read_snapshot path with
+            match Store.complete_step executor ~cursor:!cursor ~reply:(manifest_reply reply) ~workspace_hash with
             | Error err -> Error err
-            | Ok snap -> (
-                let n = List.length !(snap.journal.entries) in
-                match Store.complete_step executor ~cursor:n ~reply:(manifest_reply reply) ~workspace_hash with
-                | Error err -> Error err
-                | Ok () ->
-                    barrier path "after-complete";
-                    Ok (Completed { reply = manifest_reply reply; workspace = workspace_hash }))
+            | Ok () ->
+                barrier path "after-complete";
+                Ok (Completed { reply = manifest_reply reply; workspace = workspace_hash })
           in
-          match
-            Step_ipc.write_frame ipc
+          match write_msg
               (Step_ipc.Init
                  { version = 1; execution_hash; bound_input = input; limits = Step_ipc.worker_limits })
-              attempt_deadline
           with
           | Error msg -> fail_closed msg
           | Ok () -> loop ())
@@ -337,7 +399,8 @@ let query ~path ~execution_hash =
       | Some _ -> Error (Rejected "not completed")
       | None -> Error (Store Store.Version_unavailable))
 
-let run ~path ~execution_hash ~allowed_url =
+let run_within ~timeout_s ~path ~execution_hash ~allowed_url =
+  Sys.set_signal Sys.sigpipe Sys.Signal_ignore;
   match Store.read_snapshot path with
   | Error err -> Error (Store err)
   | Ok snap -> (
@@ -347,58 +410,63 @@ let run ~path ~execution_hash ~allowed_url =
       | Some record when record.state = Step_manifest.Completed -> stored record
       | Some record when record.manifest.policy_version <> Step_compile.policy_version -> Error (Store Store.Version_unavailable)
       | Some record -> (
-          match Store.preflight ~path ~execution_hash ~compiler_id:record.manifest.compiler_id ~runtime_id:record.manifest.runtime_id with
+          match Store.read_blob ~path ~hash:record.manifest.input_context_hash ~kind:Store.Text with
           | Error err -> Error (Store err)
-          | Ok (Store.Stored { reply; workspace }) -> Ok (Completed { reply; workspace })
-          | Ok Store.Ready -> (
-              match Store.read_blob ~path ~hash:record.manifest.input_context_hash ~kind:Store.Text with
-              | Error err -> Error (Store err)
-              | Ok input_text -> (
-                  match Step_ipc.parse_input input_text with
-                  | Error _ -> Error (Rejected "input")
-                  | Ok input -> (
-                      match
-                        Step_ipc.encode_frame
-                          (Step_ipc.Init
-                             {
-                               version = 1;
-                               execution_hash = record.manifest.execution_hash;
-                               bound_input = input;
-                               limits = Step_ipc.worker_limits;
-                             })
-                      with
-                      | Error _ -> Error (Rejected "init")
-                      | Ok _ -> (
-                          match Step_compile.hold_toolchain ~deadline:(Unix.gettimeofday () +. 25.) with
-                          | Error (Step_compile.Unavailable msg) -> Error (Unavailable msg)
-                          | Error (Step_compile.Rejected msg) -> Error (Rejected msg)
-                          | Error (Step_compile.Store err) -> Error (Store err)
-                          | Ok tools ->
-                              Fun.protect
-                                ~finally:(fun () -> Step_compile.release tools)
-                                (fun () ->
+          | Ok input_text -> (
+              match Step_ipc.parse_input input_text with
+              | Error _ -> Error (Rejected "input")
+              | Ok input -> (
+                  match
+                    Step_ipc.encode_frame
+                      (Step_ipc.Init
+                         {
+                           version = 1;
+                           execution_hash = record.manifest.execution_hash;
+                           bound_input = input;
+                           limits = Step_ipc.worker_limits;
+                         })
+                  with
+                  | Error _ -> Error (Rejected "init")
+                  | Ok _ -> (
+                      match Step_compile.hold_toolchain ~deadline:(Unix.gettimeofday () +. 25.) with
+                      | Error (Step_compile.Unavailable msg) -> Error (Unavailable msg)
+                      | Error (Step_compile.Rejected msg) -> Error (Rejected msg)
+                      | Error (Step_compile.Store err) -> Error (Store err)
+                      | Ok tools ->
+                          Fun.protect
+                            ~finally:(fun () -> Step_compile.release tools)
+                            (fun () ->
+                              let compiler_id, runtime_id = Step_compile.identity tools in
+                              match Store.preflight ~path ~execution_hash ~compiler_id ~runtime_id with
+                              | Error err -> Error (Store err)
+                              | Ok (Store.Stored { reply; workspace }) -> Ok (Completed { reply; workspace })
+                              | Ok Store.Ready -> (
                                   match Store.read_blob ~path ~hash:record.manifest.artifact_hash ~kind:Store.Artifact with
                                   | Error err -> Error (Store err)
                                   | Ok bytecode -> (
+                                      let deadline = Step_sandbox.monotonic () +. float timeout_s in
                                       let root, art, binary = private_artifact bytecode in
                                       Fun.protect
                                         ~finally:(fun () -> remove_tree root)
                                         (fun () ->
                                           match
-                                            Step_sandbox.mount_available ~deadline:(Unix.gettimeofday () +. 10.)
-                                              ~snap:(Step_compile.toolchain_root tools) ~artifact:art
+                                            Step_sandbox.mount_available ~deadline ~snap:(Step_compile.toolchain_root tools)
+                                              ~artifact:art
                                           with
                                           | Error (Step_sandbox.Unavailable msg) -> Error (Unavailable msg)
                                           | Error (Step_sandbox.Rejected msg) -> Error (Rejected msg)
                                           | Ok () -> (
                                               match
                                                 Store.with_step_executor ~path ~execution_hash (fun executor ->
-                                                    drive ~path ~execution_hash ~allowed_url
-                                                      ~workspace_hash:record.manifest.base_workspace_hash ~input ~tools ~art ~binary ~root
-                                                      executor)
+                                                    drive ~deadline ~path ~execution_hash ~allowed_url
+                                                      ~workspace_hash:record.manifest.base_workspace_hash ~input ~tools ~art
+                                                      ~binary ~root executor)
                                               with
                                               | Error err -> Error (Store err)
                                               | Ok (Store.Stored_completion { reply; workspace }) -> Ok (Completed { reply; workspace })
                                               | Ok (Store.Resumed outcome) -> Ok outcome))))))))))
+
+let run ~path ~execution_hash ~allowed_url =
+  run_within ~timeout_s:Step_ipc.worker_limits.timeout_s ~path ~execution_hash ~allowed_url
 
 let approve = Store.approve_step

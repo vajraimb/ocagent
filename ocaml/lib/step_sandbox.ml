@@ -1,7 +1,8 @@
 (** Linux user/mount/net namespace for one saved bytecode image.
     Threads may be created. fork, vfork, clone3, setsid and setpgid are denied,
-    so a descendant cannot leave the worker process group. A supervisor in that
-    group kills it when the coordinator's liveness pipe closes. *)
+    so a descendant cannot leave the worker process group. The supervisor kills
+    that group when the liveness pipe closes or the monotonic attempt deadline
+    passes. Worker-side clocks are not this deadline. *)
 
 let as_bytes = 268435456
 let file_bytes = 1048576
@@ -18,6 +19,8 @@ external clearenv : unit -> unit = "ocagent_clearenv"
 external kill_group : int -> int = "ocagent_kill_group"
 external setpgid : int -> int = "ocagent_setpgid"
 external set_subreaper : unit -> int = "ocagent_set_subreaper"
+external arm_pdeath : unit -> int = "ocagent_arm_pdeath"
+external monotonic : unit -> float = "ocagent_monotonic"
 external worker_probe : string -> string -> string -> int -> string = "ocagent_worker_probe"
 
 type launch = {
@@ -86,11 +89,11 @@ let write_exact path text =
 
 let signal_byte fd ch =
   let bytes = Bytes.make 1 ch in
-  ignore (Unix.write fd bytes 0 1)
+  try ignore (Unix.write fd bytes 0 1) with Unix.Unix_error _ -> ()
 
 let report fd text =
   let bytes = Bytes.of_string text in
-  ignore (Unix.write fd bytes 0 (Bytes.length bytes))
+  try ignore (Unix.write fd bytes 0 (Bytes.length bytes)) with Unix.Unix_error _ -> ()
 
 let kill_pid pid = try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ()
 
@@ -108,6 +111,14 @@ type child_job =
   | Probe of { art : string; sentinel : string; store : string; port : int }
 
 let child_setup ~stdout ~stderr ~ipc ~status_w ~child_to_parent_w ~parent_to_child_r ~snap ~artifact job =
+  let death = arm_pdeath () in
+  if death <> 0 then (
+    report status_w (Printf.sprintf "FAIL pdeath %d\n" (abs death));
+    exit 126);
+  let pg = setpgid 0 in
+  if pg <> 0 then (
+    report status_w (Printf.sprintf "FAIL setpgid %d\n" (abs pg));
+    exit 126);
   let null = Unix.openfile "/dev/null" [ Unix.O_RDONLY ] 0 in
   Unix.dup2 null Unix.stdin;
   Unix.close null;
@@ -116,7 +127,6 @@ let child_setup ~stdout ~stderr ~ipc ~status_w ~child_to_parent_w ~parent_to_chi
   if to_int ipc <> 3 then (
     Unix.dup2 ipc (of_int 3);
     Unix.close ipc);
-  ignore (setpgid 0);
   clearenv ();
   let rc = limit_worker as_bytes file_bytes in
   if rc <> 0 then (report status_w (Printf.sprintf "FAIL rlimit %d\n" (abs rc)); exit 126);
@@ -126,7 +136,8 @@ let child_setup ~stdout ~stderr ~ipc ~status_w ~child_to_parent_w ~parent_to_chi
   let buf = Bytes.create 1 in
   if Unix.read parent_to_child_r buf 0 1 <> 1 || Bytes.get buf 0 <> 'G' then exit 126;
   Unix.close child_to_parent_w;
-  if close_extra_fds (to_int status_w) 3 (to_int parent_to_child_r) <> 0 then (report status_w "FAIL fd\n"; exit 126);
+  let fd_rc = close_extra_fds (to_int status_w) 3 (to_int parent_to_child_r) in
+  if fd_rc <> 0 then (report status_w "FAIL fd\n"; exit 126);
   (try Unix.close parent_to_child_r with Unix.Unix_error _ -> ());
   (match job with
   | Exec { marker; _ } -> (
@@ -143,7 +154,7 @@ let child_setup ~stdout ~stderr ~ipc ~status_w ~child_to_parent_w ~parent_to_chi
   | Probe { art; sentinel; store; port } ->
       let line = worker_probe art sentinel store port in
       let bytes = Bytes.of_string (line ^ "\n") in
-      ignore (Unix.write Unix.stdout bytes 0 (Bytes.length bytes));
+      ignore (try Unix.write Unix.stdout bytes 0 (Bytes.length bytes) with Unix.Unix_error _ -> 0);
       report status_w ("PROBE " ^ line ^ "\n");
       exit 0
   | Exec { argv; env; marker = _ } ->
@@ -153,39 +164,47 @@ let child_setup ~stdout ~stderr ~ipc ~status_w ~child_to_parent_w ~parent_to_chi
           report status_w (Printf.sprintf "EXEC_ERROR %s %s: %s\n" operation path (Unix.error_message err));
           exit 127)
 
-let supervise ~alive_r ~worker =
+let supervise ~deadline ~alive_r ~worker =
   let rec watch () =
-    let readable =
-      match Unix.select [ alive_r ] [] [] 0.2 with
-      | fds, _, _ -> fds <> []
-      | exception Unix.Unix_error (Unix.EINTR, _, _) -> false
-    in
-    if readable then (
+    let remain = deadline -. monotonic () in
+    if remain <= 0. then (
       ignore (kill_group worker);
       kill_pid worker;
       ignore (reap worker);
-      exit 0)
+      exit 124)
     else
-      match Unix.waitpid [ Unix.WNOHANG ] worker with
-      | 0, _ -> watch ()
-      | _, Unix.WEXITED code -> exit code
-      | _, Unix.WSIGNALED signal -> exit (128 + signal)
-      | _, _ -> exit 1
-      | exception Unix.Unix_error (Unix.EINTR, _, _) -> watch ()
-      | exception Unix.Unix_error (Unix.ECHILD, _, _) -> exit 0
+      let readable =
+        match Unix.select [ alive_r ] [] [] (min 0.2 remain) with
+        | fds, _, _ -> fds <> []
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> false
+      in
+      if readable then (
+        ignore (kill_group worker);
+        kill_pid worker;
+        ignore (reap worker);
+        exit 0)
+      else
+        match Unix.waitpid [ Unix.WNOHANG ] worker with
+        | 0, _ -> watch ()
+        | _, Unix.WEXITED code -> exit code
+        | _, Unix.WSIGNALED signal -> exit (128 + signal)
+        | _, _ -> exit 1
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> watch ()
+        | exception Unix.Unix_error (Unix.ECHILD, _, _) -> exit 0
   in
   watch ()
 
 let read_line fd deadline =
+  (try Unix.set_nonblock fd with Unix.Unix_error _ -> ());
   let buf = Buffer.create 32 in
   let tmp = Bytes.create 1 in
   let rec go () =
-    if Unix.gettimeofday () >= deadline then Error "deadline"
+    if monotonic () >= deadline then Error "deadline"
     else
       match Unix.read fd tmp 0 1 with
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> go ()
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> (
-          match Unix.select [ fd ] [] [] (max 0. (deadline -. Unix.gettimeofday ())) with
+          match Unix.select [ fd ] [] [] (max 0. (deadline -. monotonic ())) with
           | [], _, _ -> Error "deadline"
           | _ -> go ())
       | 0 -> if Buffer.length buf = 0 then Error "eof" else Ok (Buffer.contents buf)
@@ -197,7 +216,7 @@ let read_line fd deadline =
   go ()
 
 let spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path job =
-  if Unix.gettimeofday () >= deadline then Error (Rejected "worker timeout")
+  if monotonic () >= deadline then Error (Rejected "worker timeout")
   else
     let ipc_parent, ipc_child = Unix.socketpair ~cloexec:false Unix.PF_UNIX Unix.SOCK_STREAM 0 in
     Unix.set_close_on_exec ipc_parent;
@@ -212,7 +231,10 @@ let spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path job =
           Unix.close alive_w;
           Unix.close info_r;
           Unix.close ipc_parent;
-          ignore (set_subreaper ());
+          let sub = set_subreaper () in
+          if sub <> 0 then (
+            report info_w (Printf.sprintf "FAIL subreaper %d\n" (abs sub));
+            exit 126);
           let status_r, status_w = Unix.pipe ~cloexec:true () in
           let c2p_r, c2p_w = Unix.pipe ~cloexec:true () in
           let p2c_r, p2c_w = Unix.pipe ~cloexec:true () in
@@ -232,36 +254,81 @@ let spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path job =
               Unix.close ipc_child;
               Unix.close stdout;
               Unix.close stderr;
-              ignore (setpgid worker);
-              let note = Bytes.create 1 in
-              let ready =
-                match Unix.read c2p_r note 0 1 with
-                | 1 when Bytes.get note 0 = 'R' -> true
+              (try Unix.set_nonblock alive_r with Unix.Unix_error _ -> ());
+              let parent_dead () =
+                let buf = Bytes.create 8 in
+                match Unix.read alive_r buf 0 8 with
+                | 0 -> true
                 | _ -> false
-                | exception Unix.Unix_error _ -> false
+                | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK | Unix.EINTR), _, _) -> false
+                | exception Unix.Unix_error _ -> true
               in
-              if not ready then (
+              let abandon why =
                 ignore (kill_group worker);
-                report info_w "FAIL sync\n";
-                exit 126);
+                kill_pid worker;
+                report info_w ("FAIL " ^ why ^ "\n");
+                exit 126
+              in
+              let pg = setpgid worker in
+              if pg <> 0 then abandon ("setpgid " ^ string_of_int (abs pg));
+              (match Sys.getenv_opt "OCAGENT_HOLD_SETUP" with
+              | Some text -> (
+                  match float_of_string_opt text with
+                  | Some seconds when seconds > 0. ->
+                      (match Sys.getenv_opt "OCAGENT_WORKER_PID" with
+                      | Some file when file <> "" ->
+                          let oc = open_out file in
+                          output_string oc (string_of_int worker);
+                          close_out oc
+                      | _ -> ());
+                      let until = Unix.gettimeofday () +. seconds in
+                      while Unix.gettimeofday () < until do
+                        if monotonic () >= deadline then abandon "deadline";
+                        if parent_dead () then abandon "parent-dead";
+                        (try ignore (Unix.select [ alive_r ] [] [] (min 0.05 (max 0. (deadline -. monotonic ())))) with Unix.Unix_error _ -> ())
+                      done
+                  | _ -> ())
+              | None -> ());
+              (try Unix.set_nonblock c2p_r with Unix.Unix_error _ -> ());
+              let note = Bytes.create 1 in
+              let rec read_ready () =
+                if monotonic () >= deadline then abandon "deadline"
+                else if parent_dead () then abandon "parent-dead"
+                else
+                  match Unix.read c2p_r note 0 1 with
+                  | 1 when Bytes.get note 0 = 'R' -> true
+                  | 0 | _ -> false
+                  | exception Unix.Unix_error (Unix.EINTR, _, _) -> read_ready ()
+                  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+                      (try ignore (Unix.select [ c2p_r; alive_r ] [] [] (min 0.2 (max 0. (deadline -. monotonic ())))) with Unix.Unix_error _ -> ());
+                      read_ready ()
+                  | exception Unix.Unix_error _ -> false
+              in
+              if not (read_ready ()) then abandon "sync";
               let code = write_maps worker in
               if code <> 0 then (
                 signal_byte p2c_w 'A';
-                ignore (kill_group worker);
-                report info_w ("FAIL " ^ stage_text code ^ "\n");
-                exit 126);
+                abandon (stage_text code));
               signal_byte p2c_w 'G';
               Unix.close p2c_w;
               Unix.close c2p_r;
+              (try Unix.set_nonblock status_r with Unix.Unix_error _ -> ());
               let text = Buffer.create 64 in
               let tmp = Bytes.create 256 in
               let rec drain () =
-                match Unix.read status_r tmp 0 256 with
-                | 0 -> ()
-                | n ->
-                    Buffer.add_subbytes text tmp 0 n;
-                    drain ()
-                | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+                if monotonic () >= deadline then abandon "deadline"
+                else if parent_dead () then abandon "parent-dead"
+                else
+                  match Unix.read status_r tmp 0 256 with
+                  | 0 -> ()
+                  | n ->
+                      Buffer.add_subbytes text tmp 0 n;
+                      drain ()
+                  | exception Unix.Unix_error (Unix.EINTR, _, _) -> drain ()
+                  | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) ->
+                      (try ignore (Unix.select [ status_r; alive_r ] [] [] (min 0.2 (max 0. (deadline -. monotonic ())))) with Unix.Unix_error _ -> ());
+                      drain ()
+                  | exception Unix.Unix_error _ -> ()
               in
               drain ();
               let body = String.trim (Buffer.contents text) in
@@ -270,14 +337,21 @@ let spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path job =
                 exit 0)
               else if body = "OK" then (
                 report info_w (Printf.sprintf "OK %d\n" worker);
-                supervise ~alive_r ~worker)
+                supervise ~deadline ~alive_r ~worker)
               else (
+                let st = reap worker in
+                let how =
+                  match st with
+                  | Unix.WEXITED code -> "exit " ^ string_of_int code
+                  | Unix.WSIGNALED signal -> "signal " ^ string_of_int signal
+                  | Unix.WSTOPPED signal -> "stop " ^ string_of_int signal
+                in
                 ignore (kill_group worker);
-                let line = if body = "" then "FAIL status" else body in
+                let line = if body = "" then "FAIL status " ^ how else body in
                 report info_w (line ^ "\n");
                 exit 126)
         with _ ->
-          report info_w "FAIL supervisor\n";
+          (try report info_w "FAIL supervisor\n" with _ -> ());
           exit 127)
     | supervisor -> (
         Unix.close alive_r;
@@ -315,11 +389,59 @@ let spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path job =
             | Unix.WEXITED 0 when String.starts_with ~prefix:"PROBE " line -> Error (Rejected detail)
             | _ -> Error (Unavailable detail))
 
-let release launch =
+type stop_how =
+  [ `Exited of int
+  | `Signaled of int
+  | `Killed ]
+
+let release ?(grace = 0.) launch =
+  (try Unix.set_nonblock launch.ipc with Unix.Unix_error _ -> ());
+  let traces = ref [] in
+  let take_frame deadline =
+    match Step_ipc.read_frame ~now:monotonic launch.ipc deadline with
+    | Ok (Step_ipc.Trace { message; _ }) ->
+        traces := message :: !traces;
+        true
+    | Ok _ -> true
+    | Error _ -> false
+  in
+  let deadline = monotonic () +. max 0. grace in
+  let forced = ref false in
+  let rec poll () =
+    match Unix.waitpid [ Unix.WNOHANG ] launch.supervisor with
+    | 0, _ when monotonic () >= deadline -> None
+    | 0, _ ->
+        let remain = max 0. (deadline -. monotonic ()) in
+        (match Unix.select [ launch.ipc ] [] [] (min 0.05 remain) with
+        | fds, _, _ when fds <> [] -> ignore (take_frame deadline)
+        | _ -> ()
+        | exception Unix.Unix_error (Unix.EINTR, _, _) -> ());
+        poll ()
+    | _, status -> Some status
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> poll ()
+    | exception Unix.Unix_error (Unix.ECHILD, _, _) -> Some (Unix.WEXITED 0)
+  in
+  let status =
+    match poll () with
+    | Some status -> status
+    | None ->
+        forced := true;
+        (try Unix.close launch.alive with Unix.Unix_error _ -> ());
+        reap launch.supervisor
+  in
+  let rec drain () = if take_frame (monotonic () +. 0.05) then drain () in
+  drain ();
   (try Unix.close launch.alive with Unix.Unix_error _ -> ());
   (try Unix.close launch.ipc with Unix.Unix_error _ -> ());
-  let _ = reap launch.supervisor in
-  (try Unix.rmdir (Printf.sprintf "/tmp/ocagent-wjail-%d" launch.worker) with Unix.Unix_error _ -> ())
+  (try Unix.rmdir (Printf.sprintf "/tmp/ocagent-wjail-%d" launch.worker) with Unix.Unix_error _ -> ());
+  let how =
+    if !forced then `Killed
+    else
+      match status with
+      | Unix.WEXITED code -> `Exited code
+      | Unix.WSIGNALED signal | Unix.WSTOPPED signal -> `Signaled signal
+  in
+  (List.rev !traces, how)
 
 let probe ~deadline ~snap ~artifact ~art ~sentinel ~store ~port ~stdout_path ~stderr_path =
   match spawn ~deadline ~snap ~artifact ~stdout_path ~stderr_path (Probe { art; sentinel; store; port }) with
@@ -328,7 +450,7 @@ let probe ~deadline ~snap ~artifact ~art ~sentinel ~store ~port ~stdout_path ~st
       Ok line
   | Error (Unavailable _) as err -> err
   | Ok launch ->
-      release launch;
+      ignore (release launch);
       Error (Unavailable "probe stayed up")
 
 let mount_available ~deadline ~snap ~artifact =

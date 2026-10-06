@@ -25,6 +25,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <setjmp.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ST_NAMESPACE 3
@@ -391,17 +393,43 @@ value ocagent_setpgid(value pid) {
   return Val_int(0);
 }
 
+value ocagent_monotonic(value unit) {
+  CAMLparam1(unit);
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) caml_failwith("monotonic");
+  CAMLreturn(caml_copy_double((double)ts.tv_sec + (double)ts.tv_nsec / 1e9));
+}
+
 value ocagent_set_subreaper(value unit) {
   (void)unit;
   if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) return Val_int(-errno);
   return Val_int(0);
 }
 
-static int seccomp_install(void) {
-  /* Deny escapes and prctl (it can clear PDEATHSIG). clone is allowed only
-     with CLONE_THREAD so the OCaml runtime can start threads but not forks.
-     Jump targets: deny is index 18, allow-all is 14, clone allow is 19. */
-  struct sock_filter filter[] = {
+value ocagent_arm_pdeath(value unit) {
+  (void)unit;
+  if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0, 0) != 0) return Val_int(-errno);
+  if (getppid() == 1) return Val_int(-ECHILD);
+  return Val_int(0);
+}
+
+/* x32 is the 64-bit ISA with 32-bit pointers: same EM, little-endian, no 64BIT bit.
+   It is not in every UAPI header, but seccomp sees this arch value. */
+#ifndef AUDIT_ARCH_X86_X32
+#define AUDIT_ARCH_X86_X32 (EM_X86_64 | __AUDIT_ARCH_LE)
+#endif
+
+#define SECCOMP_FILTER_MAX 24
+
+static int seccomp_filter_fill(struct sock_filter *filter) {
+  /* Only the native x86-64 ABI reaches the allow rules. i386 and x32 are
+     rejected with EPERM, so a compatibility fork cannot skip the native deny.
+     clone is allowed only with CLONE_THREAD. prctl is denied so PDEATHSIG
+     cannot be cleared. Bad arch is index 2. Deny is index 21. */
+  struct sock_filter tmp[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsid, 16, 0),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setpgid, 15, 0),
@@ -423,7 +451,75 @@ static int seccomp_install(void) {
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
-  struct sock_fprog prog = { .len = (unsigned short)(sizeof filter / sizeof filter[0]), .filter = filter };
+  memcpy(filter, tmp, sizeof tmp);
+  return (int)(sizeof tmp / sizeof tmp[0]);
+}
+
+static uint32_t seccomp_eval(const struct sock_filter *filter, int len, const struct seccomp_data *data) {
+  uint32_t acc = 0;
+  int pc = 0;
+  while (pc >= 0 && pc < len) {
+    struct sock_filter insn = filter[pc];
+    if (insn.code == (BPF_LD | BPF_W | BPF_ABS)) {
+      if (insn.k > sizeof *data - 4) return SECCOMP_RET_KILL_THREAD;
+      memcpy(&acc, (const char *)data + insn.k, 4);
+      pc++;
+    } else if (insn.code == (BPF_JMP | BPF_JEQ | BPF_K)) {
+      pc += 1 + (acc == insn.k ? insn.jt : insn.jf);
+    } else if (insn.code == (BPF_ALU | BPF_AND | BPF_K)) {
+      acc &= insn.k;
+      pc++;
+    } else if (insn.code == (BPF_RET | BPF_K)) {
+      return insn.k;
+    } else {
+      return SECCOMP_RET_KILL_THREAD;
+    }
+  }
+  return SECCOMP_RET_KILL_THREAD;
+}
+
+static int seccomp_errno_of(uint32_t decision) {
+  if ((decision & SECCOMP_RET_ACTION_FULL) != SECCOMP_RET_ERRNO) return -1;
+  return (int)(decision & SECCOMP_RET_DATA);
+}
+
+/* The installed program, not a second policy. i386 and x32 numbers must be
+   EPERM. Native process, session, and namespace calls must be EPERM. A native
+   read, and clone with CLONE_THREAD, must be allowed. */
+static int seccomp_policy_holds(void) {
+  struct sock_filter filter[SECCOMP_FILTER_MAX];
+  int len = seccomp_filter_fill(filter);
+  struct seccomp_data data;
+  memset(&data, 0, sizeof data);
+  data.arch = AUDIT_ARCH_I386;
+  data.nr = 2;
+  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  data.arch = AUDIT_ARCH_X86_X32;
+  data.nr = 2;
+  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  data.nr = __NR_fork;
+  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  data.arch = AUDIT_ARCH_X86_64;
+  int denied[] = { __NR_fork, __NR_vfork, __NR_clone3, __NR_setsid, __NR_setpgid, __NR_prctl, __NR_unshare, __NR_mount };
+  for (unsigned i = 0; i < sizeof denied / sizeof denied[0]; i++) {
+    data.nr = denied[i];
+    data.args[0] = 0;
+    if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  }
+  data.nr = __NR_read;
+  if (seccomp_eval(filter, len, &data) != SECCOMP_RET_ALLOW) return 0;
+  data.nr = __NR_clone;
+  data.args[0] = 0;
+  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  data.args[0] = 0x00010000ULL;
+  if (seccomp_eval(filter, len, &data) != SECCOMP_RET_ALLOW) return 0;
+  return 1;
+}
+
+static int seccomp_install(void) {
+  struct sock_filter filter[SECCOMP_FILTER_MAX];
+  int len = seccomp_filter_fill(filter);
+  struct sock_fprog prog = { .len = (unsigned short)len, .filter = filter };
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return -1;
   if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) return -1;
   return 0;
@@ -437,13 +533,24 @@ value ocagent_confine_worker(value unit) {
   return Val_int(0);
 }
 
+static volatile sig_atomic_t compat_sig;
+static sigjmp_buf compat_jmp;
+
+static void compat_fault(int sig) {
+  compat_sig = sig;
+  siglongjmp(compat_jmp, 1);
+}
+
 value ocagent_worker_probe(value v_art, value v_sentinel, value v_store, value v_port) {
   CAMLparam4(v_art, v_sentinel, v_store, v_port);
   char art[4096], sentinel[4096], store[4096];
   int port = Int_val(v_port);
   if (copy_path(v_art, art, sizeof art) || copy_path(v_sentinel, sentinel, sizeof sentinel) || copy_path(v_store, store, sizeof store))
     caml_failwith("probe path");
-  int setsid_err = 0, setpgid_err = 0, fork_err = 0, mount_err = 0, prctl_err = 0, tcp = 0, stat_ok = 0, store_ok = 0, tmp_ok = 0, ro_ok = 0;
+  int setsid_err = 0, setpgid_err = 0, fork_err = 0, vfork_err = 0, clone3_err = 0, unshare_err = 0;
+  int compat_err = 0, compat_entered = 0, mount_err = 0, prctl_err = 0;
+  int tcp = 0, stat_ok = 0, store_ok = 0, tmp_ok = 0, ro_ok = 0;
+  int policy = seccomp_policy_holds();
   if (setsid() < 0) setsid_err = errno;
   if (setpgid(0, 0) < 0) setpgid_err = errno;
   if (prctl(PR_SET_PDEATHSIG, 0, 0, 0, 0) != 0) prctl_err = errno;
@@ -454,6 +561,62 @@ value ocagent_worker_probe(value v_art, value v_sentinel, value v_store, value v
     int st = 0;
     waitpid(child, &st, 0);
   }
+  long vfork_ret = syscall(__NR_vfork);
+  if (vfork_ret < 0) vfork_err = errno;
+  else if (vfork_ret == 0) _exit(0);
+  else {
+    int st = 0;
+    waitpid((pid_t)vfork_ret, &st, 0);
+  }
+  long clone3_ret = syscall(__NR_clone3, NULL, (size_t)0);
+  if (clone3_ret < 0) clone3_err = errno;
+  else if (clone3_ret == 0) _exit(0);
+  else {
+    int st = 0;
+    waitpid((pid_t)clone3_ret, &st, 0);
+  }
+  if (syscall(__NR_unshare, CLONE_NEWNS) != 0) unshare_err = errno;
+#if defined(__x86_64__)
+  {
+    /* A kernel without CONFIG_IA32_EMULATION raises SIGSEGV on int $0x80
+       before seccomp. That is not a filter denial: leave compat_entered=0.
+       A kernel that enters the compat syscall must return EPERM, never a pid. */
+    struct sigaction saved_segv, saved_sys, action;
+    compat_sig = 0;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = compat_fault;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, &saved_segv);
+    sigaction(SIGSYS, &action, &saved_sys);
+    if (sigsetjmp(compat_jmp, 1) == 0) {
+      long cret;
+      asm volatile("movl $2, %%eax\n\t"
+                   "int $0x80\n\t"
+                   : "=a"(cret)
+                   :
+                   : "ebx", "ecx", "edx", "esi", "edi", "memory", "cc");
+      compat_entered = 1;
+      if (cret < 0) compat_err = (int)(-cret);
+      else if (cret == 0) _exit(0);
+      else {
+        int st = 0;
+        waitpid((pid_t)cret, &st, 0);
+        compat_err = 0;
+      }
+    } else if (compat_sig == SIGSEGV) {
+      compat_entered = 0;
+      compat_err = 0;
+    } else {
+      compat_entered = 1;
+      compat_err = 0;
+    }
+    sigaction(SIGSEGV, &saved_segv, NULL);
+    sigaction(SIGSYS, &saved_sys, NULL);
+  }
+#else
+  compat_entered = 0;
+  compat_err = ENOSYS;
+#endif
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) mount_err = errno;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd >= 0) {
@@ -478,8 +641,10 @@ value ocagent_worker_probe(value v_art, value v_sentinel, value v_store, value v
     ro_ok = 1;
     close(rw);
   }
-  char line[256];
-  snprintf(line, sizeof line, "setsid=%d setpgid=%d fork=%d mount=%d prctl=%d tcp=%d stat=%d store=%d tmp=%d ro=%d", setsid_err, setpgid_err, fork_err, mount_err, prctl_err, tcp, stat_ok, store_ok, tmp_ok, ro_ok);
+  char line[512];
+  snprintf(line, sizeof line,
+           "setsid=%d setpgid=%d fork=%d vfork=%d clone3=%d unshare=%d compat=%d entered=%d policy=%d mount=%d prctl=%d tcp=%d stat=%d store=%d tmp=%d ro=%d",
+           setsid_err, setpgid_err, fork_err, vfork_err, clone3_err, unshare_err, compat_err, compat_entered, policy, mount_err, prctl_err, tcp, stat_ok, store_ok, tmp_ok, ro_ok);
   CAMLreturn(caml_copy_string(line));
 }
 

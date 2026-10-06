@@ -55,6 +55,8 @@ val policy_version : string
 
 val toolchain_root : toolchain -> string
 
+val identity : toolchain -> string * string
+
 val runtime_argv : toolchain -> bytecode:string -> string array * string array
 
 val hold_toolchain : deadline:float -> (toolchain, error) result
@@ -93,6 +95,9 @@ val compile_fault_after :
   modules:module_source list ->
   input:(string * string) list ->
   (validated_artifact, error) result
+
+val forge :
+  ?compiler_id:string -> ?runtime_id:string -> ?bytecode:string -> validated_artifact -> validated_artifact
 
 val admit :
   path:string ->

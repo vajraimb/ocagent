@@ -38,7 +38,7 @@
 
 (test
  (name test_step_ipc)
- (libraries ocagent-harness))
+ (libraries ocagent-harness unix))
 
 (test
  (name test_step_isolation)
@@ -46,6 +46,10 @@
 
 (test
  (name test_step_worker_recover)
+ (libraries ocagent-harness unix))
+
+(test
+ (name test_step_defenses)
  (libraries ocagent-harness unix))
 
 

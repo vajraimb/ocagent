@@ -477,7 +477,19 @@ let prepare_operation executor request =
                     Error Request_changed
                 | Some existing when existing.status = Journal.Unknown -> Error Unknown_result
                 | Some existing when existing.status = Journal.Done -> Ok (Replay existing.result)
-                | Some existing when existing.kind = "Ask_human" && (not existing.dispatched) -> Ok Awaiting_approval
+                | Some existing when existing.kind = "Ask_human" && (not existing.dispatched) ->
+                    (match snap.step with
+                    | Some record
+                      when record.Step_manifest.state = Step_manifest.Running
+                           || record.state = Step_manifest.Prepared ->
+                        write_snap executor.path
+                          {
+                            snap with
+                            revision = snap.revision + 1;
+                            step = Some { record with state = Step_manifest.Awaiting_approval };
+                          }
+                    | _ -> ());
+                    Ok Awaiting_approval
                 | Some existing when existing.dispatched -> Ok In_flight
                 | Some _ -> Error (Protocol "status")
                 | None ->

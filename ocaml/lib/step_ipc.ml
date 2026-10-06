@@ -437,15 +437,16 @@ let decode_frame text =
   | Error _ as e -> e
   | Ok json -> frame_of json
 
-let read_full fd buf off len deadline =
+let read_full ?(now = Unix.gettimeofday) fd buf off len deadline =
+  (try Unix.set_nonblock fd with Unix.Unix_error _ -> ());
   let rec go off len =
     if len = 0 then Ok ()
-    else if Unix.gettimeofday () >= deadline then Error "deadline"
+    else if now () >= deadline then Error "deadline"
     else
       match Unix.read fd buf off len with
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off len
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> (
-          match Unix.select [ fd ] [] [] (max 0. (deadline -. Unix.gettimeofday ())) with
+          match Unix.select [ fd ] [] [] (max 0. (deadline -. now ())) with
           | [], _, _ -> Error "deadline"
           | _ -> go off len)
       | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET | Unix.EBADF | Unix.ECONNABORTED), _, _) -> Error "eof"
@@ -454,15 +455,16 @@ let read_full fd buf off len deadline =
   in
   go off len
 
-let write_full fd buf off len deadline =
+let write_full ?(now = Unix.gettimeofday) fd buf off len deadline =
+  (try Unix.set_nonblock fd with Unix.Unix_error _ -> ());
   let rec go off len =
     if len = 0 then Ok ()
-    else if Unix.gettimeofday () >= deadline then Error "deadline"
+    else if now () >= deadline then Error "deadline"
     else
       match Unix.write fd buf off len with
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> go off len
       | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> (
-          match Unix.select [] [ fd ] [] (max 0. (deadline -. Unix.gettimeofday ())) with
+          match Unix.select [] [ fd ] [] (max 0. (deadline -. now ())) with
           | _, [], _ -> Error "deadline"
           | _ -> go off len)
       | exception Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET | Unix.EBADF | Unix.ECONNABORTED), _, _) -> Error "eof"
@@ -471,9 +473,9 @@ let write_full fd buf off len deadline =
   in
   go off len
 
-let read_frame fd deadline =
+let read_frame ?(now = Unix.gettimeofday) fd deadline =
   let lenb = Bytes.create 4 in
-  match read_full fd lenb 0 4 deadline with
+  match read_full ~now fd lenb 0 4 deadline with
   | Error _ as e -> e
   | Ok () ->
       let len =
@@ -485,11 +487,11 @@ let read_frame fd deadline =
       if len <= 0 || len > max_frame then Error "frame"
       else
         let body = Bytes.create len in
-        match read_full fd body 0 len deadline with
+        match read_full ~now fd body 0 len deadline with
         | Error _ as e -> e
         | Ok () -> decode_frame (Bytes.to_string body)
 
-let write_frame fd frame deadline =
+let write_frame ?(now = Unix.gettimeofday) fd frame deadline =
   match encode_frame frame with
   | Error _ as e -> e
   | Ok text ->
@@ -500,7 +502,7 @@ let write_frame fd frame deadline =
       Bytes.set buf 2 (Char.chr ((len lsr 8) land 255));
       Bytes.set buf 3 (Char.chr (len land 255));
       Bytes.blit_string text 0 buf 4 len;
-      write_full fd buf 0 (Bytes.length buf) deadline
+      write_full ~now fd buf 0 (Bytes.length buf) deadline
 
 let parse_input text =
   match parse text with

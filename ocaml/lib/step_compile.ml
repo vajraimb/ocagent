@@ -111,6 +111,7 @@ let sdk_dir () =
 
 let rec remove_tree dir =
   if Sys.file_exists dir then (
+    (try Unix.chmod dir 0o700 with Unix.Unix_error _ -> ());
     let entries = Sys.readdir dir in
     Array.iter
       (fun name ->
@@ -266,6 +267,12 @@ type toolchain = {
 
 let template = ref None
 
+let rec freeze_tree path =
+  if Sys.is_directory path then (
+    Array.iter (fun name -> freeze_tree (Filename.concat path name)) (Sys.readdir path);
+    Unix.chmod path 0o555)
+  else Unix.chmod path 0o555
+
 let rec link_tree src dst =
   Unix.mkdir dst 0o700;
   Array.iter
@@ -280,27 +287,56 @@ let retarget from target path =
     target ^ String.sub path (String.length from) (String.length path - String.length from)
   else path
 
+let manifest_hash root =
+  let rec walk rel =
+    let dir = if rel = "" then root else Filename.concat root rel in
+    let names = Array.to_list (Sys.readdir dir) |> List.sort String.compare in
+    List.concat_map
+      (fun name ->
+        let child = if rel = "" then name else Filename.concat rel name in
+        let path = Filename.concat root child in
+        if Sys.is_directory path then walk child else [ child ])
+      names
+  in
+  let lines = List.map (fun rel -> rel ^ " " ^ hash_file (Filename.concat root rel)) (walk "") in
+  Step_manifest.sha256 (String.concat "\n" lines ^ "\n")
+
+let rewrite_manifest_hash id hash =
+  match String.split_on_char ' ' id with
+  | [ kind; version; marker; _ ] when marker = "manifest" -> Printf.sprintf "%s %s manifest %s" kind version hash
+  | _ -> id
+
+let refresh_identity tools =
+  let hash = manifest_hash tools.root in
+  { tools with compiler_id = rewrite_manifest_hash tools.compiler_id hash; runtime_id = rewrite_manifest_hash tools.runtime_id hash }
+
 let clone_tools tools =
   let root = Filename.temp_dir "ocagent-tc" "" in
   Unix.rmdir root;
   link_tree tools.root root;
   let swap = retarget tools.root root in
-  {
-    tools with
-    root;
-    loader = swap tools.loader;
-    libdir = swap tools.libdir;
-    ocamlc = swap tools.ocamlc;
-    ocamlrun = swap tools.ocamlrun;
-    env = Array.map (fun item ->
-      match String.index_opt item '=' with
-      | None -> item
-      | Some i ->
-          let key = String.sub item 0 i in
-          let value = String.sub item (i + 1) (String.length item - i - 1) in
-          key ^ "=" ^ swap value)
-      tools.env;
-  }
+  let cloned =
+    {
+      tools with
+      root;
+      loader = swap tools.loader;
+      libdir = swap tools.libdir;
+      ocamlc = swap tools.ocamlc;
+      ocamlrun = swap tools.ocamlrun;
+      env =
+        Array.map
+          (fun item ->
+            match String.index_opt item '=' with
+            | None -> item
+            | Some i ->
+                let key = String.sub item 0 i in
+                let value = String.sub item (i + 1) (String.length item - i - 1) in
+                key ^ "=" ^ swap value)
+          tools.env;
+    }
+  in
+  freeze_tree cloned.root;
+  refresh_identity cloned
 
 let publish tools =
   match !template with
@@ -356,20 +392,6 @@ let list_files dir =
          let path = Filename.concat dir name in
          (not (Sys.is_directory path)) && not (skip name))
   |> List.sort String.compare
-
-let manifest_hash root =
-  let rec walk rel =
-    let dir = if rel = "" then root else Filename.concat root rel in
-    let names = Array.to_list (Sys.readdir dir) |> List.sort String.compare in
-    List.concat_map
-      (fun name ->
-        let child = if rel = "" then name else Filename.concat rel name in
-        let path = Filename.concat root child in
-        if Sys.is_directory path then walk child else [ child ])
-      names
-  in
-  let lines = List.map (fun rel -> rel ^ " " ^ hash_file (Filename.concat root rel)) (walk "") in
-  Step_manifest.sha256 (String.concat "\n" lines ^ "\n")
 
 let loader_argv tools bin args = Array.of_list (tools.loader :: "--library-path" :: tools.libdir :: bin :: args)
 
@@ -559,6 +581,7 @@ let select_toolchain ~deadline =
                                       | Ok compiler_version, Ok runtime_version
                                         when toolchain_acceptable ~compiler:compiler_version ~runtime:runtime_version ->
                                           kept := true;
+                                          freeze_tree root;
                                           Ok
                                             (publish
                                                {
@@ -765,6 +788,8 @@ let policy_text =
 let policy_version = policy_text
 
 let toolchain_root tools = tools.root
+
+let identity tools = (tools.compiler_id, tools.runtime_id)
 
 let runtime_argv tools ~bytecode =
   let stdlib = Filename.concat tools.root "stdlib" in
@@ -1011,6 +1036,18 @@ let compile_fault_after n setup_fault ~deadline tools ~source ~modules ~input =
   fault_skip := n;
   Fun.protect ~finally:(fun () -> fault_skip := 0) (fun () ->
       compile_with ~setup_fault:(Some setup_fault) ~hang:false ~deadline tools ~source ~modules ~input)
+
+let forge ?compiler_id ?runtime_id ?bytecode artifact =
+  let bundle = artifact.bundle in
+  {
+    bundle =
+      {
+        bundle with
+        Step_manifest.compiler_id = (match compiler_id with Some id -> id | None -> bundle.compiler_id);
+        Step_manifest.runtime_id = (match runtime_id with Some id -> id | None -> bundle.runtime_id);
+        Step_manifest.artifact = (match bytecode with Some bytes -> bytes | None -> bundle.artifact);
+      };
+  }
 
 let admit ~path ~run_id ~agent_version ~admission_key artifact =
   match Step_manifest.build ~run_id ~step_id:"0" ~step_seq:0 artifact.bundle with

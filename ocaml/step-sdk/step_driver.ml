@@ -20,7 +20,7 @@ let die msg =
 
 let () =
   ignore policy;
-  (try Unix.clear_nonblock ipc with Unix.Unix_error (err, _, _) -> die (Unix.error_message err));
+  (try Unix.set_nonblock ipc with Unix.Unix_error (err, _, _) -> die (Unix.error_message err));
   let deadline = Unix.gettimeofday () +. 20. in
   match Step_ipc.read_frame ipc deadline with
   | Error msg -> die msg
@@ -62,16 +62,22 @@ let () =
         | Step_bridge.Net_get url -> Some (fun k -> on_net k url)
         | _ -> None
       in
-      let reply = Deep.try_with (fun () -> Step.Step.run ()) () { effc } in
-      if !stop then die "stopped";
-      let reply =
-        match reply with
-        | Step_api.Continue text -> Step_ipc.Continue text
-        | Step_api.Done text -> Step_ipc.Done text
-        | Step_api.Ask text -> Step_ipc.Ask text
-        | Step_api.Partial text -> Step_ipc.Partial text
-      in
-      match Step_ipc.write_frame ipc (Step_ipc.Finished { version = 1; reply }) deadline with
-      | Ok () -> exit 0
-      | Error _ -> die "finished")
+      match
+        try Ok (Deep.try_with (fun () -> Step.Step.run ()) () { effc }) with
+        | Exit -> Error "stopped"
+        | exn -> Error (Printexc.to_string exn)
+      with
+      | Error msg -> die msg
+      | Ok _ when !stop -> die "stopped"
+      | Ok reply ->
+          let reply =
+            match reply with
+            | Step_api.Continue text -> Step_ipc.Continue text
+            | Step_api.Done text -> Step_ipc.Done text
+            | Step_api.Ask text -> Step_ipc.Ask text
+            | Step_api.Partial text -> Step_ipc.Partial text
+          in
+          match Step_ipc.write_frame ipc (Step_ipc.Finished { version = 1; reply }) deadline with
+          | Ok () -> exit 0
+          | Error _ -> die "finished")
   | Ok _ -> die "handshake"
