@@ -413,24 +413,25 @@ value ocagent_arm_pdeath(value unit) {
   return Val_int(0);
 }
 
-/* x32 is the 64-bit ISA with 32-bit pointers: same EM, little-endian, no 64BIT bit.
-   It is not in every UAPI header, but seccomp sees this arch value. */
-#ifndef AUDIT_ARCH_X86_X32
-#define AUDIT_ARCH_X86_X32 (EM_X86_64 | __AUDIT_ARCH_LE)
+/* x32 shares AUDIT_ARCH_X86_64; bit 30 in nr identifies its syscall space. */
+#ifndef __X32_SYSCALL_BIT
+#define __X32_SYSCALL_BIT 0x40000000
 #endif
 
-#define SECCOMP_FILTER_MAX 24
+#define SECCOMP_FILTER_MAX 26
 
 static int seccomp_filter_fill(struct sock_filter *filter) {
   /* Only the native x86-64 ABI reaches the allow rules. i386 and x32 are
      rejected with EPERM, so a compatibility fork cannot skip the native deny.
      clone is allowed only with CLONE_THREAD. prctl is denied so PDEATHSIG
-     cannot be cleared. Bad arch is index 2. Deny is index 21. */
+     cannot be cleared. Reject x32 before comparing native syscall numbers. */
   struct sock_filter tmp[] = {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, __X32_SYSCALL_BIT, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setsid, 16, 0),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setpgid, 15, 0),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setns, 14, 0),
@@ -466,6 +467,8 @@ static uint32_t seccomp_eval(const struct sock_filter *filter, int len, const st
       pc++;
     } else if (insn.code == (BPF_JMP | BPF_JEQ | BPF_K)) {
       pc += 1 + (acc == insn.k ? insn.jt : insn.jf);
+    } else if (insn.code == (BPF_JMP | BPF_JSET | BPF_K)) {
+      pc += 1 + ((acc & insn.k) ? insn.jt : insn.jf);
     } else if (insn.code == (BPF_ALU | BPF_AND | BPF_K)) {
       acc &= insn.k;
       pc++;
@@ -494,12 +497,15 @@ static int seccomp_policy_holds(void) {
   data.arch = AUDIT_ARCH_I386;
   data.nr = 2;
   if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
-  data.arch = AUDIT_ARCH_X86_X32;
-  data.nr = 2;
-  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
-  data.nr = __NR_fork;
-  if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
   data.arch = AUDIT_ARCH_X86_64;
+  int x32[] = { __NR_read, __NR_fork, __NR_vfork, __NR_prctl, __NR_clone };
+  for (unsigned i = 0; i < sizeof x32 / sizeof x32[0]; i++) {
+    data.nr = __X32_SYSCALL_BIT | x32[i];
+    data.args[0] = 0;
+    if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+    data.args[0] = CLONE_THREAD;
+    if (seccomp_errno_of(seccomp_eval(filter, len, &data)) != EPERM) return 0;
+  }
   int denied[] = { __NR_fork, __NR_vfork, __NR_clone3, __NR_setsid, __NR_setpgid, __NR_prctl, __NR_unshare, __NR_mount };
   for (unsigned i = 0; i < sizeof denied / sizeof denied[0]; i++) {
     data.nr = denied[i];
@@ -647,4 +653,3 @@ value ocagent_worker_probe(value v_art, value v_sentinel, value v_store, value v
            setsid_err, setpgid_err, fork_err, vfork_err, clone3_err, unshare_err, compat_err, compat_entered, policy, mount_err, prctl_err, tcp, stat_ok, store_ok, tmp_ok, ro_ok);
   CAMLreturn(caml_copy_string(line));
 }
-

@@ -188,7 +188,7 @@ let plant_unconsumed path hash =
   | Ok _ -> fail "plant completion"
   | Error err -> fail "plant %s" (S.describe err)
 
-let plant_replay path hash url =
+let plant_replay ?(body = "spec-body") path hash url =
   let req kind approval recovery seq =
     {
       S.seq;
@@ -229,7 +229,7 @@ let plant_replay path hash url =
         | Ok (S.Replay _) -> (
             match S.prepare_operation ex (req "Fetch" false "Manual_only" 1) with
             | Ok (S.Execute issued) ->
-                S.commit_result path issued (Json.Assoc [ ("body", Json.String "spec-body"); ("status", Json.Int 200) ])
+                S.commit_result path issued (Json.Assoc [ ("body", Json.String body); ("status", Json.Int 200) ])
             | Ok _ -> Error (S.Protocol "fetch")
             | Error _ as err -> err)
         | Ok _ -> Error (S.Protocol "replay")
@@ -291,6 +291,17 @@ let serve mode log =
           (try Unix.clear_nonblock client with Unix.Unix_error _ -> ());
           match mode with
           | `Hang -> ()
+          | `Body body ->
+              let response = Printf.sprintf
+                  "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                  (String.length body) body in
+              let rec send off =
+                if off < String.length response then
+                  let n = Unix.write_substring client response off (String.length response - off) in
+                  if n > 0 then send (off + n)
+              in
+              (try send 0 with Unix.Unix_error _ -> ());
+              Unix.close client
           | `Flood ->
               let headers = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" in
               ignore (try Unix.write_substring client headers 0 (String.length headers) with _ -> 0);
@@ -305,6 +316,106 @@ let serve mode log =
       done
   | pid -> (pid, port)
 
+let return_boundaries tools =
+  let module I = Ocagent_harness.Step_ipc in
+  let return body = I.Return { version = 1; request_id = 1; result = I.Http { status = 200; body } } in
+  let overhead =
+    match I.encode_frame (return "") with Ok text -> String.length text | Error msg -> fail "empty Return %s" msg
+  in
+  let max_body = I.max_frame - overhead in
+  let exact_result = I.Http { status = 200; body = String.make max_body 'x' } in
+  (match R.checked_return 1 exact_result, R.checked_return 10 exact_result with
+  | Ok _, Error _ -> ()
+  | _ -> fail "Return did not account for the actual request_id");
+  (match R.checked_return 1 (I.Http { status = 200; body = "\255" }) with
+  | Error _ -> ()
+  | Ok _ -> fail "Return accepted invalid UTF-8");
+  let source =
+    {|open Step_api
+module Step : STEP = struct
+  let run () = match Input.get "fetch_url" with
+    | None -> Done "missing"
+    | Some url -> match Net.get url with
+      | Ok r -> Done (string_of_int (String.length r.body))
+      | Error _ -> Done "denied"
+end
+|}
+  in
+  let case name body accepted =
+    let raw = Printf.sprintf "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+        (String.length body) body in
+    let stored = Json.Assoc [ ("body", Json.String body); ("status", Json.Int 200) ] in
+    if String.length raw > I.max_frame || String.length (Json.canonical stored) > I.max_frame then
+      fail "%s is not a Return-only boundary" name;
+    (match I.encode_frame (return body) with
+    | Ok text when accepted && String.length text = I.max_frame -> ()
+    | Error _ when not accepted -> ()
+    | _ -> fail "%s frame fixture" name);
+    let dir = fresh name in
+    let log = Filename.concat dir "http.log" in
+    let server, port = serve (`Body body) log in
+    Fun.protect
+      ~finally:(fun () ->
+        (try Unix.kill server Sys.sigkill with Unix.Unix_error _ -> ());
+        ignore (Unix.waitpid [] server))
+      (fun () ->
+        let url = Printf.sprintf "http://127.0.0.1:%d/spec" port in
+        let _, m = compile tools dir source [ ("fetch_url", url) ] in
+        let path = snapshot dir in
+        let read () = match S.read_snapshot path with Ok snap -> snap | Error e -> fail "%s" (S.describe e) in
+        let fetch () =
+          match List.find_opt (fun e -> e.G.kind = "Fetch") !((read ()).journal.entries) with
+          | Some e -> e | None -> fail "%s no Fetch" name
+        in
+        (match run_step dir m.execution_hash url with
+        | Ok R.Awaiting_approval when lines log = 0 -> ()
+        | _ -> fail "%s approval" name);
+        let ask = List.hd !((read ()).journal.entries) in
+        (match S.approve_step ~path ~execution_hash:m.execution_hash ~seq:ask.G.seq ~callback_id:"return-boundary"
+                 ~expected_request_hash:ask.req_hash ~decision_json:(Json.Assoc [ ("tag", Json.String "Approved") ]) with
+        | Ok () -> () | Error e -> fail "%s" (S.describe e));
+        (match run_step dir m.execution_hash url with
+        | Ok (R.Completed { reply = Step_manifest.Done size; _ }) when accepted ->
+            if size <> string_of_int (String.length body) then fail "%s truncated" name;
+            if (fetch ()).status <> G.Done then fail "%s missing Done" name
+        | Error (R.Store S.Unknown_result) when not accepted ->
+            if (fetch ()).status <> G.Pending then fail "%s committed an undeliverable result" name;
+            if state path = Step_manifest.Completed then fail "%s completed" name
+        | Error e -> fail "%s unexpected %s" name (R.describe e)
+        | Ok _ -> fail "%s unexpected completion" name);
+        if lines log <> 1 then fail "%s HTTP count" name;
+        (match run_step dir m.execution_hash url with
+        | Ok (R.Completed _) when accepted -> ()
+        | Error (R.Store S.Unknown_result) when not accepted ->
+            if (fetch ()).status <> G.Unknown then fail "%s not Unknown after claim" name
+        | _ -> fail "%s resume" name);
+        if lines log <> 1 then fail "%s resent HTTP" name;
+        Printf.printf "return boundary %s ok\n%!" name)
+  in
+  case "exact-frame" (String.make max_body 'x') true;
+  case "envelope-overflow" (String.make (max_body + 1) 'x') false;
+  case "escaped-overflow" (String.make ((max_body / 2) + 1) '"') false;
+  (* Old, already-recorded Done results are never downgraded or reissued. *)
+  let dir = fresh "legacy-return" in
+  let url = "http://127.0.0.1:9/spec" in
+  let _, m = compile tools dir source [ ("fetch_url", url) ] in
+  let path = snapshot dir in
+  let body = String.make (max_body + 1) 'x' in
+  plant_replay ~body path m.execution_hash url;
+  for _ = 1 to 2 do
+    (match run_step dir m.execution_hash url with
+    | Error (R.Store (S.Protocol "return")) -> ()
+    | _ -> fail "legacy oversized Done was not reported as undeliverable");
+    match S.read_snapshot path with
+    | Ok snap ->
+        (match !(snap.journal.entries) with
+        | [ _; entry ] when entry.G.status = G.Done
+            && entry.result = Json.Assoc [ ("body", Json.String body); ("status", Json.Int 200) ] -> ()
+        | _ -> fail "legacy Done was changed")
+    | Error e -> fail "legacy snapshot %s" (S.describe e)
+  done;
+  print_endline "return boundaries ok"
+
 let () =
   let tools =
     match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 60.) with
@@ -314,6 +425,7 @@ let () =
   Fun.protect
     ~finally:(fun () -> C.release tools)
     (fun () ->
+      return_boundaries tools;
       let compiler_id, runtime_id = C.identity tools in
       let pure_dir = fresh "pure" in
       let artifact, manifest = compile tools pure_dir pure [] in

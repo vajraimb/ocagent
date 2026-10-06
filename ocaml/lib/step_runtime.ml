@@ -95,6 +95,18 @@ let manifest_reply = function
   | Step_ipc.Ask text -> Step_manifest.Ask text
   | Step_ipc.Partial text -> Step_manifest.Partial text
 
+(* Validate the complete message before committing an external result. A result
+   fitting in the journal may still overflow its IPC envelope or fail its codec. *)
+let checked_return request_id result =
+  let frame = Step_ipc.Return { version = 1; request_id; result } in
+  match Step_ipc.encode_frame frame with
+  | Error _ as err -> err
+  | Ok text -> (
+      match Step_ipc.decode_frame text with
+      | Ok decoded when decoded = frame -> Ok frame
+      | Ok _ -> Error "return round trip"
+      | Error _ as err -> err)
+
 let wait_fd sock mode deadline =
   if Step_sandbox.monotonic () >= deadline then failwith "deadline"
   else
@@ -346,6 +358,9 @@ let drive ~deadline ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~t
                   barrier path "after-provider";
                   let json = Json.Assoc [ ("body", Json.String body); ("status", Json.Int status) ] in
                   if String.length (Json.canonical json) > Step_ipc.max_frame then failwith "response";
+                  (match checked_return request_id (Step_ipc.Http { status; body }) with
+                  | Ok _ -> ()
+                  | Error msg -> failwith ("return " ^ msg));
                   json)
             with
             | Error Durable_dispatch.In_flight -> Error Store.Unknown_result
@@ -362,7 +377,11 @@ let drive ~deadline ~path ~execution_hash ~allowed_url ~workspace_hash ~input ~t
                 | _ -> fail_closed "codec")
           and reply request_id result =
             barrier path "before-return";
-            match write_msg (Step_ipc.Return { version = 1; request_id; result }) with
+            match
+              match checked_return request_id result with
+              | Error _ as err -> err
+              | Ok frame -> write_msg frame
+            with
             | Error _ -> Error (Store.Protocol "return")
             | Ok () -> (
                 match Step_ipc.after_return !session request_id with

@@ -814,6 +814,15 @@ let input_text pairs =
 
 let text_ok text = String.length text <= max_text
 
+(* No toolchain, parsing, subprocesses or snapshot writes in this cheap gate.
+   Keep it both before acquisition and on compile_with's direct entry path. *)
+let byte_limits ~source ~modules ~input =
+  if List.length modules > 16 then Error (Rejected "too many modules")
+  else if (not (text_ok source)) || List.exists (fun item -> not (text_ok item.source && text_ok item.interface_)) modules then
+    Error (Rejected "too big")
+  else if List.exists (fun (key, value) -> not (text_ok key && text_ok value)) input then Error (Rejected "too big")
+  else Ok ()
+
 let say_limited msg =
   let msg = if String.length msg > 500 then String.sub msg 0 500 else msg in
   output_string stdout (msg ^ "\n");
@@ -875,11 +884,9 @@ let validate_cmt ~deadline ~snap ~setup_fault ~users dir names =
       | Error _ as err -> err)
 
 let source_gate ~hang ~deadline ~snap ~setup_fault ~source ~modules ~input =
-  if List.length modules > 16 then Error (Rejected "too many modules")
-  else if (not (text_ok source)) || List.exists (fun item -> not (text_ok item.source && text_ok item.interface_)) modules then
-    Error (Rejected "too big")
-  else if List.exists (fun (key, value) -> not (text_ok key && text_ok value)) input then Error (Rejected "too big")
-  else
+  match byte_limits ~source ~modules ~input with
+  | Error _ as err -> err
+  | Ok () ->
     let names = List.map (fun item -> item.name) modules in
     if List.exists (fun name -> not (module_name_ok name)) names then Error (Rejected "module name")
     else if List.length names <> List.length (List.sort_uniq String.compare names) then Error (Rejected "duplicate module")
@@ -1020,6 +1027,9 @@ let compile_with ~setup_fault ~hang ~deadline tools ~source ~modules ~input =
                                   }))))))
 
 let compile_go ~setup_fault ~hang ~budget ~source ~modules ~input =
+  match byte_limits ~source ~modules ~input with
+  | Error _ as err -> err
+  | Ok () ->
   fault_skip := 0;
   Fun.protect ~finally:(fun () -> fault_skip := 0) (fun () ->
       let deadline = Unix.gettimeofday () +. budget in
@@ -1084,6 +1094,9 @@ let submit_fault setup_fault ~path ~run_id ~agent_version ~admission_key ~source
   | Ok artifact -> admit ~path ~run_id ~agent_version ~admission_key artifact
 
 let submit_hang ~budget ~path ~run_id ~agent_version ~admission_key ~source ~modules ~input =
+  match byte_limits ~source ~modules ~input with
+  | Error _ as err -> err
+  | Ok () ->
   match select_toolchain ~deadline:(Unix.gettimeofday () +. 20.) with
   | Error _ as err -> err
   | Ok tools ->

@@ -48,6 +48,37 @@ let () =
       output_string stdout (String.make 300000 'x');
       flush stdout;
       exit 0
+  | [ _; "--byte-gate-cold" ] ->
+      (* A fresh process with no compiler cannot acquire or clone a toolchain.
+         Rejection must precede that stage, not merely finish within two seconds. *)
+      Unix.putenv "PATH" "/no/such/ocagent-byte-gate-toolchain";
+      let dir = Filename.temp_dir "ocagent-byte-gate" "" in
+      let path = Filename.concat dir "snapshot.json" in
+      let huge = String.make 262145 '(' in
+      let small = "open Step_api\nmodule Step : STEP = struct let run () = Done \"x\" end\n" in
+      let reject name source modules input =
+        (match C.submit ~path ~run_id:"r" ~agent_version:"v" ~admission_key:"a" ~source ~modules ~input with
+        | Error (C.Rejected "too big") -> ()
+        | Error err -> fail "%s reached a later stage: %s" name (C.describe err)
+        | Ok _ -> fail "%s was accepted" name);
+        if Array.length (Sys.readdir dir) <> 0 then fail "%s wrote admission files" name
+      in
+      reject "source" huge [] [];
+      reject "module source" small [ { C.name = "Helper"; source = huge; interface_ = "" } ] [];
+      reject "interface" small [ { C.name = "Helper"; source = ""; interface_ = huge } ] [];
+      reject "input key" small [] [ (huge, "") ];
+      reject "input value" small [] [ ("k", huge) ];
+      (match C.submit_hang ~budget:0. ~path ~run_id:"r" ~agent_version:"v" ~admission_key:"a"
+               ~source:huge ~modules:[] ~input:[] with
+      | Error (C.Rejected "too big") -> ()
+      | _ -> fail "submit_hang bypassed the cheap gate");
+      (* Positive control: a small request really does reach unavailable tools. *)
+      (match C.compile ~source:small ~modules:[] ~input:[] with
+      | Error (C.Unavailable "ocamlc") -> ()
+      | _ -> fail "missing toolchain control");
+      Unix.rmdir dir;
+      print_endline "cold byte gate ok";
+      exit 0
   | _ -> ()
 
 let read_all path =
@@ -132,6 +163,11 @@ let vnum () =
   Fun.protect ~finally:(fun () -> ignore (Unix.close_process_in ic)) (fun () -> String.trim (input_line ic))
 
 let () =
+  let gate = Unix.create_process Sys.argv.(0) [| Sys.argv.(0); "--byte-gate-cold" |]
+      Unix.stdin Unix.stdout Unix.stderr in
+  (match Unix.waitpid [] gate with
+  | _, Unix.WEXITED 0 -> ()
+  | _ -> fail "cold byte gate failed");
   let expected = vnum () in
   Unix.putenv "OCAMLLIB" "/no/such/ocagent-lib";
   Unix.putenv "OCAMLPATH" "/no/such/ocagent-path";
@@ -195,7 +231,6 @@ end
 |};
   let huge_source = String.make 262145 'a' in
   let huge_compile = fresh () in
-  let t0 = Unix.gettimeofday () in
   (match
      C.submit ~path:huge_compile ~run_id:"run" ~agent_version:"step-v3" ~admission_key:"adm" ~source:huge_source ~modules:[]
        ~input:[]
@@ -203,8 +238,19 @@ end
   | Error (C.Rejected "too big") -> ()
   | Ok _ -> fail "oversized source reached compilation"
   | Error err -> fail "oversized compile %s" (C.describe err));
-  if Unix.gettimeofday () -. t0 > 2. then fail "oversized source was parsed";
   if Sys.file_exists huge_compile then fail "oversized source created a snapshot";
+  (* Even direct callers with an already-held toolchain must not enter the
+     validator. Its injected setup failure and expired deadline must not win. *)
+  let tools =
+    match C.hold_toolchain ~deadline:(Unix.gettimeofday () +. 30.) with
+    | Ok tools -> tools
+    | Error err -> fail "gate toolchain %s" (C.describe err)
+  in
+  Fun.protect ~finally:(fun () -> C.release tools) (fun () ->
+      match C.compile_with ~setup_fault:(Some C.Isolation) ~hang:true ~deadline:0. tools
+              ~source:huge_source ~modules:[] ~input:[] with
+      | Error (C.Rejected "too big") -> ()
+      | _ -> fail "direct compile_with entered validation for oversized source");
   let quoted = String.make 129 '(' in
   let commented =
     Printf.sprintf
