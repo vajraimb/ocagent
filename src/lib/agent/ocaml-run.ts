@@ -167,7 +167,12 @@ export async function runOcaml(
   }
 }
 
-function startBridge(apiKey: string | undefined, harnesses: HarnessId[]) {
+export type RunHooks = {
+  signal?: AbortSignal;
+  onCall?: (tool: string, detail: string) => void;
+};
+
+function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?: RunHooks) {
   const allow = new Set<string>(harnesses.filter((id) => id === "net" || id === "web"));
   const token = randomBytes(16).toString("hex");
   const server = createServer(async (req, res) => {
@@ -195,6 +200,7 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[]) {
       return;
     }
     try {
+      hooks?.onCall?.(op === "net" ? "Net.get" : "Search.query", payload);
       const text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(text.slice(0, 4000));
@@ -222,20 +228,31 @@ function execute(
   args: string[],
   cwd: string,
   extra: Record<string, string>,
-  opts?: { sandbox?: boolean; timeoutMs?: number },
-): Promise<{ text: string; timedOut: boolean }> {
+  opts?: { sandbox?: boolean; timeoutMs?: number; signal?: AbortSignal },
+): Promise<{ text: string; timedOut: boolean; aborted: boolean }> {
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let killer: ReturnType<typeof setTimeout> | undefined;
     let backup: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      aborted = true;
+      killTree();
+      backup = setTimeout(() => finish(Buffer.concat(chunks).toString("utf8").trim(), false), 1500);
+    };
     const finish = (text: string, timeout: boolean) => {
       if (settled) return;
       settled = true;
       if (killer) clearTimeout(killer);
       if (backup) clearTimeout(backup);
-      resolve({ text, timedOut: timeout });
+      opts?.signal?.removeEventListener("abort", onAbort);
+      resolve({ text, timedOut: timeout, aborted });
     };
+    if (opts?.signal?.aborted) {
+      resolve({ text: "", timedOut: false, aborted: true });
+      return;
+    }
     const env = { PATH: "/usr/bin:/bin", HOME: cwd, TMPDIR: cwd, LANG: "C.UTF-8", ...extra };
     const child = opts?.sandbox && sandboxReady
       ? spawn(unshareBin, ["--user", "--map-root-user", "--mount", rt("enter.sh"), cwd, bin, ...args], {
@@ -269,7 +286,8 @@ function execute(
     });
     child.on("close", (code, signal) => {
       const text = Buffer.concat(chunks).toString("utf8").trim().slice(0, 8000);
-      if (timedOut) finish(text || "时限到了，已经停掉。", true);
+      if (aborted) finish(text, false);
+      else if (timedOut) finish(text || "时限到了，已经停掉。", true);
       else if (signal === "SIGKILL") finish(text ? `${text}\n输出太长，已截断。` : "输出太长，已截断。", false);
       else if (code && code !== 0) finish(`退出码 ${code}\n${text || "没有输出"}`, false);
       else finish(text || "（没有输出）", false);
@@ -281,6 +299,7 @@ function execute(
         backup = setTimeout(() => finish(Buffer.concat(chunks).toString("utf8").trim() || "时限到了，已经停掉。", true), 1500);
       }, opts.timeoutMs);
     }
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -472,6 +491,7 @@ export async function runCore(
     search: (query: string) => Promise<string>;
     ocaml: (payload: string) => Promise<string>;
   },
+  hooks?: RunHooks,
 ): Promise<CoreResult> {
   const { run, image } = await agentBin();
   const dir = await mkdtemp(rt("runs", "job-"));
@@ -489,11 +509,13 @@ export async function runCore(
         OCAGENT_PORT: String(bridge.port),
         OCAGENT_TOKEN: bridge.token,
       },
+      { signal: hooks?.signal },
     );
     const resultPath = path.join(dir, "result");
     if (await exists(resultPath)) {
       try {
         const decoded = decodeResult(await readFile(resultPath));
+        if (ran.aborted) return { ...decoded, status: "stopped", answer: stoppedAnswer(decoded.steps) };
         if (decoded.status === "error") return { ...decoded, answer: decoded.answer || "循环没有跑起来。" };
         if (decoded.status === "done" && decoded.answer.trim()) return decoded;
         const answer =
@@ -510,8 +532,8 @@ export async function runCore(
       }
     }
     return {
-      status: "done",
-      answer: ran.timedOut ? "时限到了，还没有结果。把任务写短一点，或点继续。" : ran.text || "循环没有留下结果。",
+      status: ran.aborted ? "stopped" : "done",
+      answer: ran.aborted ? stoppedAnswer([]) : ran.timedOut ? "时限到了，还没有结果。把任务写短一点，或点继续。" : ran.text || "循环没有留下结果。",
       files: job.files,
       modules: job.modules,
       steps: [],
@@ -522,6 +544,14 @@ export async function runCore(
     await bridge.close();
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+function stoppedAnswer(steps: ToolStep[]): string {
+  const done = steps.filter((step) => step.tool !== "compile" && step.detail !== "推迟").slice(-4);
+  const lines = ["已按你的要求停下。"];
+  if (done.length) lines.push("停下之前做了：", ...done.map((step) => `${step.tool} ${step.detail}`.trim()));
+  lines.push("再发一句话就接着做；工作区里写好的文件都还在。");
+  return lines.join("\n");
 }
 
 function startCoreBridge(handlers: {
@@ -889,7 +919,7 @@ async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Prom
   return out;
 }
 
-export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
+export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
   const cur = reader(Buffer.from(payload, "utf8"));
   const source = cur.block();
   const count = Number(cur.line());
@@ -900,7 +930,7 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
   const command = await ocamlCommand();
   if (!command) return `fail\n${encodeBlock("这台服务器没有 OCaml 运行器。")}`;
   await ensureRuntime();
-  const bridge = harnesses.some((id) => id === "net" || id === "web") ? await startBridge(apiKey, harnesses) : null;
+  const bridge = harnesses.some((id) => id === "net" || id === "web") ? await startBridge(apiKey, harnesses, hooks) : null;
   const dir = await mkdtemp(rt("runs", "step-"));
   try {
     for (const file of files) {
@@ -925,8 +955,9 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       extra.OCAGENT_PORT = String(bridge.port);
       extra.OCAGENT_TOKEN = bridge.token;
     }
-    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 55_000 });
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 55_000, signal: hooks?.signal });
     const outPath = path.join(dir, "ocagent_step_out");
+    if (ran.aborted) return `fail\n${encodeBlock("已停下，这一步没有跑完。")}`;
     if (!(await exists(outPath))) {
       return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;
     }
@@ -950,8 +981,8 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
   }
 }
 
-export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
-  if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey);
+export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
+  if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey, hooks);
   const cur = reader(Buffer.from(payload, "utf8"));
   const entry = cur.block();
   const source = cur.block();

@@ -2,14 +2,17 @@ import { createServerFn } from "@tanstack/react-start";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
-import { orderCalls, searchWeb } from "./search.ts";
+import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEventBody, type JobSnapshot } from "./progress.ts";
+import { searchWeb } from "./search.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 export type { JournalItem };
 
 export type DeskResult =
-  | { ok: true; answer: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string }
-  | { ok: false; error: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string };
+  | { ok: true; answer: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean }
+  | { ok: false; error: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean };
+
+export type DeskSnapshot = JobSnapshot<DeskResult>;
 
 type CoreJob = {
   task: string;
@@ -237,9 +240,14 @@ module Step : STEP = struct
 end`;
 }
 
-export function parseDeskInput(input: unknown): { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string } | { error: string } {
+export type DeskInput = { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; jobId: string | null };
+
+export function parseDeskInput(input: unknown): DeskInput | { error: string } {
   if (!input || typeof input !== "object") return { error: "请求不对" };
   const task = "task" in input && typeof input.task === "string" ? input.task.trim() : "";
+  const rawJob = "jobId" in input ? input.jobId : null;
+  if (rawJob !== null && rawJob !== undefined && !isJobId(rawJob)) return { error: "任务编号不对。" };
+  const jobId = isJobId(rawJob) ? rawJob : null;
   const rawFiles = "files" in input && Array.isArray(input.files) ? input.files : null;
   if (!task || task.length > MAX_TASK) return { error: "先写一句要做的事，别超过一千字。" };
   if (!rawFiles || rawFiles.length > 24) return { error: "工作区文件不对。" };
@@ -255,7 +263,7 @@ export function parseDeskInput(input: unknown): { task: string; files: DeskFile[
   const modules = normalizeModules("modules" in input ? input.modules : undefined);
   const journal = normalizeJournal("journal" in input ? input.journal : undefined);
   const memory = "memory" in input && typeof input.memory === "string" ? input.memory.slice(0, 4000) : "";
-  return { task, files, harnesses, modules, journal, memory };
+  return { task, files, harnesses, modules, journal, memory, jobId };
 }
 
 function normalizeJournal(raw: unknown): JournalItem[] {
@@ -306,6 +314,15 @@ function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], module
     });
 }
 
+export type RunHooks = { signal?: AbortSignal; onCall?: (tool: string, detail: string) => void };
+
+export type LoopDeps = {
+  runCore: (job: CoreJob, handlers: CoreHandlers, hooks?: RunHooks) => Promise<CoreResult>;
+  runPayload: (payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks) => Promise<string>;
+  emit?: (event: AgentEventBody) => void;
+  signal?: AbortSignal;
+};
+
 export async function runDeskLoop(
   apiKey: string,
   task: string,
@@ -314,26 +331,58 @@ export async function runDeskLoop(
   modules: DeskModule[] = [],
   journal: JournalItem[] = [],
   memory = "",
-  deps: {
-    runCore: (job: CoreJob, handlers: CoreHandlers) => Promise<CoreResult>;
-    runPayload: (payload: string, harnesses: HarnessId[], apiKey: string | undefined) => Promise<string>;
-  },
+  deps: LoopDeps,
 ): Promise<DeskResult> {
+  const emit = deps.emit ?? (() => {});
+  let round = 0;
   try {
     let redirects = 0;
+    emit({ kind: "start", task });
     const result = await deps.runCore(
       { task, harnesses, files, modules, journal, memory },
       {
-        model: (prompt) => askModel(apiKey, prompt, harnesses, modules),
-        net: (url) => fetchPublic(url),
-        search: (query) => searchWeb(apiKey, query),
+        model: async (prompt) => {
+          round += 1;
+          emit({ kind: "think", round });
+          const raw = await askModel(apiKey, prompt, harnesses, modules);
+          const reply = describeModelReply(raw);
+          if (reply?.kind === "error") emit({ kind: "model_error", round, message: reply.message });
+          else if (reply?.kind === "text") emit({ kind: "plan", round, code: extractCode(reply.text) || reply.text });
+          return raw;
+        },
+        net: async (url) => {
+          emit({ kind: "call", round, tool: "Net.get", detail: url });
+          const output = await fetchPublic(url);
+          emit({ kind: "effect", round, tool: "Net.get", detail: url, output });
+          return output;
+        },
+        search: async (query) => {
+          emit({ kind: "call", round, tool: "Search.query", detail: query });
+          const output = await searchWeb(apiKey, query);
+          emit({ kind: "effect", round, tool: "Search.query", detail: query, output });
+          return output;
+        },
         ocaml: async (payload) => {
-          const raw = await deps.runPayload(payload, harnesses, apiKey);
+          const isStep = payload.startsWith("step\n");
+          if (isStep) emit({ kind: "run", round });
+          const raw = await deps.runPayload(payload, harnesses, apiKey, {
+            signal: deps.signal,
+            onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
+          });
           const next = rewriteStep(raw, task, redirects);
           if (next.usedRedirect) redirects += 1;
+          if (isStep) {
+            const frame = describeStepFrame(next.raw);
+            if (frame?.kind === "fail") emit({ kind: "compile_failed", round, message: frame.message });
+            else if (frame?.kind === "ok") {
+              for (const effect of frame.effects) emit({ kind: "effect", round, ...effect });
+              emit({ kind: "step", round, reply: frame.reply, text: frame.text });
+            }
+          }
           return next.raw;
         },
       },
+      { signal: deps.signal },
     );
     const carried = {
       files: result.files,
@@ -343,6 +392,7 @@ export async function runDeskLoop(
       memory: result.memory,
     };
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
+    if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
     return { ok: true, answer: presentAnswer(task, result.answer), ...carried };
   } catch (err) {
     return {
@@ -390,7 +440,7 @@ function parseArgs(raw: string | undefined): { args: Record<string, unknown>; er
 }
 
 export const runDesk = createServerFn({ method: "POST" })
-  .validator((input: unknown): { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string } => {
+  .validator((input: unknown): DeskInput => {
     const parsed = parseDeskInput(input);
     if ("error" in parsed) throw new Error(parsed.error);
     return parsed;
@@ -401,5 +451,42 @@ export const runDesk = createServerFn({ method: "POST" })
       return { ok: false, error: "Grok 没有接上。", files: data.files, steps: [], modules: data.modules, journal: data.journal, memory: data.memory };
     }
     const { runCore, runPayload } = await import("./ocaml-run.ts");
-    return runDeskLoop(apiKey, data.task, data.files, data.harnesses, data.modules, data.journal, data.memory, { runCore, runPayload });
+    const { deskProgress } = await import("./progress.server.ts");
+    const jobId = data.jobId;
+    const controller = new AbortController();
+    if (jobId) {
+      deskProgress.open(jobId);
+      deskProgress.attachAbort(jobId, () => controller.abort());
+    }
+    const result = await runDeskLoop(apiKey, data.task, data.files, data.harnesses, data.modules, data.journal, data.memory, {
+      runCore,
+      runPayload,
+      signal: controller.signal,
+      emit: jobId ? (event) => deskProgress.emit(jobId, event) : undefined,
+    });
+    if (jobId) deskProgress.close(jobId, result, result.ok);
+    return result;
+  });
+
+function readJobInput(input: unknown): { jobId: string; after: number } {
+  if (!input || typeof input !== "object") throw new Error("请求不对");
+  const jobId = "jobId" in input ? input.jobId : null;
+  if (!isJobId(jobId)) throw new Error("任务编号不对。");
+  const rawAfter = "after" in input ? input.after : 0;
+  const after = typeof rawAfter === "number" && Number.isInteger(rawAfter) && rawAfter >= 0 ? rawAfter : 0;
+  return { jobId, after };
+}
+
+export const pollDesk = createServerFn({ method: "POST" })
+  .validator(readJobInput)
+  .handler(async ({ data }): Promise<DeskSnapshot> => {
+    const { deskProgress } = await import("./progress.server.ts");
+    return deskProgress.read(data.jobId, data.after);
+  });
+
+export const stopDesk = createServerFn({ method: "POST" })
+  .validator(readJobInput)
+  .handler(async ({ data }): Promise<{ stopped: boolean }> => {
+    const { deskProgress } = await import("./progress.server.ts");
+    return { stopped: deskProgress.cancel(data.jobId) };
   });
