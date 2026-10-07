@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
+import { presentAnswer, rewriteStep } from "./present.ts";
 import { orderCalls, searchWeb } from "./search.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
@@ -213,13 +214,18 @@ end
 - 每个有副作用的调用都返回 res，必须用 match 处理 Ok 和 Error，不要用 Result.get_ok。
 - 想让下一轮看到某个结果，用 Trace.note 写出来。下一轮只会收到这些 note，不会自动看到每次调用的返回值。
 - Continue 表示还要再来一轮。Done、Ask、Partial 会结束这次任务。
+- 参数已经确定的多个调用，写在同一步里依次执行。全部 Trace.note 之后，只 Continue 一次。
+- 后一个调用的地址、查询或内容要等前一个的返回值，就不能写在同一步。先 Continue，下一轮再用笔记里的值去调用。
+- 只要这一步调用了 Net.get 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用笔记里出现过的数字。
 
 【工作方式】
 - 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。
 - 只有用户明确说「加载」或 harness 时，才把对应的 .ml 写好并结束。其它任务不要提 harness。
 - 工作区是空的时候，不要反复列出文件。
 - 收到编译错误时只改出错的地方，不要重写整段。
-- 不确定时返回 Ask，不要猜。
+- 参数已经知道的多个请求写在同一步，记完再 Continue 一次。后一个请求要依赖前一个的结果时，拆成两步。
+- 还要再请求，就不要 Done。不再请求的那一轮，只用笔记里出现过的数字写结论。
+- 不要调用没列出的模块。编译失败的那一步不会执行。
 
 【示例：写完并结束】
 module Step : STEP = struct
@@ -314,13 +320,19 @@ export async function runDeskLoop(
   },
 ): Promise<DeskResult> {
   try {
+    let redirects = 0;
     const result = await deps.runCore(
       { task, harnesses, files, modules, journal, memory },
       {
         model: (prompt) => askModel(apiKey, prompt, harnesses, modules),
         net: (url) => fetchPublic(url),
         search: (query) => searchWeb(apiKey, query),
-        ocaml: (payload) => deps.runPayload(payload, harnesses, apiKey),
+        ocaml: async (payload) => {
+          const raw = await deps.runPayload(payload, harnesses, apiKey);
+          const next = rewriteStep(raw, task, redirects);
+          if (next.usedRedirect) redirects += 1;
+          return next.raw;
+        },
       },
     );
     const carried = {
@@ -331,7 +343,7 @@ export async function runDeskLoop(
       memory: result.memory,
     };
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
-    return { ok: true, answer: result.answer, ...carried };
+    return { ok: true, answer: presentAnswer(task, result.answer), ...carried };
   } catch (err) {
     return {
       ok: false,

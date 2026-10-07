@@ -50,7 +50,7 @@ export async function searchWeb(apiKey: string, query: string): Promise<string> 
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      signal: AbortSignal.timeout(12_000),
+      signal: AbortSignal.timeout(45_000),
       body: JSON.stringify({
         model: "grok-4.5",
         reasoning: { effort: "low" },
@@ -75,6 +75,6 @@ export async function searchWeb(apiKey: string, query: string): Promise<string> 
     const joined = [text, urls].filter(Boolean).join("\n").slice(0, 1500);
     return joined || "网上没有查到。按已经知道的公开接口写。";
   } catch {
-    return "搜索超时了。按已经知道的公开接口写，不要再搜。";
+    return "搜索超时，没有拿到结果。";
   }
 }

@@ -695,9 +695,17 @@ let effects = open_out_gen [ Open_append; Open_creat ] 0o644 "ocagent_effects"
 
 let one_line s = String.map (fun c -> if c = '\\n' || c = '\\t' || c = '\\r' then ' ' else c) s
 
+let clip_ends s n =
+  let len = String.length s in
+  if len <= n then s
+  else
+    let head = n / 2 in
+    let tail = n - head in
+    String.sub s 0 head ^ " … " ^ String.sub s (len - tail) tail
+
 let log_effect name detail result =
-  let shown = if String.length result > 300 then String.sub result 0 300 else result in
-  output_string effects (name ^ "\\t" ^ one_line detail ^ "\\t" ^ one_line shown ^ "\\n");
+  let shown = clip_ends (one_line result) 2400 in
+  output_string effects (name ^ "\\t" ^ one_line detail ^ "\\t" ^ shown ^ "\\n");
   flush effects
 
 let hidden name = String.starts_with ~prefix:"ocagent_" name || String.starts_with ~prefix:"." name
@@ -917,7 +925,7 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       extra.OCAGENT_PORT = String(bridge.port);
       extra.OCAGENT_TOKEN = bridge.token;
     }
-    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 20_000 });
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 55_000 });
     const outPath = path.join(dir, "ocagent_step_out");
     if (!(await exists(outPath))) {
       return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;

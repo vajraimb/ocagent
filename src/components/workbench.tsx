@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { runDesk } from "@/lib/agent/run";
+import { decideDurableApproval, getDurableRun, resumeDurableRun } from "@/lib/agent/durable-api";
+import { callbackFor, type DurableProjection } from "@/lib/agent/durable-types";
+
 import { CATALOG, DEFAULT_HARNESSES, checkModule, isHarnessId, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import { type DeskFile, type JournalItem, type ToolStep } from "@/lib/agent/workspace";
 
@@ -8,6 +11,8 @@ type Turn = {
   text: string;
   code?: string;
   steps?: ToolStep[];
+  runId?: string;
+  run?: DurableProjection;
 };
 
 type Saved = {
@@ -23,6 +28,7 @@ type Saved = {
 };
 
 const STORAGE_KEY = "ocagent-desk-v6";
+const RUN_KEY = "ocagent-durable-run";
 const PREFAB = new Set(["README.md", "src/math.ml", "src/greet.ml", "notes/todo.md"]);
 const SWITCHES = CATALOG.filter((item) => item.id !== "ocaml");
 
@@ -54,6 +60,8 @@ export function Workbench() {
   const [settings, setSettings] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
   const [keyboardTop, setKeyboardTop] = useState(0);
+  const [watching, setWatching] = useState(true);
+  const [reason, setReason] = useState("");
   const runId = useRef(0);
 
   useEffect(() => {
@@ -103,6 +111,41 @@ export function Workbench() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
   }, [ready, task, files, harnesses, modules, journal, memory, turns]);
 
+  const live = [...turns].reverse().find((turn) => turn.runId && turn.run && turn.run.store_state !== "Completed" && turn.run.store_state !== "Failed");
+
+  useEffect(() => {
+    if (!watching || !live?.runId) return;
+    const id = live.runId;
+    const timer = window.setInterval(() => {
+      void getDurableRun({ data: { runId: id } })
+        .then((result) => {
+          if (result.projection) applyRun(result.projection);
+        })
+        .catch(() => setError("这次没有读回来。没有把它改成失败。"));
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [watching, live?.runId, live?.run?.store_state]);
+
+  function applyRun(run: DurableProjection, override?: string) {
+    if (run.source) {
+      setFiles((current) => [{ path: "step.ml", content: run.source }, ...current.filter((file) => file.path !== "step.ml")]);
+      setSelected((current) => current || "step.ml");
+    }
+    localStorage.setItem(RUN_KEY, run.run_id);
+    setTurns((current) => {
+      let index = -1;
+      for (let at = current.length - 1; at >= 0; at -= 1) {
+        if (current[at]?.runId === run.run_id) {
+          index = at;
+          break;
+        }
+      }
+      const text = override || speak(run);
+      if (index < 0) return [...current, { role: "agent", text, code: run.source, runId: run.run_id, run }];
+      return current.map((turn, at) => (at === index ? { ...turn, text, code: run.source || turn.code, run } : turn));
+    });
+  }
+
   useEffect(() => {
     const viewport = window.visualViewport;
     if (!viewport) return;
@@ -116,25 +159,22 @@ export function Workbench() {
     };
   }, []);
 
-  async function go(text: string, resume: boolean) {
+  async function go(text: string) {
     if (!text || running) return;
     const id = ++runId.current;
     setTurns((current) => [...current, { role: "user", text }]);
     setTask("");
     setRunning(true);
+    setWatching(true);
     setError("");
-    const nextJournal = resume ? journal : [];
-    if (!resume) {
-      setJournal([]);
-      setMemory("");
-    }
+    const nextJournal = journal;
     const watch = window.setTimeout(() => {
       if (runId.current !== id) return;
       setRunning(false);
       setTurns((current) => [...current, { role: "agent", text: "太久没有回来。再发一次。若刚才那次稍后做完，结果会补在后面。" }]);
     }, 300_000);
     try {
-      const result = await runDesk({ data: { task: text, files, harnesses, modules, journal: nextJournal, memory: resume ? memory : "" } });
+      const result = await runDesk({ data: { task: text, files, harnesses, modules, journal: nextJournal, memory } });
       if (runId.current !== id) return;
       const nextFiles = result.files.filter(keepFile);
       setFiles(nextFiles);
@@ -158,10 +198,25 @@ export function Workbench() {
     }
   }
 
+  async function actOn(run: DurableProjection, work: () => Promise<{ projection: DurableProjection | null; error: { message: string } | null }>) {
+    setRunning(true);
+    setError("");
+    try {
+      const result = await work();
+      if (result.projection) applyRun(result.projection, result.error?.message);
+      else if (result.error) setError(result.error.message);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "没有完成");
+    } finally {
+      setRunning(false);
+    }
+  }
+
   function stop() {
     runId.current += 1;
     setRunning(false);
-    setTurns((current) => [...current, { role: "agent", text: "已停下。" }]);
+    setWatching(false);
+    setTurns((current) => [...current, { role: "agent", text: "已停下查看。这一步没有被取消。" }]);
     setError("");
   }
 
@@ -197,7 +252,7 @@ export function Workbench() {
         <div className="mt-2 flex flex-wrap gap-2">
           <button
             type="button"
-            onClick={() => (running ? stop() : void go(task.trim(), journal.length > 0))}
+            onClick={() => (running ? stop() : void go(task.trim()))}
             disabled={!running && task.trim().length === 0}
             className="inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-fg disabled:opacity-40"
           >
@@ -218,17 +273,18 @@ export function Workbench() {
       <div className="flex flex-1 flex-col gap-4 px-4 py-4 pb-16">
         {turns.length === 0 && !running ? (
           <p className="rounded-2xl border border-border bg-surface px-4 py-4 text-sm leading-6 text-muted">
-            直接说要做什么。最新的一步会出现在这里。
+            直接说要做什么。搜索、文件和程序都从这里开始。
           </p>
         ) : null}
-        {running ? <p className="text-sm text-muted">正在编译并执行 · {seconds} 秒</p> : null}
+        {running ? <p className="text-sm text-muted">正在做 · {seconds} 秒</p> : null}
         {settings ? <HarnessPanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} /> : null}
         {filesOpen ? <WorkspacePanel files={files} selected={selected} onSelect={setSelected} /> : null}
 
         {[...turns.entries()].reverse().map(([index, turn]) => (
           <article key={`${turn.role}-${index}`} className={`select-text ${turn.role === "user" ? "ml-8 rounded-2xl bg-raised px-4 py-3" : "mr-6 rounded-2xl border border-border bg-surface px-4 py-3"}`}>
-            <p className="font-mono text-[11px] tracking-widest text-muted">{turn.role === "user" ? "你" : "OCAGENT"}</p>
+            <p className="font-mono text-xs tracking-widest text-muted">{turn.role === "user" ? "你" : "OCAGENT"}</p>
             <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-fg">{turn.text.replaceAll("**", "").replaceAll("`", "")}</p>
+            {turn.run ? <RunActions run={turn.run} busy={running} reason={reason} setReason={setReason} onAct={actOn} /> : null}
             {turn.steps?.length ? (
               <ul className="mt-3 flex flex-col gap-2">
                 {[...turn.steps].reverse().map((step, stepIndex) => (
@@ -251,6 +307,112 @@ export function Workbench() {
         {error ? <p className="text-sm text-danger">{error}</p> : null}
       </div>
     </main>
+  );
+}
+
+function speak(run: DurableProjection): string {
+  if (!run.store_state && run.error?.message) return "没写成。网络返回的是记录，要读 body，不能整段拼成文字。查天气或新闻，再发一次就会走搜索。";
+  if (run.store_state === "Completed") return run.reply?.text || "做完了。";
+  if (run.store_state === "Failed") return run.reply?.text || run.error?.message || "这一步失败了。";
+  if (run.store_state === "BlockedUnknown" || run.error?.code === "Unknown_result") return "结果未知，不会自动再请求。";
+  if (run.store_state === "AwaitingApproval" && run.pending_approval?.recorded_decision) return "决定已经记下。点继续才会往下走。";
+  if (run.store_state === "AwaitingApproval") return "要发出请求之前，先等你批准。";
+  if (run.store_state === "Prepared") return "写好了。点开始才会跑。";
+  if (run.store_state === "Running") return "还在跑。这不是又开始一次。";
+  if (run.phase === "generation") return "已经问过 Grok，结果还不知道。不要重发同一句。";
+  if (run.error?.message) return run.error.message;
+  if (run.notice) return run.notice;
+  return "还没有写成可运行的一步。";
+}
+
+function RunActions({
+  run,
+  busy,
+  reason,
+  setReason,
+  onAct,
+}: {
+  run: DurableProjection;
+  busy: boolean;
+  reason: string;
+  setReason: (value: string) => void;
+  onAct: (run: DurableProjection, work: () => Promise<{ projection: DurableProjection | null; error: { message: string } | null }>) => Promise<void>;
+}) {
+  const approval = run.pending_approval;
+  const executionHash = run.execution_hash;
+  const finished = run.store_state === "Completed" || run.store_state === "Failed" || run.store_state === "BlockedUnknown";
+  const unknown = run.error?.code === "Unknown_result";
+  if (finished || unknown || !executionHash) return null;
+  const decided = Boolean(approval?.recorded_decision);
+  if (run.store_state === "Prepared" || (run.store_state === "AwaitingApproval" && decided)) {
+    return (
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void onAct(run, () => resumeDurableRun({ data: { runId: run.run_id, executionHash } }))}
+        className="mt-3 inline-flex min-h-11 items-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-fg disabled:opacity-40"
+      >
+        {decided ? "继续" : "开始"}
+      </button>
+    );
+  }
+  if (run.store_state !== "AwaitingApproval" || !approval) return null;
+  return (
+    <div className="mt-3">
+      <label className="flex flex-col gap-2 text-sm text-fg">
+        拒绝理由
+        <input
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          placeholder="拒绝时要写理由"
+          className="min-h-11 rounded-lg border border-border bg-bg px-3 text-sm text-fg outline-none placeholder:text-muted focus:border-primary"
+        />
+      </label>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() =>
+            void onAct(run, () =>
+              decideDurableApproval({
+                data: {
+                  runId: run.run_id,
+                  executionHash,
+                  seq: approval.seq,
+                  requestHash: approval.request_hash,
+                  callbackId: callbackFor(run.run_id, approval.seq, approval.request_hash, "Approved"),
+                  decision: { tag: "Approved" },
+                },
+              }),
+            )
+          }
+          className="inline-flex min-h-11 items-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-fg disabled:opacity-40"
+        >
+          批准
+        </button>
+        <button
+          type="button"
+          disabled={busy || reason.trim().length === 0}
+          onClick={() =>
+            void onAct(run, () =>
+              decideDurableApproval({
+                data: {
+                  runId: run.run_id,
+                  executionHash,
+                  seq: approval.seq,
+                  requestHash: approval.request_hash,
+                  callbackId: callbackFor(run.run_id, approval.seq, approval.request_hash, "Rejected"),
+                  decision: { tag: "Rejected", reason: reason.trim() },
+                },
+              }),
+            )
+          }
+          className="inline-flex min-h-11 items-center rounded-lg border border-border px-4 text-sm text-fg disabled:opacity-40"
+        >
+          拒绝
+        </button>
+      </div>
+    </div>
   );
 }
 

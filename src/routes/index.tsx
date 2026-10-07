@@ -1,4 +1,4 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { DurableRun } from "@/components/durable-run";
+import { Workbench } from "@/components/workbench";
 
-export const Route = createFileRoute("/")({ component: DurableRun });
+export const Route = createFileRoute("/")({ component: Workbench });
