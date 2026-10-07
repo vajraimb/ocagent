@@ -58,6 +58,16 @@ function lastCode(journal: JournalItem[]): string {
   return "";
 }
 
+// The loop reports "done" even when the model never answered; the timeline
+// knows better, so a run with a model error and no executed step counts as failed.
+function statusOf(result: DeskResult, events: AgentEvent[]): AgentTurnData["status"] {
+  if (result.stopped) return "stopped";
+  if (!result.ok) return "failed";
+  const modelFailed = events.some((event) => event.kind === "model_error");
+  const stepped = events.some((event) => event.kind === "step" || event.kind === "effect");
+  return modelFailed && !stepped ? "failed" : "done";
+}
+
 function isTurn(value: unknown): value is Turn {
   if (!value || typeof value !== "object") return false;
   const turn = value as Partial<Turn>;
@@ -197,16 +207,19 @@ export function Workbench() {
       if (touched.length) setSelected(touched[touched.length - 1] ?? "");
       else setSelected((current) => (nextFiles.some((item) => item.path === current) ? current : ""));
       const added = (result.journal ?? []).slice(journal.length);
-      const status = result.stopped ? "stopped" : result.ok ? "done" : "failed";
-      settle(job, (turn) => ({
-        ...turn,
-        text: result.ok ? result.answer : result.error,
-        status,
-        endedAt: Date.now(),
-        steps: result.steps,
-        code: lastCode(added) || turn.code,
-        touched,
-      }));
+      settle(job, (turn) => {
+        const events = result.events && result.events.length >= turn.events.length ? result.events : turn.events;
+        return {
+          ...turn,
+          text: result.ok ? result.answer : result.error,
+          status: statusOf(result, events),
+          endedAt: Date.now(),
+          steps: result.steps,
+          code: lastCode(added) || turn.code,
+          touched,
+          events,
+        };
+      });
     },
     [journal.length, settle],
   );

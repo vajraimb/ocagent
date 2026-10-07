@@ -2,15 +2,15 @@ import { createServerFn } from "@tanstack/react-start";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
-import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEventBody, type JobSnapshot } from "./progress.ts";
+import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEvent, type AgentEventBody, type JobSnapshot } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 export type { JournalItem };
 
-export type DeskResult =
-  | { ok: true; answer: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean }
-  | { ok: false; error: string; files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean };
+type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean; events?: AgentEvent[] };
+
+export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
 export type DeskSnapshot = JobSnapshot<DeskResult>;
 
@@ -464,8 +464,11 @@ export const runDesk = createServerFn({ method: "POST" })
       signal: controller.signal,
       emit: jobId ? (event) => deskProgress.emit(jobId, event) : undefined,
     });
-    if (jobId) deskProgress.close(jobId, result, result.ok);
-    return result;
+    if (!jobId) return result;
+    // The answer carries the whole timeline too, so a page that could not
+    // poll (or polled too slowly for a quick run) still shows the process.
+    deskProgress.close(jobId, result, result.ok);
+    return { ...result, events: deskProgress.read(jobId).events };
   });
 
 function readJobInput(input: unknown): { jobId: string; after: number } {
