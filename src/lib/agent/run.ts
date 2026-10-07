@@ -4,7 +4,7 @@ import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
 import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEvent, type AgentEventBody, type JobSnapshot } from "./progress.ts";
 import { searchWeb } from "./search.ts";
-import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
+import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
 
@@ -250,13 +250,14 @@ export function parseDeskInput(input: unknown): DeskInput | { error: string } {
   const jobId = isJobId(rawJob) ? rawJob : null;
   const rawFiles = "files" in input && Array.isArray(input.files) ? input.files : null;
   if (!task || task.length > MAX_TASK) return { error: "先写一句要做的事，别超过一千字。" };
-  if (!rawFiles || rawFiles.length > 24) return { error: "工作区文件不对。" };
+  if (!rawFiles) return { error: "请求里没有工作区。" };
+  if (rawFiles.length > MAX_FILES) return { error: `工作区里有 ${rawFiles.length} 个文件，一次最多带 ${MAX_FILES} 个。` };
   const files: DeskFile[] = [];
   for (const file of rawFiles) {
     if (!file || typeof file !== "object") return { error: "工作区文件不对。" };
     const path = "path" in file && typeof file.path === "string" ? file.path : "";
     const content = "content" in file && typeof file.content === "string" ? file.content : "";
-    if (!safePath(path) || content.length > 8000) return { error: `不能收下 ${path || "这个文件"}。` };
+    if (!safePath(path)) return { error: `不能收下 ${path || "这个文件"}。` };
     files.push({ path, content });
   }
   const harnesses = normalizeHarnesses("harnesses" in input ? input.harnesses : undefined);
@@ -385,12 +386,15 @@ export async function runDeskLoop(
       { signal: deps.signal },
     );
     const carried = {
-      files: result.files,
-      steps: result.steps,
-      modules: result.modules,
-      journal: result.journal,
-      memory: result.memory,
+      files: Array.isArray(result?.files) ? result.files : files,
+      steps: Array.isArray(result?.steps) ? result.steps : [],
+      modules: Array.isArray(result?.modules) ? result.modules : modules,
+      journal: Array.isArray(result?.journal) ? result.journal : journal,
+      memory: typeof result?.memory === "string" ? result.memory : memory,
     };
+    if (!result || (result.status !== "error" && result.status !== "stopped" && result.status !== "done")) {
+      return { ok: false, error: "循环没有留下结果。", ...carried };
+    }
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
     return { ok: true, answer: presentAnswer(task, result.answer), ...carried };

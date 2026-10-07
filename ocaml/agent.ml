@@ -435,7 +435,6 @@ let module_name_of path =
 
 let harness_problem body =
   if body = "" then Some "文件是空的。"
-  else if String.length body > 2500 then Some "内容太长。"
   else if contains body "Unix." then Some "不能用 Unix。计时用 Sys.time ()。"
   else if dangerous body || contains body "#" || contains body "open_in" || contains body "open_out" || contains body "Obj." || contains body "Marshal." || contains_word body "call"
   then Some "这个文件不能当 harness。"
@@ -517,7 +516,6 @@ let () =
         let content = assoc "content" args in
         let output =
           if not (safe_path path) then "路径不行"
-          else if String.length content > 8_000 then "内容太长"
           else (
             files := replace !files path content;
             "写好了 " ^ path)
@@ -644,8 +642,7 @@ let () =
          hints
   in
   let reject path content =
-    if String.length content > 8000 then Some (path ^ " 超过 8000 字，装不进 harness。")
-    else if hostile content then Some (path ^ " 里有禁止的调用，装不进 harness。")
+    if hostile content then Some (path ^ " 里有禁止的调用，装不进 harness。")
     else if stock path then None
     else
       match module_name_of path with

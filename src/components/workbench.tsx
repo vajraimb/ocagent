@@ -78,6 +78,20 @@ function isTurn(value: unknown): value is Turn {
   return Array.isArray(agent.events) && Array.isArray(agent.steps) && Array.isArray(agent.touched) && typeof agent.status === "string";
 }
 
+function tasksOf(turns: Turn[]): Turn[][] {
+  const groups: Turn[][] = [];
+  for (let i = 0; i < turns.length; i += 1) {
+    const turn = turns[i];
+    if (!turn) continue;
+    const next = turns[i + 1];
+    if (turn.role === "user" && next?.role === "agent") {
+      groups.push([turn, next]);
+      i += 1;
+    } else groups.push([turn]);
+  }
+  return groups.reverse();
+}
+
 function fromLegacy(turns: LegacyTurn[]): Turn[] {
   const base = Date.now() - turns.length * 1000;
   return turns.flatMap((turn, index): Turn[] => {
@@ -100,9 +114,8 @@ export function Workbench() {
   const [active, setActive] = useState<ActiveJob | null>(null);
   const [ready, setReady] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [examplesOpen, setExamplesOpen] = useState(false);
   const finished = useRef(new Set<string>());
-  const stick = useRef(true);
-  const bottom = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const running = active !== null;
 
@@ -166,19 +179,6 @@ export function Workbench() {
     }
   }, [ready, files, harnesses, modules, journal, memory, turns]);
 
-  useEffect(() => {
-    const onScroll = () => {
-      stick.current = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 160;
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-
-  useEffect(() => {
-    if (!ready || !stick.current) return;
-    bottom.current?.scrollIntoView({ block: "end" });
-  }, [ready, turns]);
-
   const patchTurn = useCallback((turnId: string, patch: (turn: AgentTurnData) => AgentTurnData) => {
     setTurns((current) => current.map((turn) => (turn.id === turnId && turn.role === "agent" ? patch(turn) : turn)));
   }, []);
@@ -196,8 +196,17 @@ export function Workbench() {
   );
 
   const finish = useCallback(
-    (job: ActiveJob, result: DeskResult) => {
+    (job: ActiveJob, result: DeskResult | null | undefined) => {
       if (finished.current.has(job.jobId)) return;
+      if (!result || !Array.isArray(result.files) || !Array.isArray(result.steps)) {
+        settle(job, (turn) => ({
+          ...turn,
+          status: "failed",
+          endedAt: Date.now(),
+          text: "结果没有完整传回来。上面的过程还在，可以再发一次。",
+        }));
+        return;
+      }
       const nextFiles = result.files.filter(keepFile);
       setFiles(nextFiles);
       if (result.journal) setJournal(result.journal);
@@ -270,12 +279,11 @@ export function Workbench() {
       { id: job.turnId, role: "agent", text: "", at, status: "running", jobId: job.jobId, events: [], steps: [], touched: [] },
     ]);
     setTask("");
-    stick.current = true;
     localStorage.setItem(ACTIVE_KEY, JSON.stringify({ jobId: job.jobId, turnId: job.turnId }));
     setActive(job);
     try {
       const result = await runDesk({ data: { task: text, files, harnesses, modules, journal, memory, jobId: job.jobId } });
-      finish(job, result);
+      finish(job, result ?? null);
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "没跑成";
       finish(job, { ok: false, error: message, files, steps: [], modules, journal, memory });
@@ -319,77 +327,29 @@ export function Workbench() {
   }
 
   const enabled = CATALOG.filter((item) => item.id === "ocaml" || harnesses.includes(item.id)).map((item) => item.name);
+  const showExamples = turns.length === 0;
 
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[minmax(0,1fr)_21rem]">
       <main className="flex min-h-screen min-w-0 flex-col">
-        <header className="sticky top-0 z-20 border-b border-border bg-bg/90 backdrop-blur">
-          <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-4 py-3">
-            <div className="min-w-0">
-              <p className="font-mono text-xs tracking-widest text-muted">OCAGENT</p>
-              <h1 className="truncate text-base font-semibold text-fg">用 OCaml 行动的 agent</h1>
-            </div>
-            <button
-              type="button"
-              onClick={() => setPanelOpen(true)}
-              className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm text-fg lg:hidden"
-            >
-              <PanelRight className="h-4 w-4" aria-hidden />
-              工作区{files.length ? <span className="font-mono text-xs text-muted">{files.length}</span> : null}
-            </button>
-          </div>
-        </header>
-
-        <section className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-5 px-4 py-5">
-          {ready && turns.length === 0 ? (
-            <div className="flex flex-1 flex-col justify-center gap-6 py-6">
-              <div>
-                <h2 className="text-2xl font-semibold text-fg">说一件事，它去做。</h2>
-                <p className="mt-2 max-w-xl text-sm leading-6 text-muted">每一步都写成一段 OCaml，编译通过才执行；搜了什么、写了什么、下一步为什么继续，都会实时显示在这里。</p>
+        <div className="sticky top-0 z-20 border-b border-border bg-bg/95 backdrop-blur">
+          <header>
+            <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-4 py-3">
+              <div className="min-w-0">
+                <p className="font-mono text-xs tracking-widest text-muted">OCAGENT</p>
+                <h1 className="truncate text-base font-semibold text-fg">用 OCaml 行动的 agent</h1>
               </div>
-              <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                {ABILITIES.map((item) => (
-                  <li key={item.title} className="rounded-xl border border-border bg-surface px-3 py-3">
-                    <item.icon className="h-4 w-4 text-muted" aria-hidden />
-                    <p className="mt-2 text-sm font-medium text-fg">{item.title}</p>
-                    <p className="mt-0.5 text-xs leading-5 text-muted">{item.body}</p>
-                  </li>
-                ))}
-              </ul>
-              <div>
-                <p className="font-mono text-xs tracking-widest text-muted">试试</p>
-                <div className="mt-2 flex flex-col gap-2">
-                  {EXAMPLES.map((item) => (
-                    <button
-                      key={item.text}
-                      type="button"
-                      onClick={() => void go(item.text)}
-                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-surface px-3 text-left text-sm text-fg hover:border-primary"
-                    >
-                      <item.icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-                      <span className="min-w-0 flex-1">{item.text}</span>
-                      <ArrowUp className="h-3.5 w-3.5 shrink-0 rotate-45 text-muted" aria-hidden />
-                    </button>
-                  ))}
-                </div>
-              </div>
+              <button
+                type="button"
+                onClick={() => setPanelOpen(true)}
+                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-border px-3 text-sm text-fg lg:hidden"
+              >
+                <PanelRight className="h-4 w-4" aria-hidden />
+                工作区{files.length ? <span className="font-mono text-xs text-muted">{files.length}</span> : null}
+              </button>
             </div>
-          ) : null}
-
-          {turns.map((turn) =>
-            turn.role === "user" ? (
-              <article key={turn.id} className="ml-10 select-text self-end rounded-2xl bg-raised px-4 py-3">
-                <p className="whitespace-pre-wrap text-[15px] leading-7 text-fg">{turn.text}</p>
-              </article>
-            ) : (
-              <AgentTurn key={turn.id} turn={turn} onOpenFile={openFile} />
-            ),
-          )}
-          <div ref={bottom} />
-        </section>
-
-        <footer className="sticky bottom-0 z-20 border-t border-border bg-bg/95 backdrop-blur">
-          <div className="mx-auto w-full max-w-3xl px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3">
+          </header>
+          <div className="mx-auto w-full max-w-3xl px-4 pb-3">
             <div className="flex items-end gap-2 rounded-2xl border border-border bg-surface p-2 focus-within:border-primary">
               <label className="min-w-0 flex-1">
                 <span className="sr-only">对它说</span>
@@ -398,7 +358,7 @@ export function Workbench() {
                   value={task}
                   onChange={(event) => setTask(event.target.value)}
                   onKeyDown={onKey}
-                  rows={Math.min(6, Math.max(1, task.split("\n").length))}
+                  rows={Math.min(6, Math.max(2, task.split("\n").length))}
                   placeholder={running ? "它还在做，做完再说下一件。" : "说一件要做完的事"}
                   disabled={running}
                   className="block w-full resize-none select-text bg-transparent px-2 py-2 text-[15px] leading-6 text-fg outline-none placeholder:text-muted disabled:opacity-60"
@@ -420,9 +380,98 @@ export function Workbench() {
                 </button>
               )}
             </div>
-            <p className="mt-1.5 truncate px-1 text-xs text-muted">开着：{enabled.join(" · ")}</p>
+            <div className="mt-1.5 flex items-center justify-between gap-3 px-1">
+              <p className="min-w-0 truncate text-xs text-muted">开着：{enabled.join(" · ")}</p>
+              {turns.length > 0 ? (
+                <button type="button" onClick={() => setExamplesOpen((open) => !open)} className="shrink-0 text-xs text-fg">
+                  {examplesOpen ? "收起示例" : "试试"}
+                </button>
+              ) : null}
+            </div>
+            {turns.length > 0 && examplesOpen ? (
+              <div className="mt-3 flex max-h-[40vh] flex-col gap-3 overflow-y-auto pb-1">
+                <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {ABILITIES.map((item) => (
+                    <li key={item.title} className="rounded-xl border border-border bg-surface px-3 py-3">
+                      <item.icon className="h-4 w-4 text-muted" aria-hidden />
+                      <p className="mt-2 text-sm font-medium text-fg">{item.title}</p>
+                      <p className="mt-0.5 text-xs leading-5 text-muted">{item.body}</p>
+                    </li>
+                  ))}
+                </ul>
+                <div className="flex flex-col gap-2">
+                  {EXAMPLES.map((item) => (
+                    <button
+                      key={item.text}
+                      type="button"
+                      disabled={running}
+                      onClick={() => void go(item.text)}
+                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-bg px-3 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
+                    >
+                      <item.icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+                      <span className="min-w-0 flex-1">{item.text}</span>
+                      <ArrowUp className="h-3.5 w-3.5 shrink-0 rotate-45 text-muted" aria-hidden />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </div>
-        </footer>
+        </div>
+
+        <section className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-5 px-4 py-5">
+          {ready && showExamples ? (
+            <div className={turns.length === 0 ? "flex flex-1 flex-col justify-center gap-6 py-6" : "flex flex-col gap-4"}>
+              {turns.length === 0 ? (
+                <div>
+                  <h2 className="text-2xl font-semibold text-fg">说一件事，它去做。</h2>
+                  <p className="mt-2 max-w-xl text-sm leading-6 text-muted">每一步都写成一段 OCaml，编译通过才执行；搜了什么、写了什么、下一步为什么继续，都会实时显示在这里。</p>
+                </div>
+              ) : null}
+              <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {ABILITIES.map((item) => (
+                  <li key={item.title} className="rounded-xl border border-border bg-surface px-3 py-3">
+                    <item.icon className="h-4 w-4 text-muted" aria-hidden />
+                    <p className="mt-2 text-sm font-medium text-fg">{item.title}</p>
+                    <p className="mt-0.5 text-xs leading-5 text-muted">{item.body}</p>
+                  </li>
+                ))}
+              </ul>
+              <div>
+                <p className="font-mono text-xs tracking-widest text-muted">试试</p>
+                <div className="mt-2 flex flex-col gap-2">
+                  {EXAMPLES.map((item) => (
+                    <button
+                      key={item.text}
+                      type="button"
+                      disabled={running}
+                      onClick={() => void go(item.text)}
+                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-surface px-3 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
+                    >
+                      <item.icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
+                      <span className="min-w-0 flex-1">{item.text}</span>
+                      <ArrowUp className="h-3.5 w-3.5 shrink-0 rotate-45 text-muted" aria-hidden />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {tasksOf(turns).map((taskTurns) => (
+            <div key={taskTurns[0]?.id} className="flex flex-col gap-5">
+              {taskTurns.map((turn) =>
+                turn.role === "user" ? (
+                  <article key={turn.id} className="ml-10 select-text self-end rounded-2xl bg-raised px-4 py-3">
+                    <p className="whitespace-pre-wrap text-[15px] leading-7 text-fg">{turn.text}</p>
+                  </article>
+                ) : (
+                  <AgentTurn key={turn.id} turn={turn} onOpenFile={openFile} />
+                ),
+              )}
+            </div>
+          ))}
+        </section>
       </main>
 
       <aside className="hidden border-l border-border bg-bg lg:block">

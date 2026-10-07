@@ -817,7 +817,6 @@ module Files = struct
     let result =
       if not files_on then Error "文件没开"
       else if not (safe_rel path) then Error "路径不行"
-      else if String.length content > 8000 then Error "内容太长"
       else (
         mkdir_p (Filename.dirname path);
         let oc = open_out path in
@@ -910,7 +909,7 @@ async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Prom
     else if (entry.isFile()) {
       try {
         const content = await readFile(abs, "utf8");
-        if (!content.includes("\u0000") && content.length <= 8000) out.push({ path: rel, content });
+        if (!content.includes("\u0000")) out.push({ path: rel, content });
       } catch {
         /* skip unreadable files */
       }

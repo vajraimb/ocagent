@@ -10,8 +10,7 @@ export type JournalItem = { kind: string; text: string };
 
 export const SEED: DeskFile[] = [];
 
-const MAX_FILES = 24;
-const MAX_CONTENT = 8000;
+export const MAX_FILES = 80;
 
 export function safePath(path: string): boolean {
   if (!path || path.length > 80) return false;
@@ -52,7 +51,6 @@ export function applyTool(
     const path = stringArg(args, "path");
     const content = stringArg(args, "content");
     if (!safePath(path)) return { files, detail: path || "路径", output: "路径不行" };
-    if (content.length > MAX_CONTENT) return { files, detail: path, output: "内容太长" };
     const next = files.filter((file) => file.path !== path);
     if (!files.some((file) => file.path === path) && next.length >= MAX_FILES) {
       return { files, detail: path, output: "文件数量到顶了" };

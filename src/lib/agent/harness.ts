@@ -141,7 +141,7 @@ export function checkModule(name: string, body: string): DeskModule | null {
   const moduleName = name.trim();
   const source = body.trim();
   if (!MODULE_NAME.test(moduleName) || RESERVED.has(moduleName)) return null;
-  if (!source || source.length > 8000 || BANNED.test(source)) return null;
+  if (!source || BANNED.test(source)) return null;
   return { name: moduleName, body: source };
 }
 
