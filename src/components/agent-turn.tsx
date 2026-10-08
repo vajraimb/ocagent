@@ -23,7 +23,7 @@ import {
 import { foldRounds, type AgentEvent, type Round } from "@/lib/agent/progress";
 import type { ToolStep } from "@/lib/agent/workspace";
 
-export type AgentStatus = "running" | "done" | "failed" | "stopped";
+export type AgentStatus = "running" | "done" | "failed" | "stopped" | "paused";
 
 export type AgentTurnData = {
   id: string;
@@ -71,17 +71,26 @@ export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnDat
   const showProcess = running || open;
   const elapsed = seconds(turn.at, running ? now : (turn.endedAt ?? turn.at));
   const current = rounds[rounds.length - 1];
+  const dropped = turn.events.flatMap((event) => (event.kind === "module_dropped" ? [event] : []));
+  const lastTrouble = !running && turn.status !== "done" ? troubleOf(current) : "";
 
   return (
     <article className="select-text">
       <header className="flex items-center gap-2 text-xs">
-        <span className={`inline-block h-2 w-2 rounded-full ${running ? "animate-pulse bg-accent" : turn.status === "failed" ? "bg-danger" : "bg-muted"}`} />
+        <span className={`inline-block h-2 w-2 rounded-full ${running ? "animate-pulse bg-accent" : turn.status === "failed" ? "bg-danger" : turn.status === "paused" ? "bg-warn" : "bg-muted"}`} />
         <span className="font-mono tracking-widest text-muted">OCAGENT</span>
         <span className="text-muted">·</span>
         <span className="text-muted">{statusLine(turn.status, current, elapsed)}</span>
       </header>
 
       <div className="mt-2 rounded-2xl border border-border bg-surface">
+        {dropped.length > 0 ? (
+          <div className="flex flex-col gap-1.5 border-b border-border px-4 py-3">
+            {dropped.map((gone) => (
+              <Row key={gone.name} icon={<Blocks className="h-3.5 w-3.5" aria-hidden />} label={`这次没带上 ${gone.name}：它现在编译不过`} detail={gone.reason} tone="warn" />
+            ))}
+          </div>
+        ) : null}
         {hasProcess && showProcess ? (
           <div className="border-b border-border px-4 py-3">
             {rounds.length > 0 ? <Timeline rounds={rounds} running={running} /> : <LegacySteps steps={turn.steps} />}
@@ -95,7 +104,12 @@ export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnDat
         ) : null}
 
         {!running && turn.text ? (
-          <p className={`whitespace-pre-wrap px-4 py-3 text-[15px] leading-7 ${turn.status === "failed" ? "text-danger" : "text-fg"}`}>{clean(turn.text)}</p>
+          <div className="px-4 py-3">
+            <p className={`whitespace-pre-wrap text-[15px] leading-7 ${turn.status === "failed" ? "text-danger" : "text-fg"}`}>{clean(turn.text)}</p>
+            {lastTrouble && !turn.text.includes(lastTrouble.slice(0, 40)) ? (
+              <p className="mt-1.5 whitespace-pre-wrap break-words font-mono text-xs leading-5 text-muted">最近一次出错：{lastTrouble}</p>
+            ) : null}
+          </div>
         ) : null}
 
         {!running && (turn.touched.length > 0 || hasProcess || onContinue) ? (
@@ -145,7 +159,14 @@ function statusLine(status: AgentStatus, current: Round | undefined, elapsed: st
   }
   if (status === "failed") return "没做成";
   if (status === "stopped") return "已停下";
+  if (status === "paused") return "没做完";
   return "完成";
+}
+
+// The last round's error, for a turn that ended without an answer.
+function troubleOf(current: Round | undefined): string {
+  if (!current) return "";
+  return (current.compileError || current.modelError || "").trim().slice(0, 300);
 }
 
 function Timeline({ rounds, running }: { rounds: Round[]; running: boolean }) {

@@ -20,7 +20,10 @@ type Saved = {
 };
 
 type LegacyTurn = { role: "user" | "agent"; text: string; code?: string; steps?: ToolStep[] };
-type ActiveJob = { jobId: string; turnId: string; resumed: boolean };
+// One request to the server. A long task is several of these in a row
+// (segments): the server pauses when its time budget runs out and the page
+// starts the next segment with the carried journal, under the same turn.
+type ActiveJob = { jobId: string; turnId: string; resumed: boolean; task: string; segment: number; roundBase: number; eventsBefore: number };
 
 const STORAGE_KEY = "ocagent-desk-v7";
 const LEGACY_KEYS = ["ocagent-desk-v6", "ocagent-desk-v5"];
@@ -28,6 +31,7 @@ const ACTIVE_KEY = "ocagent-active-job";
 const PREFAB = new Set(["README.md", "src/math.ml", "src/greet.ml", "notes/todo.md"]);
 const MAX_TURNS = 40;
 const MAX_EVENTS_SAVED = 80;
+const MAX_SEGMENTS = 6;
 
 const EXAMPLES = [
   { icon: Search, text: "查一下东京现在的天气，用一句话告诉我。" },
@@ -47,9 +51,59 @@ const CONTINUE_TEXT = "接着上一次没做完的继续做，先看看工作区
 
 // The newest agent turn that stopped short of an answer gets a one-tap follow-up.
 function unfinished(turn: AgentTurnData): boolean {
-  if (turn.status === "stopped" || turn.status === "failed") return true;
+  if (turn.status === "stopped" || turn.status === "failed" || turn.status === "paused") return true;
   const rounds = foldRounds(turn.events);
   return rounds[rounds.length - 1]?.reply?.kind === "partial";
+}
+
+// Rounds of a later segment continue the numbering of the earlier ones.
+function shiftRounds(events: AgentEvent[], base: number): AgentEvent[] {
+  if (!base) return events;
+  return events.map((event) => ("round" in event ? { ...event, round: event.round + base } : event));
+}
+
+function lastRound(events: AgentEvent[]): number {
+  let max = 0;
+  for (const event of events) if ("round" in event && event.round > max) max = event.round;
+  return max;
+}
+
+function readActive(raw: string | null): ActiveJob | null {
+  if (!raw) return null;
+  const parsed = JSON.parse(raw) as Partial<ActiveJob>;
+  if (typeof parsed.jobId !== "string" || typeof parsed.turnId !== "string") return null;
+  return {
+    jobId: parsed.jobId,
+    turnId: parsed.turnId,
+    resumed: true,
+    task: typeof parsed.task === "string" ? parsed.task : "",
+    segment: typeof parsed.segment === "number" ? parsed.segment : 1,
+    roundBase: typeof parsed.roundBase === "number" ? parsed.roundBase : 0,
+    eventsBefore: typeof parsed.eventsBefore === "number" ? parsed.eventsBefore : 0,
+  };
+}
+
+function isDeskResult(value: unknown): value is DeskResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<DeskResult>;
+  return typeof result.ok === "boolean" && Array.isArray(result.files) && Array.isArray(result.steps);
+}
+
+// What came back was not a desk result at all: typically a gateway error page
+// after a connection timed out. Say so, with whatever it did say.
+function brokenReplyText(result: unknown, startedAt: number): string {
+  const seconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+  let said = "";
+  if (result && typeof result === "object") {
+    for (const key of ["error", "message", "detail"]) {
+      const value = (result as Record<string, unknown>)[key];
+      if (typeof value === "string" && value.trim()) {
+        said = value.trim().slice(0, 200);
+        break;
+      }
+    }
+  }
+  return `连接在 ${seconds} 秒后断开了，结果没有完整传回来${said ? `（对方说：${said}）` : ""}。上面的过程还在，工作区里写好的也还在；点「接着做」会从那里继续。`;
 }
 
 function keepFile(file: DeskFile): boolean {
@@ -72,6 +126,7 @@ function lastCode(journal: JournalItem[]): string {
 // knows better, so a run with a model error and no executed step counts as failed.
 function statusOf(result: DeskResult, events: AgentEvent[]): AgentTurnData["status"] {
   if (result.stopped) return "stopped";
+  if (result.paused) return "paused";
   if (!result.ok) return "failed";
   const modelFailed = events.some((event) => event.kind === "model_error");
   const stepped = events.some((event) => event.kind === "step" || event.kind === "effect");
@@ -126,6 +181,9 @@ export function Workbench() {
   const [panelOpen, setPanelOpen] = useState(false);
   const [examplesOpen, setExamplesOpen] = useState(false);
   const finished = useRef(new Set<string>());
+  // The running turn's event log, kept outside React state so the poll loop
+  // and segment hand-offs read what was actually appended, not a stale render.
+  const logs = useRef(new Map<string, AgentEvent[]>());
   const input = useRef<HTMLTextAreaElement>(null);
   const running = active !== null;
 
@@ -145,7 +203,11 @@ export function Workbench() {
         }
         if (Array.isArray(saved.journal)) setJournal(saved.journal);
         if (typeof saved.memory === "string") setMemory(saved.memory);
-        if (Array.isArray(saved.turns)) setTurns(saved.turns.filter(isTurn));
+        if (Array.isArray(saved.turns)) {
+          const kept = saved.turns.filter(isTurn);
+          setTurns(kept);
+          for (const turn of kept) if (turn.role === "agent" && turn.status === "running") logs.current.set(turn.id, turn.events);
+        }
       } else {
         for (const key of LEGACY_KEYS) {
           const legacy = localStorage.getItem(key);
@@ -165,12 +227,9 @@ export function Workbench() {
           break;
         }
       }
-      const live = localStorage.getItem(ACTIVE_KEY);
-      if (live) {
-        const parsed = JSON.parse(live) as Partial<ActiveJob>;
-        if (typeof parsed.jobId === "string" && typeof parsed.turnId === "string") setActive({ jobId: parsed.jobId, turnId: parsed.turnId, resumed: true });
-        else localStorage.removeItem(ACTIVE_KEY);
-      }
+      const live = readActive(localStorage.getItem(ACTIVE_KEY));
+      if (live) setActive(live);
+      else localStorage.removeItem(ACTIVE_KEY);
     } catch {
       localStorage.removeItem(STORAGE_KEY);
       localStorage.removeItem(ACTIVE_KEY);
@@ -193,6 +252,14 @@ export function Workbench() {
     setTurns((current) => current.map((turn) => (turn.id === turnId && turn.role === "agent" ? patch(turn) : turn)));
   }, []);
 
+  const setLog = useCallback(
+    (turnId: string, events: AgentEvent[]) => {
+      logs.current.set(turnId, events);
+      patchTurn(turnId, (turn) => ({ ...turn, events }));
+    },
+    [patchTurn],
+  );
+
   const settle = useCallback(
     (job: ActiveJob, patch: (turn: AgentTurnData) => AgentTurnData): boolean => {
       if (finished.current.has(job.jobId)) return false;
@@ -205,18 +272,35 @@ export function Workbench() {
     [patchTurn],
   );
 
+  // startSegment and finish call each other (a paused segment starts the next
+  // one), so finish is reached through a ref.
+  const finishRef = useRef<(job: ActiveJob, result: unknown) => void>(() => {});
+
+  const startSegment = useCallback(
+    async (job: ActiveJob, input: { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string }) => {
+      localStorage.setItem(ACTIVE_KEY, JSON.stringify(job));
+      setActive(job);
+      try {
+        const result = await runDesk({ data: { ...input, jobId: job.jobId } });
+        finishRef.current(job, result ?? null);
+      } catch (caught) {
+        // A thrown string or a bare object is the gateway talking, not the desk.
+        if (caught instanceof Error && caught.message.trim()) {
+          finishRef.current(job, { ok: false, error: caught.message, files: input.files, steps: [], modules: input.modules, journal: input.journal, memory: input.memory });
+        } else finishRef.current(job, typeof caught === "string" ? { error: caught } : caught);
+      }
+    },
+    [],
+  );
+
   const finish = useCallback(
-    (job: ActiveJob, result: DeskResult | null | undefined) => {
+    (job: ActiveJob, raw: unknown) => {
       if (finished.current.has(job.jobId)) return;
-      if (!result || !Array.isArray(result.files) || !Array.isArray(result.steps)) {
-        settle(job, (turn) => ({
-          ...turn,
-          status: "failed",
-          endedAt: Date.now(),
-          text: "结果没有完整传回来。上面的过程还在，可以再发一次。",
-        }));
+      if (!isDeskResult(raw)) {
+        settle(job, (turn) => ({ ...turn, status: "failed", endedAt: Date.now(), text: brokenReplyText(raw, turn.at) }));
         return;
       }
+      const result = raw;
       const nextFiles = result.files.filter(keepFile);
       setFiles(nextFiles);
       if (result.journal) setJournal(result.journal);
@@ -226,11 +310,27 @@ export function Workbench() {
       if (touched.length) setSelected(touched[touched.length - 1] ?? "");
       else setSelected((current) => (nextFiles.some((item) => item.path === current) ? current : ""));
       const added = (result.journal ?? []).slice(journal.length);
+      // Prefer the server's full log for this segment over what polling caught,
+      // keeping the earlier segments' events in front of it.
+      const current = logs.current.get(job.turnId) ?? [];
+      const polled = current.slice(job.eventsBefore);
+      const sent = shiftRounds(result.events ?? [], job.roundBase);
+      const events = sent.length >= polled.length ? [...current.slice(0, job.eventsBefore), ...sent] : current;
+      logs.current.set(job.turnId, events);
+      const carryOn = result.paused && job.segment < MAX_SEGMENTS && job.task.trim().length > 0;
+      if (carryOn) {
+        finished.current.add(job.jobId);
+        patchTurn(job.turnId, (turn) => ({ ...turn, events, steps: result.steps, touched }));
+        const next: ActiveJob = { jobId: uid("job"), turnId: job.turnId, resumed: false, task: job.task, segment: job.segment + 1, roundBase: lastRound(events), eventsBefore: events.length };
+        void startSegment(next, { task: job.task, files: nextFiles, harnesses, modules: result.modules ?? [], journal: result.journal ?? [], memory: result.memory ?? "" });
+        return;
+      }
+      logs.current.delete(job.turnId);
       settle(job, (turn) => {
-        const events = result.events && result.events.length >= turn.events.length ? result.events : turn.events;
+        const text = result.ok ? result.answer : result.error;
         return {
           ...turn,
-          text: result.ok ? result.answer : result.error,
+          text: result.paused && job.segment >= MAX_SEGMENTS ? `${text}\n已经连着做了 ${job.segment} 段，先停一下；点「接着做」继续。` : text,
           status: statusOf(result, events),
           endedAt: Date.now(),
           steps: result.steps,
@@ -240,8 +340,9 @@ export function Workbench() {
         };
       });
     },
-    [journal.length, settle],
+    [harnesses, journal.length, patchTurn, settle, startSegment],
   );
+  finishRef.current = finish;
 
   useEffect(() => {
     if (!active) return;
@@ -262,8 +363,8 @@ export function Workbench() {
         }
         if (snapshot.events.length) {
           after = snapshot.events[snapshot.events.length - 1]?.seq ?? after;
-          const fresh: AgentEvent[] = snapshot.events;
-          patchTurn(job.turnId, (turn) => ({ ...turn, events: [...turn.events, ...fresh] }));
+          const fresh = shiftRounds(snapshot.events, job.roundBase);
+          setLog(job.turnId, [...(logs.current.get(job.turnId) ?? []), ...fresh]);
         }
         if (snapshot.done && snapshot.result) finish(job, snapshot.result);
       } catch {
@@ -276,12 +377,12 @@ export function Workbench() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [active, finish, patchTurn, settle]);
+  }, [active, finish, setLog, settle]);
 
   async function go(raw: string) {
     const text = raw.trim();
     if (!text || running) return;
-    const job: ActiveJob = { jobId: uid("job"), turnId: uid("a"), resumed: false };
+    const job: ActiveJob = { jobId: uid("job"), turnId: uid("a"), resumed: false, task: text, segment: 1, roundBase: 0, eventsBefore: 0 };
     const at = Date.now();
     setTurns((current) => [
       ...current,
@@ -289,15 +390,8 @@ export function Workbench() {
       { id: job.turnId, role: "agent", text: "", at, status: "running", jobId: job.jobId, events: [], steps: [], touched: [] },
     ]);
     setTask("");
-    localStorage.setItem(ACTIVE_KEY, JSON.stringify({ jobId: job.jobId, turnId: job.turnId }));
-    setActive(job);
-    try {
-      const result = await runDesk({ data: { task: text, files, harnesses, modules, journal, memory, jobId: job.jobId } });
-      finish(job, result ?? null);
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "没跑成";
-      finish(job, { ok: false, error: message, files, steps: [], modules, journal, memory });
-    }
+    logs.current.set(job.turnId, []);
+    await startSegment(job, { task: text, files, harnesses, modules, journal, memory });
   }
 
   async function stop() {
