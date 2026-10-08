@@ -166,7 +166,7 @@ function statusLine(status: AgentStatus, current: Round | undefined, elapsed: st
 // The last round's error, for a turn that ended without an answer.
 function troubleOf(current: Round | undefined): string {
   if (!current) return "";
-  return (current.compileError || current.modelError || "").trim().slice(0, 300);
+  return (current.runnerError || current.compileError || current.modelError || "").trim().slice(0, 300);
 }
 
 function Timeline({ rounds, running }: { rounds: Round[]; running: boolean }) {
@@ -204,6 +204,7 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
           <Row icon={<LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden />} label="编译并执行" tone="muted" />
         ) : null}
         {round.compileError ? <Row icon={<Hammer className="h-3.5 w-3.5" aria-hidden />} label="编译没过，改一下再来" detail={round.compileError} tone="warn" /> : null}
+        {round.runnerError ? <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label="这一步没跑起来" detail={round.runnerError} tone="danger" /> : null}
         {round.effects.map((effect, index) => (
           <EffectRow key={`${effect.tool}-${index}`} tool={effect.tool} detail={effect.detail} output={effect.output} />
         ))}

@@ -32,6 +32,7 @@ const PREFAB = new Set(["README.md", "src/math.ml", "src/greet.ml", "notes/todo.
 const MAX_TURNS = 40;
 const MAX_EVENTS_SAVED = 80;
 const MAX_SEGMENTS = 6;
+const RECOVER_MS = 120_000;
 
 const EXAMPLES = [
   { icon: Search, text: "查一下东京现在的天气，用一句话告诉我。" },
@@ -128,9 +129,21 @@ function statusOf(result: DeskResult, events: AgentEvent[]): AgentTurnData["stat
   if (result.stopped) return "stopped";
   if (result.paused) return "paused";
   if (!result.ok) return "failed";
-  const modelFailed = events.some((event) => event.kind === "model_error");
+  // Rounds happened but no step ever ran to completion: whatever text came
+  // back is an error the loop relayed, not an answer.
+  const rounds = events.some((event) => event.kind === "think");
   const stepped = events.some((event) => event.kind === "step" || event.kind === "effect");
-  return modelFailed && !stepped ? "failed" : "done";
+  return rounds && !stepped ? "failed" : "done";
+}
+
+function progressed(events: AgentEvent[]): boolean {
+  return events.some((event) => event.kind === "step" || event.kind === "effect");
+}
+
+// fetch() failed before any response: the connection dropped (phone locked,
+// network changed, gateway reset). The server may well still be running.
+function isConnectionLoss(caught: unknown): boolean {
+  return caught instanceof TypeError || (caught instanceof Error && /load failed|failed to fetch|network/i.test(caught.message));
 }
 
 function isTurn(value: unknown): value is Turn {
@@ -184,6 +197,9 @@ export function Workbench() {
   // The running turn's event log, kept outside React state so the poll loop
   // and segment hand-offs read what was actually appended, not a stale render.
   const logs = useRef(new Map<string, AgentEvent[]>());
+  // Jobs whose request died mid-flight; polling keeps looking for their result
+  // until the deadline, then the turn is marked failed with this message.
+  const recovering = useRef(new Map<string, { until: number; message: string }>());
   const input = useRef<HTMLTextAreaElement>(null);
   const running = active !== null;
 
@@ -264,6 +280,7 @@ export function Workbench() {
     (job: ActiveJob, patch: (turn: AgentTurnData) => AgentTurnData): boolean => {
       if (finished.current.has(job.jobId)) return false;
       finished.current.add(job.jobId);
+      recovering.current.delete(job.jobId);
       patchTurn(job.turnId, patch);
       setActive((current) => (current?.jobId === job.jobId ? null : current));
       localStorage.removeItem(ACTIVE_KEY);
@@ -284,6 +301,12 @@ export function Workbench() {
         const result = await runDesk({ data: { ...input, jobId: job.jobId } });
         finishRef.current(job, result ?? null);
       } catch (caught) {
+        if (isConnectionLoss(caught)) {
+          // Keep polling: the server is likely still working and will hold the result.
+          const said = caught instanceof Error ? caught.message : String(caught);
+          recovering.current.set(job.jobId, { until: Date.now() + RECOVER_MS, message: `连接断开了（${said}），之后也没等到结果。工作区里写好的都还在；点「接着做」会从那里继续。` });
+          return;
+        }
         // A thrown string or a bare object is the gateway talking, not the desk.
         if (caught instanceof Error && caught.message.trim()) {
           finishRef.current(job, { ok: false, error: caught.message, files: input.files, steps: [], modules: input.modules, journal: input.journal, memory: input.memory });
@@ -317,7 +340,9 @@ export function Workbench() {
       const sent = shiftRounds(result.events ?? [], job.roundBase);
       const events = sent.length >= polled.length ? [...current.slice(0, job.eventsBefore), ...sent] : current;
       logs.current.set(job.turnId, events);
-      const carryOn = result.paused && job.segment < MAX_SEGMENTS && job.task.trim().length > 0;
+      // Carry on only if this segment got somewhere; a segment that spent its
+      // whole budget without one completed step would just spin again.
+      const carryOn = result.paused && job.segment < MAX_SEGMENTS && job.task.trim().length > 0 && progressed(sent);
       if (carryOn) {
         finished.current.add(job.jobId);
         patchTurn(job.turnId, (turn) => ({ ...turn, events, steps: result.steps, touched }));
@@ -350,17 +375,26 @@ export function Workbench() {
     let after = 0;
     let cancelled = false;
     let misses = 0;
+    const giveUp = (text: string) => {
+      recovering.current.delete(job.jobId);
+      settle(job, (turn) => ({ ...turn, status: "failed", endedAt: Date.now(), text }));
+    };
     const tick = async () => {
+      const lost = recovering.current.get(job.jobId);
+      if (lost && Date.now() > lost.until) {
+        giveUp(lost.message);
+        return;
+      }
       try {
         const snapshot = await pollDesk({ data: { jobId: job.jobId, after } });
         if (cancelled) return;
         if (!snapshot.found) {
           misses += 1;
-          if (job.resumed && misses >= 2) {
-            settle(job, (turn) => ({ ...turn, status: "failed", endedAt: Date.now(), text: "页面刷新后，服务器已经不记得这次运行了。再发一次就好。" }));
-          }
+          if (job.resumed && misses >= 2) giveUp("页面刷新后，服务器已经不记得这次运行了。再发一次就好。");
+          else if (lost && misses >= 4) giveUp(lost.message);
           return;
         }
+        misses = 0;
         if (snapshot.events.length) {
           after = snapshot.events[snapshot.events.length - 1]?.seq ?? after;
           const fresh = shiftRounds(snapshot.events, job.roundBase);
