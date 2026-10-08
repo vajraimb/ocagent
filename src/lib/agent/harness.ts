@@ -167,7 +167,8 @@ export const MAX_MODULES = 6;
 // "src/fib_fast.ml" → "Fib_fast", the way the loop names a claimed file.
 export function moduleNameFor(path: string): string | null {
   const base = path.split("/").pop() ?? "";
-  const stem = base.endsWith(".ml") ? base.slice(0, -3) : base;
+  if (!base.endsWith(".ml")) return null;
+  const stem = base.slice(0, -3);
   if (!stem) return null;
   const name = stem[0]!.toUpperCase() + stem.slice(1);
   return MODULE_NAME.test(name) && !RESERVED.has(name) ? name : null;

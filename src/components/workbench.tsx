@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { ArrowUp, FilePen, Globe, PanelRight, Play, Search, Square } from "lucide-react";
+import { ArrowUp, Blocks, FilePen, Globe, PackagePlus, PanelRight, Play, Search, Square } from "lucide-react";
 import { AgentTurn, type AgentTurnData } from "@/components/agent-turn";
 import { SidePanel } from "@/components/side-panel";
-import { CATALOG, DEFAULT_HARNESSES, checkModule, isHarnessId, type DeskModule, type HarnessId } from "@/lib/agent/harness";
-import type { AgentEvent } from "@/lib/agent/progress";
-import { pollDesk, runDesk, stopDesk, type DeskResult } from "@/lib/agent/run";
+import { CATALOG, DEFAULT_HARNESSES, MAX_MODULES, checkModule, isHarnessId, moduleNameFor, type DeskModule, type HarnessId } from "@/lib/agent/harness";
+import { foldRounds, type AgentEvent } from "@/lib/agent/progress";
+import { installModule, pollDesk, runDesk, stopDesk, type DeskResult } from "@/lib/agent/run";
 import type { DeskFile, JournalItem, ToolStep } from "@/lib/agent/workspace";
 
 type UserTurn = { id: string; role: "user"; text: string; at: number };
@@ -31,16 +31,26 @@ const MAX_EVENTS_SAVED = 80;
 
 const EXAMPLES = [
   { icon: Search, text: "查一下东京现在的天气，用一句话告诉我。" },
-  { icon: FilePen, text: "写一个 src/fib.ml，算出第 30 个斐波那契数，然后运行它。" },
+  { icon: Blocks, text: "写一个 src/fib.ml，里面有 fib n，装成 harness，再用它算 fib 30。" },
+  { icon: PackagePlus, text: "把 https://raw.githubusercontent.com/ocaml/ocaml/trunk/stdlib/option.ml 装成 Myopt，然后用 Myopt.value 试一下。" },
   { icon: Globe, text: "请求 https://example.com，把页面标题记下来。" },
 ];
 
 const ABILITIES = [
   { icon: FilePen, title: "读写文件", body: "在工作区里新建、修改、查找文件。" },
-  { icon: Search, title: "搜索网页", body: "查公开的新闻、天气和事实。" },
-  { icon: Globe, title: "请求地址", body: "抓取一个公网页面或接口。" },
+  { icon: Search, title: "搜索与请求", body: "查公开的事实，抓一个公网页面或接口。" },
   { icon: Play, title: "编译执行", body: "每一步写成 OCaml，编译通过才会跑。" },
+  { icon: Blocks, title: "装 harness", body: "写好的 .ml 或网上的库，装上后每一步都能直接调用。" },
 ];
+
+const CONTINUE_TEXT = "接着上一次没做完的继续做，先看看工作区里已经有什么。";
+
+// The newest agent turn that stopped short of an answer gets a one-tap follow-up.
+function unfinished(turn: AgentTurnData): boolean {
+  if (turn.status === "stopped" || turn.status === "failed") return true;
+  const rounds = foldRounds(turn.events);
+  return rounds[rounds.length - 1]?.reply?.kind === "partial";
+}
 
 function keepFile(file: DeskFile): boolean {
   const name = file.path.split("/").pop() ?? "";
@@ -302,6 +312,21 @@ export function Workbench() {
     settle(job, (turn) => ({ ...turn, status: "stopped", endedAt: Date.now(), text: "已停止查看。这一步可能还在后台跑完，结果不会再显示。" }));
   }
 
+  async function installFromFile(file: DeskFile): Promise<string | null> {
+    const name = moduleNameFor(file.path);
+    if (!name) return "这个文件名不能当 module 名。";
+    const replacing = modules.some((mod) => mod.name === name);
+    if (!replacing && modules.length >= MAX_MODULES) return `最多装 ${MAX_MODULES} 个，先卸下一个。`;
+    try {
+      const verdict = await installModule({ data: { name, body: file.content } });
+      if (!verdict.ok) return verdict.error;
+      setModules((current) => [...current.filter((mod) => mod.name !== name), verdict.module]);
+      return null;
+    } catch (caught) {
+      return caught instanceof Error ? caught.message : "没装上。";
+    }
+  }
+
   function reset() {
     if (running) return;
     setFiles([]);
@@ -327,7 +352,10 @@ export function Workbench() {
   }
 
   const enabled = CATALOG.filter((item) => item.id === "ocaml" || harnesses.includes(item.id)).map((item) => item.name);
+  const loadedLine = modules.length ? ` · 已装 ${modules.map((mod) => mod.name).join("、")}` : "";
   const showExamples = turns.length === 0;
+  const lastAgent = [...turns].reverse().find((turn): turn is AgentTurnData => turn.role === "agent");
+  const continueFor = lastAgent && !running && unfinished(lastAgent) ? lastAgent.id : null;
 
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[minmax(0,1fr)_21rem]">
@@ -381,7 +409,10 @@ export function Workbench() {
               )}
             </div>
             <div className="mt-1.5 flex items-center justify-between gap-3 px-1">
-              <p className="min-w-0 truncate text-xs text-muted">开着：{enabled.join(" · ")}</p>
+              <p className="min-w-0 truncate text-xs text-muted">
+                开着：{enabled.join(" · ")}
+                {loadedLine}
+              </p>
               {turns.length > 0 ? (
                 <button type="button" onClick={() => setExamplesOpen((open) => !open)} className="shrink-0 text-xs text-fg">
                   {examplesOpen ? "收起示例" : "试试"}
@@ -406,10 +437,10 @@ export function Workbench() {
                       type="button"
                       disabled={running}
                       onClick={() => void go(item.text)}
-                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-bg px-3 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
+                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-bg px-3 py-2 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
                     >
                       <item.icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-                      <span className="min-w-0 flex-1">{item.text}</span>
+                      <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{item.text}</span>
                       <ArrowUp className="h-3.5 w-3.5 shrink-0 rotate-45 text-muted" aria-hidden />
                     </button>
                   ))}
@@ -425,7 +456,7 @@ export function Workbench() {
               {turns.length === 0 ? (
                 <div>
                   <h2 className="text-2xl font-semibold text-fg">说一件事，它去做。</h2>
-                  <p className="mt-2 max-w-xl text-sm leading-6 text-muted">每一步都写成一段 OCaml，编译通过才执行；搜了什么、写了什么、下一步为什么继续，都会实时显示在这里。</p>
+                  <p className="mt-2 max-w-xl text-sm leading-6 text-muted">每一步都写成一段 OCaml，编译通过才执行；搜了什么、写了什么、装了哪个 module，都会实时显示在这里。它还能把写好的代码或网上的库装成 harness，后面的步骤直接调用。</p>
                 </div>
               ) : null}
               <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -446,10 +477,10 @@ export function Workbench() {
                       type="button"
                       disabled={running}
                       onClick={() => void go(item.text)}
-                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-surface px-3 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
+                      className="flex min-h-11 items-center gap-3 rounded-xl border border-border bg-surface px-3 py-2 text-left text-sm text-fg hover:border-primary disabled:opacity-50"
                     >
                       <item.icon className="h-4 w-4 shrink-0 text-muted" aria-hidden />
-                      <span className="min-w-0 flex-1">{item.text}</span>
+                      <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{item.text}</span>
                       <ArrowUp className="h-3.5 w-3.5 shrink-0 rotate-45 text-muted" aria-hidden />
                     </button>
                   ))}
@@ -466,7 +497,7 @@ export function Workbench() {
                     <p className="whitespace-pre-wrap text-[15px] leading-7 text-fg">{turn.text}</p>
                   </article>
                 ) : (
-                  <AgentTurn key={turn.id} turn={turn} onOpenFile={openFile} />
+                  <AgentTurn key={turn.id} turn={turn} onOpenFile={openFile} onContinue={turn.id === continueFor ? () => void go(CONTINUE_TEXT) : undefined} />
                 ),
               )}
             </div>
@@ -476,7 +507,7 @@ export function Workbench() {
 
       <aside className="hidden border-l border-border bg-bg lg:block">
         <div className="sticky top-0 h-screen overflow-y-auto">
-          <SidePanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} files={files} selected={selected} onSelect={setSelected} onReset={reset} busy={running} />
+          <SidePanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} onInstall={installFromFile} files={files} selected={selected} onSelect={setSelected} onReset={reset} busy={running} />
         </div>
       </aside>
 
@@ -484,7 +515,7 @@ export function Workbench() {
         <div className="fixed inset-0 z-30 lg:hidden">
           <button type="button" aria-label="收起工作区" onClick={() => setPanelOpen(false)} className="absolute inset-0 bg-black/50" />
           <div className="absolute inset-y-0 right-0 w-[min(22rem,100%)] overflow-y-auto border-l border-border bg-bg shadow-2xl">
-            <SidePanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} files={files} selected={selected} onSelect={setSelected} onReset={reset} onClose={() => setPanelOpen(false)} busy={running} />
+            <SidePanel harnesses={harnesses} setHarnesses={setHarnesses} modules={modules} setModules={setModules} onInstall={installFromFile} files={files} selected={selected} onSelect={setSelected} onReset={reset} onClose={() => setPanelOpen(false)} busy={running} />
           </div>
         </div>
       ) : null}

@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
+  Blocks,
   Braces,
   Check,
   ChevronDown,
@@ -12,6 +13,8 @@ import {
   Globe,
   Hammer,
   LoaderCircle,
+  PackagePlus,
+  RotateCcw,
   Search,
   StickyNote,
   Trash2,
@@ -57,12 +60,13 @@ function clean(text: string): string {
   return text.replaceAll("**", "").replaceAll("`", "");
 }
 
-export function AgentTurn({ turn, onOpenFile }: { turn: AgentTurnData; onOpenFile: (path: string) => void }) {
+export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnData; onOpenFile: (path: string) => void; onContinue?: () => void }) {
   const running = turn.status === "running";
   const now = useNow(running);
   const [open, setOpen] = useState(false);
   const rounds = foldRounds(turn.events);
   const calls = rounds.reduce((sum, round) => sum + round.effects.length, 0);
+  const loaded = rounds.flatMap((round) => round.modules.map((mod) => mod.name));
   const hasProcess = rounds.length > 0 || turn.steps.length > 0;
   const showProcess = running || open;
   const elapsed = seconds(turn.at, running ? now : (turn.endedAt ?? turn.at));
@@ -94,12 +98,12 @@ export function AgentTurn({ turn, onOpenFile }: { turn: AgentTurnData; onOpenFil
           <p className={`whitespace-pre-wrap px-4 py-3 text-[15px] leading-7 ${turn.status === "failed" ? "text-danger" : "text-fg"}`}>{clean(turn.text)}</p>
         ) : null}
 
-        {!running && (turn.touched.length > 0 || hasProcess) ? (
+        {!running && (turn.touched.length > 0 || hasProcess || onContinue) ? (
           <footer className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-border px-4 py-2 text-xs text-muted">
             {hasProcess ? (
               <button type="button" onClick={() => setOpen((value) => !value)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 -ml-1 text-xs text-muted hover:text-fg">
                 {open ? <ChevronDown className="h-3.5 w-3.5" aria-hidden /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden />}
-                {rounds.length > 0 ? `${rounds.length} 轮 · ${calls} 次调用 · ${elapsed}` : `${turn.steps.length} 步`}
+                {rounds.length > 0 ? summaryLine(rounds.length, calls, loaded, elapsed) : `${turn.steps.length} 步`}
               </button>
             ) : null}
             {turn.touched.map((path) => (
@@ -108,11 +112,30 @@ export function AgentTurn({ turn, onOpenFile }: { turn: AgentTurnData; onOpenFil
                 {path}
               </button>
             ))}
+            {loaded.map((name) => (
+              <span key={name} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-accent/40 bg-bg px-2 font-mono text-[11px] text-accent">
+                <Blocks className="h-3 w-3" aria-hidden />
+                {name}
+              </span>
+            ))}
+            {onContinue ? (
+              <button type="button" onClick={onContinue} className="ml-auto inline-flex min-h-8 items-center gap-1 rounded-md border border-border px-2 text-xs text-fg hover:border-primary">
+                <RotateCcw className="h-3 w-3" aria-hidden />
+                接着做
+              </button>
+            ) : null}
           </footer>
         ) : null}
       </div>
     </article>
   );
+}
+
+function summaryLine(roundCount: number, calls: number, loaded: string[], elapsed: string): string {
+  const parts = [`${roundCount} 轮`, `${calls} 次调用`];
+  if (loaded.length) parts.push(`装了 ${loaded.length} 个 module`);
+  parts.push(elapsed);
+  return parts.join(" · ");
 }
 
 function statusLine(status: AgentStatus, current: Round | undefined, elapsed: string): string {
@@ -166,9 +189,41 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         {round.calls.map((call, index) => (
           <Row key={`call-${index}`} icon={<LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden />} label={`${toolLabel(call.tool)}中`} detail={call.detail} tone="muted" />
         ))}
+        {round.modules.map((mod) => (
+          <ModuleRow key={mod.name} name={mod.name} exports={mod.exports} />
+        ))}
         {round.reply ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
       </div>
     </li>
+  );
+}
+
+function ModuleRow({ name, exports }: { name: string; exports: string[] }) {
+  const shown = exports.slice(0, 6);
+  const more = exports.length - shown.length;
+  return (
+    <div className="min-w-0 text-sm">
+      <p className="flex min-w-0 items-start gap-1.5 text-accent">
+        <span className="mt-1 shrink-0">
+          <Blocks className="h-3.5 w-3.5" aria-hidden />
+        </span>
+        <span className="min-w-0">
+          <span className="text-fg">
+            <span className="font-mono">{name}</span> 已就位，后面的步骤可以直接调用
+          </span>
+        </span>
+      </p>
+      {shown.length ? (
+        <p className="ml-5 mt-1 flex flex-wrap gap-1">
+          {shown.map((fn) => (
+            <span key={fn} className="rounded border border-border bg-bg px-1.5 py-0.5 font-mono text-[11px] text-muted">
+              {name}.{fn}
+            </span>
+          ))}
+          {more > 0 ? <span className="px-1 py-0.5 font-mono text-[11px] text-muted">+{more}</span> : null}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -260,6 +315,11 @@ function iconFor(tool: string): ReactNode {
       return <StickyNote className={cls} aria-hidden />;
     case "Clock.now":
       return <Clock className={cls} aria-hidden />;
+    case "Harness.load":
+    case "load_harness":
+      return <Blocks className={cls} aria-hidden />;
+    case "Harness.install":
+      return <PackagePlus className={cls} aria-hidden />;
     case "compile":
       return <Hammer className={cls} aria-hidden />;
     default:
@@ -278,6 +338,8 @@ function toolLabel(tool: string): string {
     "Net.get": "请求",
     "Trace.note": "记下",
     "Clock.now": "计时",
+    "Harness.load": "装为 harness",
+    "Harness.install": "安装库",
     compile: "编译未通过",
     list_files: "列出文件",
     read_file: "读文件",
