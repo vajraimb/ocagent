@@ -13,6 +13,7 @@ export type AgentEventBody =
   | { kind: "effect"; round: number; tool: string; detail: string; output: string }
   | { kind: "step"; round: number; reply: string; text: string }
   | { kind: "module"; round: number; name: string; exports: string[] }
+  | { kind: "module_dropped"; name: string; reason: string }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };

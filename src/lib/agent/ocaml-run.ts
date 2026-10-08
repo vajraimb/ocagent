@@ -174,6 +174,7 @@ export type RunHooks = {
   // / Harness.install add to them through onModule.
   modules?: () => DeskModule[];
   onModule?: (mod: DeskModule) => void;
+  onUnload?: (name: string) => void;
 };
 
 export function renderModules(mods: DeskModule[]): string {
@@ -184,7 +185,7 @@ export type ModuleVerdict = { ok: true; module: DeskModule } | { ok: false; erro
 
 // A module becomes part of every later step's toplevel, so it has to pass the
 // same source bans as a step and actually compile against the harness API.
-export async function verifyModule(name: string, rawBody: string): Promise<ModuleVerdict> {
+export async function verifyModule(name: string, rawBody: string, context: DeskModule[] = []): Promise<ModuleVerdict> {
   const stripped = moduleFromFile(name, rawBody);
   if (!stripped) {
     const trimmed = name.trim();
@@ -196,24 +197,52 @@ export async function verifyModule(name: string, rawBody: string): Promise<Modul
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
-  const diagnostic = await compileModule(stripped);
-  if (diagnostic) return { ok: false, error: diagnostic };
+  // Compiled together with what is already loaded, so a module that builds on
+  // another one passes, and one that clashes with the set is caught now.
+  const together = [...context.filter((mod) => mod.name !== stripped.name), stripped];
+  const outcome = await compileModules(together);
+  if (!outcome.ok) {
+    if (outcome.name === stripped.name) return { ok: false, error: outcome.error };
+    return { ok: false, error: `装上 ${stripped.name} 后，已装的 ${outcome.name} 编译不过了：${outcome.error}` };
+  }
   return { ok: true, module: stripped };
 }
 
-async function compileModule(mod: DeskModule): Promise<string | null> {
+export type SetVerdict = { kept: DeskModule[]; dropped: { name: string; error: string }[] };
+
+// Before a run, make sure the modules the page sent still compile as a set;
+// a broken one is dropped (and reported) instead of poisoning every step.
+export async function verifyModuleSet(modules: DeskModule[]): Promise<SetVerdict> {
+  let kept = [...modules];
+  const dropped: SetVerdict["dropped"] = [];
+  while (kept.length > 0) {
+    const outcome = await compileModules(kept);
+    if (outcome.ok) break;
+    const culprit = outcome.name;
+    dropped.push({ name: culprit, error: outcome.error });
+    kept = kept.filter((mod) => mod.name !== culprit);
+  }
+  return { kept, dropped };
+}
+
+type CompileOutcome = { ok: true } | { ok: false; name: string; error: string };
+
+async function compileModules(mods: DeskModule[]): Promise<CompileOutcome> {
+  const last = mods[mods.length - 1]?.name ?? "";
   const command = await ocamlCommand();
-  if (!command) return "这台服务器没有 OCaml 运行器。";
+  if (!command) return { ok: false, name: last, error: "这台服务器没有 OCaml 运行器。" };
   await ensureRuntime();
   const dir = await mkdtemp(rt("runs", "mod-"));
   try {
     await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(false, false, false, []), "utf8");
-    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules([mod]), "utf8");
+    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules(mods), "utf8");
     await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_modules.ml";;\nlet () = print_string "harness-ok";;\n', "utf8");
-    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, { OCAMLLIB: rt("lib"), CAMLLIB: rt("lib") }, { sandbox: true, timeoutMs: 10_000 });
-    if (ran.timedOut) return "编译或顶层求值超时。module 顶层不要做耗时的事。";
-    if (ran.text.includes("harness-ok") && !/\bError\b/.test(ran.text)) return null;
-    return moduleDiagnostic(ran.text, mod.name);
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, { OCAMLLIB: rt("lib"), CAMLLIB: rt("lib") }, { sandbox: true, timeoutMs: 10_000 + 2_000 * mods.length });
+    if (ran.timedOut) return { ok: false, name: last, error: "编译或顶层求值超时。module 顶层不要做耗时的事。" };
+    if (ran.text.includes("harness-ok") && !/\bError\b/.test(ran.text)) return { ok: true };
+    const where = /ocagent_modules\.ml", line (\d+)/.exec(plainText(ran.text));
+    const name = (where ? moduleAtLine(mods, Number(where[1])) : null) ?? last;
+    return { ok: false, name, error: moduleDiagnostic(ran.text, name, moduleStart(mods, name)) };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -229,11 +258,25 @@ function moduleAtLine(mods: DeskModule[], line: number): string | null {
   return mods[mods.length - 1]?.name ?? null;
 }
 
-function moduleDiagnostic(raw: string, name: string): string {
-  const text = raw.replace(/\u001b\[[0-9;]*m/g, "");
+// Line on which a module's own `module X = struct` header sits in the rendered file.
+function moduleStart(mods: DeskModule[], name: string): number {
+  let at = 1;
+  for (const mod of mods) {
+    if (mod.name === name) return at;
+    at += renderModules([mod]).split("\n").length;
+  }
+  return 1;
+}
+
+// eslint-disable-next-line no-control-regex -- the toplevel colours its errors
+const ANSI = /\u001b\[[0-9;]*m/g;
+const plainText = (raw: string) => raw.replace(ANSI, "");
+
+function moduleDiagnostic(raw: string, name: string, start = 1): string {
+  const text = plainText(raw);
   const where = /ocagent_modules\.ml", line (\d+)/.exec(text);
   const error = /Error: ([\s\S]{0,400}?)(?:\n\s*\n|$)/.exec(text);
-  const line = where ? `第 ${Math.max(1, Number(where[1]) - 1)} 行` : "";
+  const line = where ? `第 ${Math.max(1, Number(where[1]) - start)} 行` : "";
   const reason = error?.[1]?.trim().replace(/\s+/g, " ") ?? text.trim().slice(0, 300);
   return `module ${name} 编译失败${line ? `（${line}）` : ""}：${reason || "没有输出"}`;
 }
@@ -248,8 +291,13 @@ async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status:
   const name = payload.slice(first + 1, second).trim();
   const rest = payload.slice(second + 1);
   const loaded = ctx.hooks?.modules?.() ?? [];
+  if (op === "unload") {
+    if (!loaded.some((mod) => mod.name === name)) return { status: 404, text: `没有装着叫 ${name} 的 module。现在装着：${loaded.map((mod) => mod.name).join("、") || "（没有）"}。` };
+    ctx.hooks?.onUnload?.(name);
+    return { status: 200, text: `已卸下 module ${name}。` };
+  }
   if (!loaded.some((mod) => mod.name === name) && loaded.length >= MAX_MODULES) {
-    return { status: 409, text: `最多同时装 ${MAX_MODULES} 个 module。先卸下一个。` };
+    return { status: 409, text: `最多同时装 ${MAX_MODULES} 个 module。先用 Harness.unload 卸下一个。` };
   }
   let body = rest;
   let savedTo = "";
@@ -262,7 +310,7 @@ async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status:
   } else if (op !== "load") {
     return { status: 400, text: "不支持的 harness 操作" };
   }
-  const verdict = await verifyModule(name, body);
+  const verdict = await verifyModule(name, body, loaded);
   if (!verdict.ok) return { status: 422, text: verdict.error };
   if (savedTo) {
     if (!safePath(savedTo)) return { status: 422, text: "模块名不能当文件名。" };
@@ -1005,6 +1053,14 @@ module Harness = struct
       else bridge "harness" ("install\\n" ^ String.trim name ^ "\\n" ^ String.trim url)
     in
     log_effect "Harness.install" (String.trim name ^ " <- " ^ String.trim url) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let unload name =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else bridge "harness" ("unload\\n" ^ String.trim name ^ "\\n")
+    in
+    log_effect "Harness.unload" (String.trim name) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
     result
 end
 

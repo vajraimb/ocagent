@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { moduleExports, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
+import { MAX_MODULES, moduleExports, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
 import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEvent, type AgentEventBody, type JobSnapshot } from "./progress.ts";
@@ -8,7 +8,7 @@ import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } f
 
 export type { JournalItem };
 
-type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean; events?: AgentEvent[] };
+type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
 
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
@@ -194,6 +194,8 @@ Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执�
 - 装之前会编译检查。失败会返回 Error 和原因；修好文件再装一次。module 里只能用标准库和 Files/Search/Net/Trace/Clock，不能用 Unix、Sys。
 - 用户点名要加载/安装/装成 harness 的模块时：先 Files.write_file 写好 .ml（文件名就用那个名字，例如 PDF_gen 写成 PDF_gen.ml），同一步里接着 Harness.load，成功才 Done。
 - 已经装上的 module 不要再写一遍，直接调用。Harness.loaded () 返回当前装着的名字。
+- Harness.unload "Name"：卸下一个装错或用不着的 module（最多同时装 ${MAX_MODULES} 个）。
+- 一次只做一件有效果的事，再 Continue；不要连着几轮只算不写、不读、不搜。
 
 【已加载的 module】
 ${describeModules(modules)}
@@ -228,6 +230,7 @@ module Harness : sig
   val loaded : unit -> string list
   val load : string -> string -> string res
   val install : string -> string -> string res
+  val unload : string -> string res
 end
 
 type reply =
@@ -330,11 +333,12 @@ function block(text: string): string {
   return `${body.length}\n${body.toString("utf8")}\n`;
 }
 
-function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], modules: DeskModule[]): Promise<string> {
+function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], modules: DeskModule[], signal?: AbortSignal): Promise<string> {
+  const slowGuard = AbortSignal.timeout(90_000);
   return fetch("https://api.x.ai/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    signal: AbortSignal.timeout(90_000),
+    signal: signal ? AbortSignal.any([slowGuard, signal]) : slowGuard,
     body: JSON.stringify({
       model: "grok-4.5",
       reasoning: { effort: "low" },
@@ -364,14 +368,30 @@ export type RunHooks = {
   onCall?: (tool: string, detail: string) => void;
   modules?: () => DeskModule[];
   onModule?: (mod: DeskModule) => void;
+  onUnload?: (name: string) => void;
 };
 
-// Verified loads win over the loop's own bookkeeping for the same name.
-export function mergeModules(fromLoop: DeskModule[], loaded: DeskModule[]): DeskModule[] {
+// Verified loads win over the loop's own bookkeeping for the same name, and
+// a module the run unloaded stays unloaded even if the loop still lists it.
+export function mergeModules(fromLoop: DeskModule[], loaded: DeskModule[], unloaded: Iterable<string> = []): DeskModule[] {
   const merged = new Map<string, DeskModule>();
   for (const mod of fromLoop) merged.set(mod.name, mod);
   for (const mod of loaded) merged.set(mod.name, mod);
+  for (const name of unloaded) merged.delete(name);
   return normalizeModules([...merged.values()]);
+}
+
+// How the loop was cut short, when it was.
+export type HaltReason = "budget" | "compile_stall" | "idle_stall";
+
+export const ROUND_BUDGET_MS = 70_000;
+const MIN_ROUND_MS = 12_000;
+const MAX_COMPILE_STALL = 4;
+const MAX_IDLE_STALL = 5;
+
+export function runBudgetMs(): number {
+  const raw = Number(process.env.OCAGENT_RUN_BUDGET_MS);
+  return Number.isFinite(raw) && raw >= 15_000 ? raw : ROUND_BUDGET_MS;
 }
 
 export type LoopDeps = {
@@ -379,6 +399,10 @@ export type LoopDeps = {
   runPayload: (payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks) => Promise<string>;
   emit?: (event: AgentEventBody) => void;
   signal?: AbortSignal;
+  /** Wall-clock budget for this request; the loop pauses (resumably) when it runs out. */
+  budgetMs?: number;
+  /** Modules that failed the pre-flight compile and were left out of this run. */
+  dropped?: { name: string; error: string }[];
 };
 
 export async function runDeskLoop(
@@ -396,22 +420,53 @@ export async function runDeskLoop(
   // Modules loaded during this run join the ones the page sent, so every later
   // step (and every later prompt) sees them.
   const loaded: DeskModule[] = [...modules];
+  const unloaded = new Set<string>();
   const addModule = (mod: DeskModule) => {
     const at = loaded.findIndex((item) => item.name === mod.name);
     if (at >= 0) loaded[at] = mod;
     else loaded.push(mod);
+    unloaded.delete(mod.name);
     emit({ kind: "module", round, name: mod.name, exports: moduleExports(mod.body) });
   };
+  const dropModule = (name: string) => {
+    const at = loaded.findIndex((item) => item.name === name);
+    if (at >= 0) loaded.splice(at, 1);
+    unloaded.add(name);
+  };
+  // The loop is cut (and resumed by the page) when the request's time budget
+  // runs out, and stopped when it keeps failing to compile or doing nothing.
+  const halt = new AbortController();
+  let haltReason: HaltReason | null = null;
+  let haltDetail = "";
+  const cut = (reason: HaltReason, detail = "") => {
+    if (haltReason) return;
+    haltReason = reason;
+    haltDetail = detail;
+    halt.abort(reason);
+  };
+  const signal = deps.signal ? AbortSignal.any([deps.signal, halt.signal]) : halt.signal;
+  const budgetMs = deps.budgetMs ?? runBudgetMs();
+  const deadline = Date.now() + budgetMs;
+  const timer = setTimeout(() => cut("budget"), budgetMs);
+  let compileStall = 0;
+  let idleStall = 0;
   try {
     let redirects = 0;
     emit({ kind: "start", task });
+    for (const gone of deps.dropped ?? []) emit({ kind: "module_dropped", name: gone.name, reason: gone.error });
     const result = await deps.runCore(
       { task, harnesses, files, modules, journal, memory },
       {
         model: async (prompt) => {
+          if (deadline - Date.now() < MIN_ROUND_MS) {
+            // Not enough time left for a round; pause now instead of leaving a
+            // model call half-finished when the budget runs out.
+            cut("budget");
+            return `error\n${block("这一段时间用完了。")}`;
+          }
           round += 1;
           emit({ kind: "think", round });
-          const raw = await askModel(apiKey, prompt, harnesses, loaded);
+          const raw = await askModel(apiKey, prompt, harnesses, loaded, signal);
           const reply = describeModelReply(raw);
           if (reply?.kind === "error") emit({ kind: "model_error", round, message: reply.message });
           else if (reply?.kind === "text") emit({ kind: "plan", round, code: extractCode(reply.text) || reply.text });
@@ -433,30 +488,38 @@ export async function runDeskLoop(
           const isStep = payload.startsWith("step\n");
           if (isStep) emit({ kind: "run", round });
           const raw = await deps.runPayload(payload, harnesses, apiKey, {
-            signal: deps.signal,
+            signal,
             onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
             modules: () => loaded,
             onModule: addModule,
+            onUnload: dropModule,
           });
           const next = rewriteStep(raw, task, redirects);
           if (next.usedRedirect) redirects += 1;
           if (isStep) {
             const frame = describeStepFrame(next.raw);
-            if (frame?.kind === "fail") emit({ kind: "compile_failed", round, message: frame.message });
-            else if (frame?.kind === "ok") {
+            if (frame?.kind === "fail") {
+              emit({ kind: "compile_failed", round, message: frame.message });
+              compileStall += 1;
+              idleStall = 0;
+              if (compileStall >= MAX_COMPILE_STALL) cut("compile_stall", frame.message);
+            } else if (frame?.kind === "ok") {
               for (const effect of frame.effects) emit({ kind: "effect", round, ...effect });
               emit({ kind: "step", round, reply: frame.reply, text: frame.text });
+              compileStall = 0;
+              idleStall = frame.reply === "continue" && frame.effects.length === 0 ? idleStall + 1 : 0;
+              if (idleStall >= MAX_IDLE_STALL) cut("idle_stall", frame.text);
             }
           }
           return next.raw;
         },
       },
-      { signal: deps.signal },
+      { signal },
     );
     const carried = {
       files: Array.isArray(result?.files) ? result.files : files,
       steps: Array.isArray(result?.steps) ? result.steps : [],
-      modules: mergeModules(Array.isArray(result?.modules) ? result.modules : modules, loaded),
+      modules: mergeModules(Array.isArray(result?.modules) ? result.modules : modules, loaded, unloaded),
       journal: Array.isArray(result?.journal) ? result.journal : journal,
       memory: typeof result?.memory === "string" ? result.memory : memory,
     };
@@ -464,6 +527,10 @@ export async function runDeskLoop(
       return { ok: false, error: "循环没有留下结果。", ...carried };
     }
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
+    if (haltReason === "budget") {
+      return { ok: true, answer: pausedAnswer(round, carried.steps), paused: true, ...carried };
+    }
+    if (haltReason) return { ok: false, error: stallAnswer(haltReason, haltDetail), ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
     return { ok: true, answer: presentAnswer(task, result.answer), ...carried };
   } catch (err) {
@@ -476,7 +543,20 @@ export async function runDeskLoop(
       journal,
       memory,
     };
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function pausedAnswer(rounds: number, steps: ToolStep[]): string {
+  const done = steps.filter((step) => step.tool !== "compile").length;
+  return `这一段时间用完了（${rounds} 轮，${done} 次调用），做到的都留在工作区里；接着做就会从这里继续。`;
+}
+
+function stallAnswer(reason: HaltReason, detail: string): string {
+  const tail = detail.trim() ? `\n最近一次：${detail.trim().slice(0, 400)}` : "";
+  if (reason === "compile_stall") return `连续 ${MAX_COMPILE_STALL} 轮写的代码都没编译过，先停下，免得空转。${tail}`;
+  return `连续 ${MAX_IDLE_STALL} 轮没有做任何事（没有读写、搜索、请求），先停下。换个说法再试，或把任务拆小。${tail}`;
 }
 
 type ResponseBody = {
@@ -522,7 +602,8 @@ export const runDesk = createServerFn({ method: "POST" })
     if (!apiKey) {
       return { ok: false, error: "Grok 没有接上。", files: data.files, steps: [], modules: data.modules, journal: data.journal, memory: data.memory };
     }
-    const { runCore, runPayload } = await import("./ocaml-run.ts");
+    const started = Date.now();
+    const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
     const { deskProgress } = await import("./progress.server.ts");
     const jobId = data.jobId;
     const controller = new AbortController();
@@ -530,11 +611,17 @@ export const runDesk = createServerFn({ method: "POST" })
       deskProgress.open(jobId);
       deskProgress.attachAbort(jobId, () => controller.abort());
     }
-    const result = await runDeskLoop(apiKey, data.task, data.files, data.harnesses, data.modules, data.journal, data.memory, {
+    // A module that no longer compiles as part of the set would make every
+    // step fail; leave it out of this run and say so, instead of spinning.
+    const checked = data.modules.length ? await verifyModuleSet(data.modules) : { kept: data.modules, dropped: [] };
+    const budgetMs = Math.max(15_000, runBudgetMs() - (Date.now() - started));
+    const result = await runDeskLoop(apiKey, data.task, data.files, data.harnesses, checked.kept, data.journal, data.memory, {
       runCore,
       runPayload,
       signal: controller.signal,
       emit: jobId ? (event) => deskProgress.emit(jobId, event) : undefined,
+      budgetMs,
+      dropped: checked.dropped,
     });
     if (!jobId) return result;
     // The answer carries the whole timeline too, so a page that could not
