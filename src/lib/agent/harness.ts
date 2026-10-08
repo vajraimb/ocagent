@@ -134,8 +134,14 @@ export function prelude(enabled: HarnessId[], modules: DeskModule[] = []): strin
 }
 
 const MODULE_NAME = /^[A-Z][A-Za-z0-9_]{0,24}$/;
-const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml"]);
+const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml", "Step", "Trace", "Clock", "Harness", "STEP"]);
 const BANNED = /\bObj\.|\bMarshal\.|#\s*(load|use|directory|mod_use)|Sys\.(command|getenv|readdir|chdir|remove|rename|set_signal)\b/;
+
+/** The first forbidden call in a would-be module, for an error message that names it. */
+export function bannedCall(body: string): string | null {
+  const hit = body.match(BANNED);
+  return hit ? hit[0].trim() : null;
+}
 
 export function checkModule(name: string, body: string): DeskModule | null {
   const moduleName = name.trim();
@@ -156,6 +162,29 @@ export function moduleFromFile(name: string, content: string): DeskModule | null
   return checkModule(moduleName, body);
 }
 
+export const MAX_MODULES = 6;
+
+// "src/fib_fast.ml" → "Fib_fast", the way the loop names a claimed file.
+export function moduleNameFor(path: string): string | null {
+  const base = path.split("/").pop() ?? "";
+  const stem = base.endsWith(".ml") ? base.slice(0, -3) : base;
+  if (!stem) return null;
+  const name = stem[0]!.toUpperCase() + stem.slice(1);
+  return MODULE_NAME.test(name) && !RESERVED.has(name) ? name : null;
+}
+
+// Top-level bindings a module offers, so the panel and the prompt can say
+// "Fib: fib, fib_list" without compiling anything.
+export function moduleExports(body: string): string[] {
+  const names: string[] = [];
+  for (const line of body.split("\n")) {
+    const match = /^(?:let|and)\s+(?:rec\s+)?(?:\(\s*)?([a-z_][A-Za-z0-9_']*)/.exec(line);
+    const name = match?.[1];
+    if (name && name !== "_" && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
 export function normalizeModules(raw: unknown): DeskModule[] {
   if (!Array.isArray(raw)) return [];
   const modules: DeskModule[] = [];
@@ -166,7 +195,7 @@ export function normalizeModules(raw: unknown): DeskModule[] {
     const mod = checkModule(name, body);
     if (!mod || modules.some((kept) => kept.name === mod.name)) continue;
     modules.push(mod);
-    if (modules.length >= 6) break;
+    if (modules.length >= MAX_MODULES) break;
   }
   return modules;
 }

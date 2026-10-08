@@ -5,9 +5,9 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkModule, prelude, type DeskModule, type HarnessId } from "./harness.ts";
+import { bannedCall, checkModule, MAX_MODULES, moduleFromFile, prelude, type DeskModule, type HarnessId } from "./harness.ts";
 import { settle } from "./budget.ts";
-import { fetchPublic } from "./net.ts";
+import { fetchPublic, fetchSource } from "./net.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
@@ -170,9 +170,112 @@ export async function runOcaml(
 export type RunHooks = {
   signal?: AbortSignal;
   onCall?: (tool: string, detail: string) => void;
+  // Modules loaded so far in this run; a step sees them all, and Harness.load
+  // / Harness.install add to them through onModule.
+  modules?: () => DeskModule[];
+  onModule?: (mod: DeskModule) => void;
 };
 
-function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?: RunHooks) {
+export function renderModules(mods: DeskModule[]): string {
+  return mods.map((mod) => `module ${mod.name} = struct\n${mod.body}\nend\n`).join("\n");
+}
+
+export type ModuleVerdict = { ok: true; module: DeskModule } | { ok: false; error: string };
+
+// A module becomes part of every later step's toplevel, so it has to pass the
+// same source bans as a step and actually compile against the harness API.
+export async function verifyModule(name: string, rawBody: string): Promise<ModuleVerdict> {
+  const stripped = moduleFromFile(name, rawBody);
+  if (!stripped) {
+    const trimmed = name.trim();
+    if (!/^[A-Z][A-Za-z0-9_]{0,24}$/.test(trimmed)) return { ok: false, error: `模块名 ${trimmed || "（空）"} 不行：大写开头，字母数字下划线。` };
+    if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
+    const offending = bannedCall(rawBody);
+    if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Step 是保留名），换一个。` };
+  }
+  const banned = rejectedSource(stripped.body);
+  if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
+  const diagnostic = await compileModule(stripped);
+  if (diagnostic) return { ok: false, error: diagnostic };
+  return { ok: true, module: stripped };
+}
+
+async function compileModule(mod: DeskModule): Promise<string | null> {
+  const command = await ocamlCommand();
+  if (!command) return "这台服务器没有 OCaml 运行器。";
+  await ensureRuntime();
+  const dir = await mkdtemp(rt("runs", "mod-"));
+  try {
+    await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(false, false, false, []), "utf8");
+    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules([mod]), "utf8");
+    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_modules.ml";;\nlet () = print_string "harness-ok";;\n', "utf8");
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, { OCAMLLIB: rt("lib"), CAMLLIB: rt("lib") }, { sandbox: true, timeoutMs: 10_000 });
+    if (ran.timedOut) return "编译或顶层求值超时。module 顶层不要做耗时的事。";
+    if (ran.text.includes("harness-ok") && !/\bError\b/.test(ran.text)) return null;
+    return moduleDiagnostic(ran.text, mod.name);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function moduleAtLine(mods: DeskModule[], line: number): string | null {
+  let at = 1;
+  for (const mod of mods) {
+    const span = renderModules([mod]).split("\n").length;
+    if (line < at + span) return mod.name;
+    at += span;
+  }
+  return mods[mods.length - 1]?.name ?? null;
+}
+
+function moduleDiagnostic(raw: string, name: string): string {
+  const text = raw.replace(/\u001b\[[0-9;]*m/g, "");
+  const where = /ocagent_modules\.ml", line (\d+)/.exec(text);
+  const error = /Error: ([\s\S]{0,400}?)(?:\n\s*\n|$)/.exec(text);
+  const line = where ? `第 ${Math.max(1, Number(where[1]) - 1)} 行` : "";
+  const reason = error?.[1]?.trim().replace(/\s+/g, " ") ?? text.trim().slice(0, 300);
+  return `module ${name} 编译失败${line ? `（${line}）` : ""}：${reason || "没有输出"}`;
+}
+
+type BridgeContext = { dir: string; hooks?: RunHooks };
+
+async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status: number; text: string }> {
+  const first = payload.indexOf("\n");
+  const second = first < 0 ? -1 : payload.indexOf("\n", first + 1);
+  if (first < 0 || second < 0) return { status: 400, text: "请求不对" };
+  const op = payload.slice(0, first);
+  const name = payload.slice(first + 1, second).trim();
+  const rest = payload.slice(second + 1);
+  const loaded = ctx.hooks?.modules?.() ?? [];
+  if (!loaded.some((mod) => mod.name === name) && loaded.length >= MAX_MODULES) {
+    return { status: 409, text: `最多同时装 ${MAX_MODULES} 个 module。先卸下一个。` };
+  }
+  let body = rest;
+  let savedTo = "";
+  if (op === "install") {
+    const fetched = await fetchSource(rest.trim());
+    if (!fetched.ok) return { status: 502, text: fetched.error };
+    body = fetched.text;
+    const stem = name ? name[0]!.toLowerCase() + name.slice(1) : "";
+    savedTo = `lib/${stem}.ml`;
+  } else if (op !== "load") {
+    return { status: 400, text: "不支持的 harness 操作" };
+  }
+  const verdict = await verifyModule(name, body);
+  if (!verdict.ok) return { status: 422, text: verdict.error };
+  if (savedTo) {
+    if (!safePath(savedTo)) return { status: 422, text: "模块名不能当文件名。" };
+    const target = path.resolve(ctx.dir, savedTo);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, body, "utf8");
+  }
+  ctx.hooks?.onModule?.(verdict.module);
+  const where = savedTo ? `已安装到 ${savedTo}，` : "";
+  return { status: 200, text: `${where}已加载 module ${verdict.module.name}。从下一步起可以直接调用 ${verdict.module.name}.… 。` };
+}
+
+function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?: RunHooks, ctx?: BridgeContext) {
   const allow = new Set<string>(harnesses.filter((id) => id === "net" || id === "web"));
   const token = randomBytes(16).toString("hex");
   const server = createServer(async (req, res) => {
@@ -192,6 +295,20 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?:
       return;
     }
     const op = body.op ?? "";
+    if (op === "harness" && ctx) {
+      try {
+        const payload = (body.payload ?? "").slice(0, 250_000);
+        const kind = payload.startsWith("install\n") ? "Harness.install" : "Harness.load";
+        hooks?.onCall?.(kind, payload.split("\n")[1] ?? "");
+        const outcome = await harnessOp(payload, ctx);
+        res.writeHead(outcome.status, { "content-type": "text/plain; charset=utf-8" });
+        res.end(outcome.text);
+      } catch (err) {
+        res.writeHead(500);
+        res.end(err instanceof Error ? err.message : "失败");
+      }
+      return;
+    }
     const payload = (body.payload ?? "").slice(0, 4000);
     const permitted = (op === "net" && allow.has("net")) || (op === "search" && allow.has("web"));
     if (!permitted) {
@@ -692,7 +809,11 @@ function rejectedSource(source: string): string | null {
   return null;
 }
 
-function stepApi(filesOn: boolean, webOn: boolean, netOn: boolean): string {
+function ocamlStringList(items: string[]): string {
+  return `[ ${items.map((item) => JSON.stringify(item)).join("; ")} ]`;
+}
+
+function stepApi(filesOn: boolean, webOn: boolean, netOn: boolean, loaded: string[]): string {
   return `
 type 'a res = ('a, string) result
 
@@ -862,6 +983,31 @@ module Clock = struct
     t
 end
 
+module Harness = struct
+  let loaded () = ${ocamlStringList(loaded)}
+
+  let load name path =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else if not (safe_rel path) then Error "路径不行"
+      else
+        match (try Ok (slurp path) with Sys_error _ -> Error "没有这个文件") with
+        | Error e -> Error e
+        | Ok body -> bridge "harness" ("load\\n" ^ String.trim name ^ "\\n" ^ body)
+    in
+    log_effect "Harness.load" (String.trim name ^ " <- " ^ path) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let install name url =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else if String.trim url = "" then Error "地址是空的"
+      else bridge "harness" ("install\\n" ^ String.trim name ^ "\\n" ^ String.trim url)
+    in
+    log_effect "Harness.install" (String.trim name ^ " <- " ^ String.trim url) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
 type reply =
   | Continue of string
   | Done of string
@@ -929,8 +1075,8 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
   const command = await ocamlCommand();
   if (!command) return `fail\n${encodeBlock("这台服务器没有 OCaml 运行器。")}`;
   await ensureRuntime();
-  const bridge = harnesses.some((id) => id === "net" || id === "web") ? await startBridge(apiKey, harnesses, hooks) : null;
   const dir = await mkdtemp(rt("runs", "step-"));
+  const bridge = await startBridge(apiKey, harnesses, hooks, { dir, hooks });
   try {
     for (const file of files) {
       if (!safePath(file.path)) continue;
@@ -939,10 +1085,21 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, file.content, "utf8");
     }
-    await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(harnesses.includes("files"), harnesses.includes("web"), harnesses.includes("net")), "utf8");
+    const loaded = hooks?.modules?.() ?? [];
+    await writeFile(
+      path.join(dir, "ocagent_api.ml"),
+      stepApi(
+        harnesses.includes("files"),
+        harnesses.includes("web"),
+        harnesses.includes("net"),
+        loaded.map((mod) => mod.name),
+      ),
+      "utf8",
+    );
+    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules(loaded), "utf8");
     await writeFile(path.join(dir, "ocagent_step.ml"), `${source.trim()}\n`, "utf8");
     await writeFile(path.join(dir, "ocagent_finish.ml"), STEP_FINISH, "utf8");
-    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_step.ml";;\n#use "ocagent_finish.ml";;\n', "utf8");
+    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_modules.ml";;\n#use "ocagent_step.ml";;\n#use "ocagent_finish.ml";;\n', "utf8");
     await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
     const extra: Record<string, string> = {
       OCAGENT_NODE: process.execPath,
@@ -958,6 +1115,11 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
     const outPath = path.join(dir, "ocagent_step_out");
     if (ran.aborted) return `fail\n${encodeBlock("已停下，这一步没有跑完。")}`;
     if (!(await exists(outPath))) {
+      const broken = /ocagent_modules\.ml", line (\d+)/.exec(ran.text.replace(/\u001b\[[0-9;]*m/g, ""));
+      if (broken) {
+        const culprit = moduleAtLine(loaded, Number(broken[1]));
+        return `fail\n${encodeBlock(`编译失败\n已加载的 module ${culprit ?? ""} 本身没有编译通过，这一步没有执行。先在工作区卸下它，或改好后重新 Harness.load。\n${moduleDiagnostic(ran.text, culprit ?? "?")}`)}`;
+      }
       return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;
     }
     const outcome = reader(await readFile(outPath));

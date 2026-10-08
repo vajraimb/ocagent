@@ -27,6 +27,39 @@ function isBlockedHost(hostname: string): boolean {
   return false;
 }
 
+const MAX_SOURCE = 200_000;
+
+// Pulls one OCaml source file off the public web, verbatim. Used by
+// Harness.install; the result still has to pass the module checks and compile.
+export async function fetchSource(raw: string): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  let current = publicUrl(raw);
+  if (!current) return { ok: false, error: "这个地址不能请求。" };
+  for (let hop = 0; hop < 3; hop += 1) {
+    const response = await fetch(current, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(15_000),
+      headers: { "User-Agent": "ocagent", Accept: "text/plain, text/x-ocaml, */*" },
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const next = response.headers.get("location");
+      if (!next) return { ok: false, error: `HTTP ${response.status}，没有跳转地址。` };
+      current = publicUrl(new URL(next, current).toString());
+      if (!current) return { ok: false, error: "跳转目标不能请求。" };
+      continue;
+    }
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}。` };
+    const type = response.headers.get("content-type") ?? "";
+    if (/^(image|audio|video|application\/(octet-stream|zip|gzip|pdf))/i.test(type)) return { ok: false, error: `这不是源码（${type.split(";")[0]}）。` };
+    const text = await response.text();
+    if (text.length > MAX_SOURCE) return { ok: false, error: `文件太大（${Math.round(text.length / 1000)} KB），一次最多装 ${MAX_SOURCE / 1000} KB。` };
+    if (text.includes("\u0000")) return { ok: false, error: "这不是文本文件。" };
+    if (/^\s*<(!doctype|html)/i.test(text)) return { ok: false, error: "拿到的是网页，不是 .ml 源码。要用 raw 地址。" };
+    return { ok: true, text };
+  }
+  return { ok: false, error: "跳转太多次。" };
+}
+
 export async function fetchPublic(raw: string): Promise<string> {
   let current = publicUrl(raw);
   if (!current) return "这个地址不能请求。";

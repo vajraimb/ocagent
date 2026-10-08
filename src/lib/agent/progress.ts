@@ -12,6 +12,7 @@ export type AgentEventBody =
   | { kind: "compile_failed"; round: number; message: string }
   | { kind: "effect"; round: number; tool: string; detail: string; output: string }
   | { kind: "step"; round: number; reply: string; text: string }
+  | { kind: "module"; round: number; name: string; exports: string[] }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };
@@ -205,6 +206,7 @@ export type Round = {
   compileError: string;
   calls: { tool: string; detail: string }[];
   effects: { tool: string; detail: string; output: string }[];
+  modules: { name: string; exports: string[] }[];
   reply: { kind: string; text: string } | null;
 };
 
@@ -213,7 +215,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", calls: [], effects: [], reply: null };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", calls: [], effects: [], modules: [], reply: null };
       rounds.set(round, found);
     }
     return found;
@@ -249,6 +251,9 @@ export function foldRounds(events: AgentEvent[]): Round[] {
       }
       case "effect":
         at(event.round).effects.push({ tool: event.tool, detail: event.detail, output: event.output });
+        break;
+      case "module":
+        at(event.round).modules.push({ name: event.name, exports: event.exports });
         break;
       case "step": {
         const round = at(event.round);

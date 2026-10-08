@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
+import { moduleExports, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
 import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEvent, type AgentEventBody, type JobSnapshot } from "./progress.ts";
@@ -152,7 +152,19 @@ function toolsFor(harnesses: HarnessId[]) {
   return tools;
 }
 
-function instructionsFor(harnesses: HarnessId[], _modules: DeskModule[]): string {
+function describeModules(modules: DeskModule[]): string {
+  if (modules.length === 0) return "（还没有。要复用一段代码，先用 Files.write_file 写成 .ml，再 Harness.load 装上。）";
+  return modules
+    .map((mod) => {
+      const names = moduleExports(mod.body);
+      const head = mod.body.split("\n").slice(0, 30).join("\n");
+      const more = mod.body.split("\n").length > 30 ? "\n  (* … *)" : "";
+      return `module ${mod.name}（提供：${names.length ? names.join("、") : "见源码"}）\n${head}${more}`;
+    })
+    .join("\n\n");
+}
+
+export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): string {
   const opened = [
     harnesses.includes("files") ? "文件 Files" : "",
     harnesses.includes("web") ? "网页 Search" : "",
@@ -170,12 +182,21 @@ function instructionsFor(harnesses: HarnessId[], _modules: DeskModule[]): string
 代码块之外不要写任何文字。想解释思路，写成 OCaml 注释 (* ... *)。
 
 【你能用什么】
-只能使用下面的 module：Files、Search、Net、Trace、Clock，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
-用户点名要加载的模块时，文件名就用那个名字，例如 PDF_gen 写成 PDF_gen.ml，写完再 Done。不要加载别的旧文件。
 
 这次开着的能力：${opened.length ? opened.join("、") : "没有"}。没开的调用会得到 Error。
+
+【harness：把代码装成可复用的 module】
+- Harness.load "Name" "path/file.ml"：把工作区里的一个 .ml 装成 module Name。装上后，从下一步起可以直接写 Name.func …，不用再读文件。
+- Harness.install "Name" "https://…/file.ml"：从公网下载一个单文件纯 OCaml 库，保存到 lib/name.ml 并装上。只认 raw 源码地址，不认网页。
+- 装之前会编译检查。失败会返回 Error 和原因；修好文件再装一次。module 里只能用标准库和 Files/Search/Net/Trace/Clock，不能用 Unix、Sys。
+- 用户点名要加载/安装/装成 harness 的模块时：先 Files.write_file 写好 .ml（文件名就用那个名字，例如 PDF_gen 写成 PDF_gen.ml），同一步里接着 Harness.load，成功才 Done。
+- 已经装上的 module 不要再写一遍，直接调用。Harness.loaded () 返回当前装着的名字。
+
+【已加载的 module】
+${describeModules(modules)}
 
 type 'a res = ('a, string) result
 
@@ -201,6 +222,12 @@ end
 
 module Clock : sig
   val now : unit -> float
+end
+
+module Harness : sig
+  val loaded : unit -> string list
+  val load : string -> string -> string res
+  val install : string -> string -> string res
 end
 
 type reply =
@@ -237,6 +264,23 @@ module Step : STEP = struct
     match Files.write_file "alarm.ml" body with
     | Error e -> Partial ("写入失败：" ^ e)
     | Ok () -> Done "已写下 alarm.ml。"
+end
+
+【示例：写一个 module 并装成 harness】
+module Step : STEP = struct
+  let run () =
+    let body = "let rec fib n = if n < 2 then n else fib (n - 1) + fib (n - 2)\\n" in
+    match Files.write_file "src/fib.ml" body with
+    | Error e -> Partial ("写入失败：" ^ e)
+    | Ok () -> (
+        match Harness.load "Fib" "src/fib.ml" with
+        | Error e -> Partial ("没装上：" ^ e)
+        | Ok _ -> Continue "Fib 已装上，下一步直接用 Fib.fib")
+end
+
+【示例：用已装上的 module】
+module Step : STEP = struct
+  let run () = Done (Printf.sprintf "fib 30 = %d" (Fib.fib 30))
 end`;
 }
 
@@ -315,7 +359,20 @@ function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], module
     });
 }
 
-export type RunHooks = { signal?: AbortSignal; onCall?: (tool: string, detail: string) => void };
+export type RunHooks = {
+  signal?: AbortSignal;
+  onCall?: (tool: string, detail: string) => void;
+  modules?: () => DeskModule[];
+  onModule?: (mod: DeskModule) => void;
+};
+
+// Verified loads win over the loop's own bookkeeping for the same name.
+export function mergeModules(fromLoop: DeskModule[], loaded: DeskModule[]): DeskModule[] {
+  const merged = new Map<string, DeskModule>();
+  for (const mod of fromLoop) merged.set(mod.name, mod);
+  for (const mod of loaded) merged.set(mod.name, mod);
+  return normalizeModules([...merged.values()]);
+}
 
 export type LoopDeps = {
   runCore: (job: CoreJob, handlers: CoreHandlers, hooks?: RunHooks) => Promise<CoreResult>;
@@ -336,6 +393,15 @@ export async function runDeskLoop(
 ): Promise<DeskResult> {
   const emit = deps.emit ?? (() => {});
   let round = 0;
+  // Modules loaded during this run join the ones the page sent, so every later
+  // step (and every later prompt) sees them.
+  const loaded: DeskModule[] = [...modules];
+  const addModule = (mod: DeskModule) => {
+    const at = loaded.findIndex((item) => item.name === mod.name);
+    if (at >= 0) loaded[at] = mod;
+    else loaded.push(mod);
+    emit({ kind: "module", round, name: mod.name, exports: moduleExports(mod.body) });
+  };
   try {
     let redirects = 0;
     emit({ kind: "start", task });
@@ -345,7 +411,7 @@ export async function runDeskLoop(
         model: async (prompt) => {
           round += 1;
           emit({ kind: "think", round });
-          const raw = await askModel(apiKey, prompt, harnesses, modules);
+          const raw = await askModel(apiKey, prompt, harnesses, loaded);
           const reply = describeModelReply(raw);
           if (reply?.kind === "error") emit({ kind: "model_error", round, message: reply.message });
           else if (reply?.kind === "text") emit({ kind: "plan", round, code: extractCode(reply.text) || reply.text });
@@ -369,6 +435,8 @@ export async function runDeskLoop(
           const raw = await deps.runPayload(payload, harnesses, apiKey, {
             signal: deps.signal,
             onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
+            modules: () => loaded,
+            onModule: addModule,
           });
           const next = rewriteStep(raw, task, redirects);
           if (next.usedRedirect) redirects += 1;
@@ -388,7 +456,7 @@ export async function runDeskLoop(
     const carried = {
       files: Array.isArray(result?.files) ? result.files : files,
       steps: Array.isArray(result?.steps) ? result.steps : [],
-      modules: Array.isArray(result?.modules) ? result.modules : modules,
+      modules: mergeModules(Array.isArray(result?.modules) ? result.modules : modules, loaded),
       journal: Array.isArray(result?.journal) ? result.journal : journal,
       memory: typeof result?.memory === "string" ? result.memory : memory,
     };
@@ -489,6 +557,27 @@ export const pollDesk = createServerFn({ method: "POST" })
   .handler(async ({ data }): Promise<DeskSnapshot> => {
     const { deskProgress } = await import("./progress.server.ts");
     return deskProgress.read(data.jobId, data.after);
+  });
+
+export type InstallVerdict = { ok: true; module: DeskModule; exports: string[] } | { ok: false; error: string };
+
+function readInstallInput(input: unknown): { name: string; body: string } {
+  if (!input || typeof input !== "object") throw new Error("请求不对");
+  const name = "name" in input && typeof input.name === "string" ? input.name.trim() : "";
+  const body = "body" in input && typeof input.body === "string" ? input.body : "";
+  if (!name || name.length > 25) throw new Error("模块名不对。");
+  if (!body.trim() || body.length > 200_000) throw new Error("源码是空的，或超过 200 KB。");
+  return { name, body };
+}
+
+// The workspace panel's "装为 harness": the same checks a step's Harness.load runs.
+export const installModule = createServerFn({ method: "POST" })
+  .validator(readInstallInput)
+  .handler(async ({ data }): Promise<InstallVerdict> => {
+    const { verifyModule } = await import("./ocaml-run.ts");
+    const verdict = await verifyModule(data.name, data.body);
+    if (!verdict.ok) return verdict;
+    return { ok: true, module: verdict.module, exports: moduleExports(verdict.module.body) };
   });
 
 export const stopDesk = createServerFn({ method: "POST" })
