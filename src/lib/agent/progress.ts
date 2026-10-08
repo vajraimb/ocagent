@@ -10,6 +10,7 @@ export type AgentEventBody =
   | { kind: "run"; round: number }
   | { kind: "call"; round: number; tool: string; detail: string }
   | { kind: "compile_failed"; round: number; message: string }
+  | { kind: "runner_failed"; round: number; message: string }
   | { kind: "effect"; round: number; tool: string; detail: string; output: string }
   | { kind: "step"; round: number; reply: string; text: string }
   | { kind: "module"; round: number; name: string; exports: string[] }
@@ -205,6 +206,7 @@ export type Round = {
   modelError: string;
   running: boolean;
   compileError: string;
+  runnerError: string;
   calls: { tool: string; detail: string }[];
   effects: { tool: string; detail: string; output: string }[];
   modules: { name: string; exports: string[] }[];
@@ -216,7 +218,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", calls: [], effects: [], modules: [], reply: null };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null };
       rounds.set(round, found);
     }
     return found;
@@ -248,6 +250,12 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         const round = at(event.round);
         round.running = false;
         round.compileError = event.message;
+        break;
+      }
+      case "runner_failed": {
+        const round = at(event.round);
+        round.running = false;
+        round.runnerError = event.message;
         break;
       }
       case "effect":

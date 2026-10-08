@@ -41,6 +41,10 @@ type CoreHandlers = {
 };
 
 const MAX_TASK = 1000;
+// The workspace rides along on every run (and every step inside it), so it has
+// to stay well under the deployment's request limit.
+export const MAX_FILE_BYTES = 512 * 1024;
+export const MAX_WORKSPACE_BYTES = 3 * 1024 * 1024;
 
 const FILE_TOOLS = [
   {
@@ -300,12 +304,20 @@ export function parseDeskInput(input: unknown): DeskInput | { error: string } {
   if (!rawFiles) return { error: "请求里没有工作区。" };
   if (rawFiles.length > MAX_FILES) return { error: `工作区里有 ${rawFiles.length} 个文件，一次最多带 ${MAX_FILES} 个。` };
   const files: DeskFile[] = [];
+  let total = 0;
   for (const file of rawFiles) {
     if (!file || typeof file !== "object") return { error: "工作区文件不对。" };
     const path = "path" in file && typeof file.path === "string" ? file.path : "";
     const content = "content" in file && typeof file.content === "string" ? file.content : "";
     if (!safePath(path)) return { error: `不能收下 ${path || "这个文件"}。` };
+    const size = Buffer.byteLength(content);
+    if (size > MAX_FILE_BYTES) return { error: `${path} 有 ${Math.round(size / 1024)} KB，单个文件最多 ${MAX_FILE_BYTES / 1024} KB。缩小或删掉它再试。` };
+    total += size;
     files.push({ path, content });
+  }
+  if (total > MAX_WORKSPACE_BYTES) {
+    const biggest = [...files].sort((a, b) => b.content.length - a.content.length).slice(0, 3).map((file) => file.path);
+    return { error: `工作区一共 ${(total / 1024 / 1024).toFixed(1)} MB，每次运行都要带上，最多 ${MAX_WORKSPACE_BYTES / 1024 / 1024} MB。最大的几个：${biggest.join("、")}。删掉用不着的再试。` };
   }
   const harnesses = normalizeHarnesses("harnesses" in input ? input.harnesses : undefined);
   const modules = normalizeModules("modules" in input ? input.modules : undefined);
@@ -382,12 +394,13 @@ export function mergeModules(fromLoop: DeskModule[], loaded: DeskModule[], unloa
 }
 
 // How the loop was cut short, when it was.
-export type HaltReason = "budget" | "compile_stall" | "idle_stall";
+export type HaltReason = "budget" | "compile_stall" | "idle_stall" | "runner";
 
 export const ROUND_BUDGET_MS = 70_000;
 const MIN_ROUND_MS = 12_000;
 const MAX_COMPILE_STALL = 4;
 const MAX_IDLE_STALL = 5;
+const MAX_RUNNER_STALL = 2;
 
 export function runBudgetMs(): number {
   const raw = Number(process.env.OCAGENT_RUN_BUDGET_MS);
@@ -450,6 +463,7 @@ export async function runDeskLoop(
   const timer = setTimeout(() => cut("budget"), budgetMs);
   let compileStall = 0;
   let idleStall = 0;
+  let runnerStall = 0;
   try {
     let redirects = 0;
     emit({ kind: "start", task });
@@ -487,13 +501,25 @@ export async function runDeskLoop(
         ocaml: async (payload) => {
           const isStep = payload.startsWith("step\n");
           if (isStep) emit({ kind: "run", round });
-          const raw = await deps.runPayload(payload, harnesses, apiKey, {
-            signal,
-            onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
-            modules: () => loaded,
-            onModule: addModule,
-            onUnload: dropModule,
-          });
+          let raw: string;
+          try {
+            raw = await deps.runPayload(payload, harnesses, apiKey, {
+              signal,
+              onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
+              modules: () => loaded,
+              onModule: addModule,
+              onUnload: dropModule,
+            });
+          } catch (err) {
+            // The runner, not the step's code, failed: another model round
+            // cannot fix that, so two in a row end the run with the reason.
+            const message = err instanceof Error && err.message.trim() ? err.message : "这一步没有跑起来。";
+            if (isStep) emit({ kind: "runner_failed", round, message });
+            runnerStall += 1;
+            if (runnerStall >= MAX_RUNNER_STALL) cut("runner", message);
+            return `fail\n${block(message)}`;
+          }
+          runnerStall = 0;
           const next = rewriteStep(raw, task, redirects);
           if (next.usedRedirect) redirects += 1;
           if (isStep) {
@@ -556,6 +582,7 @@ function pausedAnswer(rounds: number, steps: ToolStep[]): string {
 function stallAnswer(reason: HaltReason, detail: string): string {
   const tail = detail.trim() ? `\n最近一次：${detail.trim().slice(0, 400)}` : "";
   if (reason === "compile_stall") return `连续 ${MAX_COMPILE_STALL} 轮写的代码都没编译过，先停下，免得空转。${tail}`;
+  if (reason === "runner") return `执行这一步的环境出了问题，再来几轮也一样，先停下。${tail}`;
   return `连续 ${MAX_IDLE_STALL} 轮没有做任何事（没有读写、搜索、请求），先停下。换个说法再试，或把任务拆小。${tail}`;
 }
 
@@ -599,13 +626,18 @@ export const runDesk = createServerFn({ method: "POST" })
   })
   .handler(async ({ data }): Promise<DeskResult> => {
     const apiKey = process.env.XAI_API_KEY;
+    const { deskProgress } = await import("./progress.server.ts");
+    const jobId = data.jobId;
     if (!apiKey) {
-      return { ok: false, error: "Grok 没有接上。", files: data.files, steps: [], modules: data.modules, journal: data.journal, memory: data.memory };
+      const missing: DeskResult = { ok: false, error: "Grok 没有接上。", files: data.files, steps: [], modules: data.modules, journal: data.journal, memory: data.memory };
+      if (jobId) {
+        deskProgress.open(jobId);
+        deskProgress.close(jobId, missing, false);
+      }
+      return missing;
     }
     const started = Date.now();
     const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
-    const { deskProgress } = await import("./progress.server.ts");
-    const jobId = data.jobId;
     const controller = new AbortController();
     if (jobId) {
       deskProgress.open(jobId);

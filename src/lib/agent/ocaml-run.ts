@@ -99,9 +99,26 @@ async function ocamlCommand(): Promise<{ bin: string; prefix: string[]; lib: str
   return null;
 }
 
+/** The step runner itself could not do its job (as opposed to the step's code failing). */
+export class RunnerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunnerError";
+  }
+}
+
+// Payloads carry the whole workspace on every step, so the cap is generous and
+// overshooting it is an error the loop can see, never a silent cut.
+export const MAX_BRIDGE_PAYLOAD = 16 * 1024 * 1024;
+
 const CLIENT = `import { readFileSync, writeFileSync } from "node:fs";
 const [op, inputPath, outputPath] = process.argv.slice(2);
-const payload = readFileSync(inputPath, "utf8").slice(0, 200000);
+const raw = readFileSync(inputPath);
+if (raw.length > ${MAX_BRIDGE_PAYLOAD}) {
+  writeFileSync(outputPath, "这一步要带的内容有 " + Math.round(raw.length / 1024) + " KB，超过了上限。工作区太大了，删掉或缩小几个文件。");
+  process.exit(1);
+}
+const payload = raw.toString("utf8");
 const res = await fetch("http://127.0.0.1:" + process.env.OCAGENT_PORT + "/call", {
   method: "POST",
   headers: { "content-type": "application/json", "x-ocagent-token": process.env.OCAGENT_TOKEN ?? "" },
@@ -1121,11 +1138,17 @@ async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Prom
 }
 
 export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
-  const cur = reader(Buffer.from(payload, "utf8"));
-  const source = cur.block();
-  const count = Number(cur.line());
+  let source = "";
   const files: DeskFile[] = [];
-  for (let i = 0; i < count; i += 1) files.push({ path: cur.line(), content: cur.block() });
+  try {
+    const cur = reader(Buffer.from(payload, "utf8"));
+    source = cur.block();
+    const count = Number(cur.line());
+    for (let i = 0; i < count; i += 1) files.push({ path: cur.line(), content: cur.block() });
+  } catch {
+    const kb = Math.round(Buffer.byteLength(payload) / 1024);
+    throw new RunnerError(`这一步的输入没有读全（收到 ${kb} KB，${files.length} 个文件后断了）。工作区可能太大，删掉或缩小几个大文件再试。`);
+  }
   const banned = rejectedSource(source);
   if (banned) return `fail\n${encodeBlock(banned)}`;
   const command = await ocamlCommand();

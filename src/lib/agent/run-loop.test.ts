@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { mergeModules, runDeskLoop, type LoopDeps } from "./run.ts";
+import { MAX_FILE_BYTES, mergeModules, parseDeskInput, runDeskLoop, type LoopDeps } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 
 const block = (text: string) => `${Buffer.byteLength(text)}\n${text}\n`;
@@ -82,6 +82,44 @@ test("five rounds that continue without doing anything stop the loop", async () 
   assert.equal(result.ok, false);
   assert.match(result.ok ? "" : result.error, /连续 5 轮没有做任何事/);
   assert.equal(kinds.filter((kind) => kind === "think").length, 5);
+});
+
+test("two runner failures in a row end the run with the runner's message", async () => {
+  const kinds: string[] = [];
+  const result = await runDeskLoop(
+    "key",
+    "task",
+    [],
+    ["ocaml"],
+    [],
+    [],
+    "",
+    deps(
+      {
+        runPayload: async () => {
+          throw new Error("这一步的输入没有读全（收到 213 KB，3 个文件后断了）。");
+        },
+      },
+      kinds,
+    ),
+  );
+  assert.equal(result.ok, false);
+  assert.match(result.ok ? "" : result.error, /执行这一步的环境出了问题/);
+  assert.match(result.ok ? "" : result.error, /213 KB/);
+  assert.equal(kinds.filter((kind) => kind === "runner_failed").length, 2);
+  assert.equal(kinds.filter((kind) => kind === "think").length, 2);
+});
+
+test("parseDeskInput refuses a workspace too big to ride along, naming the biggest files", () => {
+  const base = { task: "t", harnesses: ["ocaml"], modules: [], journal: [], memory: "" };
+  const huge = "x".repeat(MAX_FILE_BYTES + 1);
+  const single = parseDeskInput({ ...base, files: [{ path: "lib/big.ml", content: huge }] });
+  assert.ok("error" in single && /lib\/big\.ml.*单个文件最多/.test(single.error));
+  const many = Array.from({ length: 8 }, (_, i) => ({ path: `lib/l${i}.ml`, content: "y".repeat(MAX_FILE_BYTES - 1) }));
+  const total = parseDeskInput({ ...base, files: many });
+  assert.ok("error" in total && /工作区一共.*最大的几个：lib\/l0\.ml/.test(total.error));
+  const fine = parseDeskInput({ ...base, files: [{ path: "src/a.ml", content: "let a = 1" }] });
+  assert.ok(!("error" in fine) && fine.files.length === 1);
 });
 
 test("a module unloaded by a step leaves the carried set; dropped modules are announced", async () => {
