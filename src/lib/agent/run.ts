@@ -1124,49 +1124,6 @@ export function carriesOn(run: RunRecord): boolean {
   return run.status === "paused" && run.segment < MAX_SEGMENTS && segmentProgressed(run);
 }
 
-// After a pause, the server asks itself for the next segment, so the run goes
-// on even when no page is watching. The request is made through the app's own
-// public address; on Vercel, waitUntil keeps this function alive until the
-// next one has answered. Local servers have no such context, and the fetch
-// simply runs in the background.
-async function selfContinue(run: RunRecord, origin: string | null): Promise<void> {
-  if (!origin) return;
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
-  if (bypass) headers["x-vercel-protection-bypass"] = bypass;
-  const request = fetch(`${origin}/api/agent/continue`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ runId: run.id, segment: run.segment }),
-  })
-    .then(() => undefined)
-    .catch(() => undefined);
-  try {
-    const { waitUntil } = await import("@vercel/functions");
-    waitUntil(request);
-  } catch {
-    /* no platform context: the request just runs in this process */
-  }
-}
-
-async function selfOrigin(): Promise<string | null> {
-  const configured = process.env.OCAGENT_SELF_URL?.trim();
-  if (configured) return configured.replace(/\/$/, "");
-  try {
-    // The address the page used, which is also the one that reaches this app.
-    const { getRequestHeader } = await import("@tanstack/react-start/server");
-    const host = getRequestHeader("x-forwarded-host") ?? getRequestHeader("host");
-    if (host) {
-      const proto = getRequestHeader("x-forwarded-proto") ?? (host.startsWith("127.0.0.1") || host.startsWith("localhost") ? "http" : "https");
-      return `${proto.split(",")[0]?.trim() || "https"}://${host.split(",")[0]?.trim()}`;
-    }
-  } catch {
-    /* not inside a request */
-  }
-  const vercel = process.env.VERCEL_URL;
-  return vercel ? `https://${vercel}` : null;
-}
-
 /** Earlier runs of the desk as conversation, oldest first; the current run and anything still running are left out. */
 export function historyFor(runs: RunRecord[], currentId: string): HistoryItem[] {
   return runs
@@ -1180,7 +1137,8 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
   const { runProgress } = await import("./progress.server.ts");
   const apiKey = process.env.XAI_API_KEY;
   const seqBase = run.events.length ? (run.events[run.events.length - 1]?.seq ?? 0) : 0;
-  const self = origin === undefined ? await selfOrigin() : origin;
+  const drive = await import("./drive.server.ts");
+  const self = origin === undefined ? drive.selfOrigin() : origin;
   runProgress.open(run.id, seqBase);
   const finish = async (status: Exclude<RunStatus, "running">, result: DeskResult, state: DeskState): Promise<RunReply> => {
     const events = runProgress.read(run.id).events;
@@ -1195,7 +1153,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
     const reply: RunReply = { run: fresh, desk: publicDesk(saved) };
     runProgress.close(run.id, reply, outcome.ok);
     // Paused for time only: the server carries on by itself.
-    if (status === "paused" && carriesOn(fresh)) await selfContinue(fresh, self);
+    if (status === "paused" && carriesOn(fresh)) await drive.selfContinue(fresh.id, fresh.segment, self);
     return reply;
   };
   const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory, notes: desk.notes };
