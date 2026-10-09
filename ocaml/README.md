@@ -34,7 +34,11 @@ dune exec ./bin/demo.exe
 网页工作台跑的循环是 **`assets/ocaml/bin/ocagent.ml`**——一份 OCaml 源码，由随包的字节码顶层以脚本方式执行（`ocamlrun ocaml ocagent.ml <job> <result>`），所以改它不需要编译器。它只是一个薄执行器：
 
 - **循环脚本**：每轮把"任务 + 自己的 Trace 笔记 + 上一次编译错误"交给 Node 当提示（Node 再加上指令和其余上下文），拿回模型回复，抽出 `ocaml` 代码块交给 `runStep`，把这一步的 effect 日志折进 journal。它**从不自己判断任务做没做完**：只在交回来的一步说 Done / Ask / Partial、同一步原样重复、或模型连续三轮不给代码时结束。它看不到工作区文件，不管时间，不装 harness，不改 modules。桥接只有两个调用：`model` 和 `ocaml`。
-- **Node（`src/lib/agent/run.ts`）**：拥有每轮的 prompt 上下文（文件清单、上一步的返回、编译失败的代码、计划勾选状态、剩余时间）、时间预算与分段（`OCAGENT_RUN_BUDGET_MS`）、跨实例的停止标志、把过程写进数据库的进度日志，以及**收尾前核对**：写过文件的运行第一次 `Done` 会被改成 `Continue` 再给一轮，让模型读回文件或算一个已知值核对；核对过的 `Done` 原样放行。
+- **Node（`src/lib/agent/run.ts`）**：拥有每轮的 prompt 上下文（文件清单、上一步的返回、编译失败的代码、计划勾选状态、剩余时间）、时间预算与分段（`OCAGENT_RUN_BUDGET_MS`）、跨实例的停止标志、把过程写进数据库的进度日志，以及**收尾前核对**：写过文件的运行第一次 `Done` 会被改成 `Continue` 再给一轮；同一步里有 `Check.*` 断言且全部通过（或读回了写出的文件）的 `Done` 直接放行；有断言没通过的 `Done` 也会被拦回去（最多再一次），提示里列出没通过的几条并让模型先修（或 `Files.restore`）；再拦不住的，答案末尾会标出哪几条没通过。
+- **Step API 里的 `Check`**：`Check.that cond "说明"`、`Check.equal 期望 实际 "说明"`、`Check.contains "path" "内容"`，都返回 bool 并写一行 effect（`通过` / `没通过：…`），时间线上以绿盾 / 红盾显示。
+- **Step API 里的 `Files.restore`**：退回任务开始时的版本。`runStep` 在一个文件**第一次**被改时记下它改前的内容（`hooks.onOrigin`，存在运行行的 `plan.origin`，总量封顶 256 KB），下一步起把这些原件放进步骤目录的 `ocagent_origin/`（不存在的文件记在 `ocagent_origin_absent`），`restore` 就是从那里复制回来或删掉。
+- **占位符检测（`missingInput`）**：任务里有「我的名字 / 城市 / 生日 …」而答案或这步写出的文件里出现占位（`<名字>`、`your_name`、`某某`、`XXX`、"改成参数"……），且笔记、之前的对话、任务本身都没提供这件事，`Done` 会被改写成 `Ask`（`patchFrame`），时间线上多一行「结果里用了占位……改成问你」，运行以「等你回答」结束，用户下一句话按原有的 Ask 续接逻辑处理。
+- **服务器端续跑**：一段因时间用完而暂停、且这一段有进展时（`carriesOn`，最多 `MAX_SEGMENTS = 10` 段），`runSegment` 结束前通过 `drive.server.ts` 向自己的公网地址 `POST /api/agent/continue`（Vercel 上用 `waitUntil` 保活），由 `driveNextSegment` 以一条原子更新 `claimSegment`（`where status='paused' and segment=…`）认领下一段。页面不再自己接力，只轮询观看；`pollRun` 在本实例的段结束后改读数据库行，所以别的实例在跑也看得到；若约 8 秒内没人接（`CARRY_GRACE_MS`），页面才自己调 `continueRun`——谁先认领谁跑，另一个只会看到「在跑」。
 - **装 harness** 只有一条路：步骤里的 `Harness.load / install / unload`，走 `ocaml-run.ts` 的桥接，由 Node 验证、编译、记录（`onModule` / `onUnload`），运行结果里的 modules 由 `mergeModules` 合出。
 - **Step API 里的 `Plan`**（`ocaml-run.ts` 的前导）：`Plan.set [...]` / `Plan.tick n "结果"` 只是写进 effect 日志的两行，由 Node 解析成清单、附回下一轮提示并推给页面；循环脚本对它一无所知。
 - **Step API 里的 `Memory`**：同样只是 effect 日志（`Memory.remember "…"` / `Memory.forget n`）。Node 把它们合并进工作区的 `notes`（数据库 `desks.notes`），之后这个工作区的每一个任务的提示都带【记住的】；页面的「它记住的」可以删。
