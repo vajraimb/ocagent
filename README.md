@@ -37,3 +37,101 @@ dune runtest --root .
 ```
 
 `src/` 是浏览器里的 journal harness 演示。验收以 `dune runtest` 为准。
+
+## Sending email through Gmail（用站长的 Gmail 发信）
+
+The deployed site (`https://ocagent.grok.me`) is the TanStack Start app in
+`src/`, running as Node functions on Vercel. It can send mail **as the owner's
+Gmail account** through the Gmail API (`users.messages.send`) with an OAuth2
+refresh token. Google's official Node client (`@googleapis/gmail`) does the
+token refresh and the API call; the OCaml harnesses are not involved.
+
+Code: `src/lib/mail/gmail.ts` (validation, MIME, `sendGmail()`),
+`src/lib/mail/google-transport.ts` (the Google call),
+`src/lib/mail/endpoint.ts` + `src/routes/api/mail/send.ts` (HTTP endpoint).
+Tests: `src/lib/mail/gmail.test.ts`, `scripts/gmail-oauth-token.test.mjs`.
+
+### Secrets (set these in the deployment, never in the repo)
+
+| Variable | What it is |
+|---|---|
+| `GMAIL_CLIENT_ID` | OAuth 2.0 client ID from Google Cloud Console |
+| `GMAIL_CLIENT_SECRET` | Its client secret |
+| `GMAIL_REFRESH_TOKEN` | Refresh token for the sending account, scope `gmail.send` only |
+| `GMAIL_SENDER` | The Gmail address that approved the token, e.g. `shunjie.bi@gmail.com`; used as `From` |
+| `OCAGENT_MAIL_TOKEN` | Optional. ≥ 24 random chars; enables `POST /api/mail/send` for the owner's automations. Unset = endpoint answers 404 |
+
+Where: Vercel → Project → **Settings → Environment Variables** (Production, and
+Preview if wanted), then redeploy. `.env.example` lists the same names with
+placeholders. Do not create a `.env` in this workspace.
+
+### One-time setup for the owner
+
+1. **Google Cloud project.** Open <https://console.cloud.google.com/>, create or
+   pick a project.
+2. **Enable the Gmail API.** APIs & Services → Library → "Gmail API" → Enable.
+3. **OAuth consent screen.** APIs & Services → OAuth consent screen → User type
+   *External* → fill app name + your email. Add the scope
+   `https://www.googleapis.com/auth/gmail.send`. Under *Test users* add the
+   sending address (`shunjie.bi@gmail.com`). Leaving the app in *Testing* is
+   fine for one owner account; note Google expires testing refresh tokens after
+   7 days unless the app is set to *In production* (click **Publish app**; a
+   `gmail.send`-only app for your own account does not need verification to
+   keep working, you will just see an "unverified app" warning once).
+4. **OAuth client.** APIs & Services → Credentials → Create credentials →
+   OAuth client ID → Application type **Desktop app**. Copy the client ID and
+   secret. (Desktop type is what lets the helper below receive the redirect on
+   `127.0.0.1` without registering a redirect URI.)
+5. **Mint the refresh token** on your own computer (Node 22+, repo checked out):
+
+   ```sh
+   GMAIL_CLIENT_ID=… GMAIL_CLIENT_SECRET=… node scripts/gmail-oauth-token.mjs
+   ```
+
+   Open the printed URL **signed in as the sending Gmail account**, approve
+   "Send email on your behalf", and the script prints `GMAIL_REFRESH_TOKEN=…`.
+   It requests `access_type=offline&prompt=consent`, so a refresh token is
+   returned every run. If you ever need to rotate it, revoke the app at
+   <https://myaccount.google.com/permissions> and run the script again.
+6. **Put the five values into Vercel** (table above), generate
+   `OCAGENT_MAIL_TOKEN` with `openssl rand -hex 32`, redeploy.
+7. **Verify without sending:**
+
+   ```sh
+   curl -H "Authorization: Bearer $OCAGENT_MAIL_TOKEN" https://ocagent.grok.me/api/mail/send
+   # → {"ok":true,"gmail":true,"sender":"shunjie.bi@gmail.com","missing":[]}
+   ```
+
+### Sending
+
+From server code (server functions, loaders, the agent's Node side):
+
+```ts
+import { sendGmail } from "@/lib/mail/gmail";
+
+const result = await sendGmail({
+  to: "friend@example.com",           // or string[] (max 10)
+  subject: "Weekly digest",
+  text: "Plain-text body (required)",
+  html: "<p>Optional HTML alternative</p>",
+});
+if (!result.ok) console.error(result.code, result.message); // not_configured | invalid_request | send_failed
+```
+
+Over HTTP, for the owner's own scripts and automations:
+
+```sh
+curl -X POST https://ocagent.grok.me/api/mail/send \
+  -H "Authorization: Bearer $OCAGENT_MAIL_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"friend@example.com","subject":"Hello","text":"Sent by ocagent."}'
+# → {"ok":true,"id":"<gmail message id>","threadId":"…"}
+```
+
+Status codes: `200` sent · `400` invalid body · `401` wrong/missing bearer ·
+`404` endpoint disabled (no `OCAGENT_MAIL_TOKEN`) · `503` Gmail secrets missing
+· `502` Gmail rejected the send (message explains which secret to re-check).
+Bodies are capped at 512 KB and 10 recipients; the subject is header-injection
+safe. Nothing in the browser UI can trigger a send, and the agent's LLM steps
+have no `Mail` tool yet — adding one should go through an approval effect, not
+run unattended.
