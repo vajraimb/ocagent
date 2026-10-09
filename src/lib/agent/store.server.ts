@@ -5,6 +5,7 @@ import { dbSource, getSql, type Sql } from "@/lib/db";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { normalizeNotes, type AgentEvent, type PlanItem, type PlanState } from "./progress.ts";
 import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
+import type { LastOutcome } from "./run.ts";
 
 export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[] };
 export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: number };
@@ -12,7 +13,7 @@ export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: 
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
 
 // What a finished (or paused) run leaves behind besides its timeline.
-export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[]; plan?: PlanState; asked?: boolean };
+export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[]; plan?: PlanState; asked?: boolean; last?: LastOutcome };
 
 /** True when rows outlive this server instance (Neon), false on the embedded fallback. */
 export function isDurable(): boolean {
@@ -111,7 +112,31 @@ function outcomeOf(raw: unknown): RunOutcome | null {
   const plan = planOf(item.plan);
   if (plan) outcome.plan = plan;
   if (item.asked === true) outcome.asked = true;
+  const last = lastOf(item.last);
+  if (last) outcome.last = last;
   return outcome;
+}
+
+// The carried last-step outcome is the loop's own data; only its shape is checked.
+function lastOf(raw: unknown): LastOutcome {
+  if (!raw || typeof raw !== "object" || typeof (raw as { kind?: unknown }).kind !== "string") return null;
+  const item = raw as Record<string, unknown>;
+  if (item.kind === "ran" && typeof item.reply === "string" && Array.isArray(item.effects)) {
+    return {
+      kind: "ran",
+      round: Number(item.round) || 0,
+      reply: item.reply,
+      text: typeof item.text === "string" ? item.text : "",
+      effects: item.effects
+        .filter((effect): effect is { tool: string; detail: string; output: string } => !!effect && typeof effect === "object" && typeof (effect as { tool?: unknown }).tool === "string")
+        .map((effect) => ({ tool: effect.tool, detail: String(effect.detail ?? ""), output: String(effect.output ?? "") })),
+    };
+  }
+  if ((item.kind === "compile_failed" || item.kind === "runner_failed" || item.kind === "model_error") && typeof item.message === "string") {
+    if (item.kind === "compile_failed") return { kind: "compile_failed", message: item.message, code: typeof item.code === "string" ? item.code : "" };
+    return { kind: item.kind, message: item.message };
+  }
+  return null;
 }
 
 function planOf(raw: unknown): PlanState | null {

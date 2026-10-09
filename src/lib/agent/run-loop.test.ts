@@ -190,6 +190,43 @@ test("a continued segment numbers its rounds after the earlier ones and tells th
   }
 });
 
+test("the binary's own finish after writing a .ml becomes a pause, with the check and last step carried", async () => {
+  const kinds: string[] = [];
+  const result = await runDeskLoop(
+    "key",
+    "写一个 greet.ml",
+    [],
+    ["ocaml", "files"],
+    [],
+    [],
+    "",
+    deps(
+      {
+        runCore: async (job, handlers) => {
+          await handlers.model("prompt");
+          const frame = await handlers.ocaml(`step\n${block("code")}0\n`);
+          // The binary sees a Continue with a freshly written .ml and stops the run itself.
+          assert.match(frame, /^ok\ncontinue\n/);
+          return { status: "done", answer: "已写下 greet.ml", files: [{ path: "greet.ml", content: "let hello n = n" }], modules: job.modules, steps: [], journal: [], memory: "" };
+        },
+        runPayload: async () => `ok\ndone\n${block("已写 greet.ml，hello name 会打招呼")}${block("")}${block("Files.write_file\tgreet.ml\tOk")}1\ngreet.ml\n${block("let hello n = n")}`,
+      },
+      kinds,
+    ),
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.paused, true);
+  assert.equal(result.answer, "已写下 greet.ml；接着做。");
+  // The Done was held for a check; the pending check and the step's returns ride into the next segment.
+  assert.equal(result.plan.pending, "已写 greet.ml，hello name 会打招呼");
+  assert.equal(result.last?.kind, "ran");
+  assert.ok(kinds.includes("check"));
+  // The next segment's first prompt shows both.
+  const text = promptContext({ round: 2, segment: 2, remainingMs: 60_000, files: [{ path: "greet.ml", bytes: 15 }], last: result.last ?? null, plan: result.plan.items, check: result.plan.pending ?? undefined });
+  assert.match(text, /【收尾前核对】[\s\S]*已写 greet\.ml/);
+  assert.match(text, /Files\.write_file greet\.ml → Ok/);
+});
+
 test("a busy model endpoint is asked again before the round is given up", async () => {
   const realFetch = globalThis.fetch;
   const statuses = [429, 503, 200, 400];

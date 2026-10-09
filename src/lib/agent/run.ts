@@ -10,7 +10,7 @@ import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type 
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
 
-type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[]; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
+type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[]; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[]; last?: LastOutcome };
 
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
@@ -93,6 +93,7 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 【对话】
 提示里可能附有【之前的对话】：同一个工作区里用户之前说过的话和你当时的回答。用户这次的话可能是接着说的——追问、补充、改要求、回答你上次的 Ask——按上下文理解，不要当成孤立的新任务。上面已经有的结论直接用，不要重新查一遍；工作区里的文件也还在。
 真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
+任务里出现"我的名字""我的城市""我的……"这类只有用户知道、结果里又必须用到的内容，而【记住的】和【之前的对话】里都没有时，就 Ask 一句问清楚，不要用占位符、示例值或改成参数来绕过——那样做出来的不是用户要的。
 
 【你能用什么】
 只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
@@ -528,6 +529,8 @@ export type LoopDeps = {
   roundBase?: number;
   /** Which segment of the run this is (1 for a fresh run). */
   segment?: number;
+  /** The last step's outcome from the segment before, when it was cut short mid-thought. */
+  last?: LastOutcome;
   /** The plan and check state earlier segments left; a fresh run starts empty. */
   plan?: PlanState;
   /** Earlier exchanges in this desk, oldest first, for follow-ups to read against. */
@@ -574,7 +577,11 @@ export async function runDeskLoop(
   const images: ModelImage[] = files.filter(isImageFile).slice(-MAX_IMAGES_SHOWN).map((file) => ({ path: file.path, dataUrl: file.content }));
   let visionFailed = false;
   let lastCode = "";
-  let last: LastOutcome = null;
+  let last: LastOutcome = deps.last ?? null;
+  // What the last step frame told the loop binary to do. The binary ends a run
+  // on its own when a step wrote a .ml and said Continue ("已写下 …"); that
+  // is detected afterwards and the run carries on in a new segment.
+  let handed: string | null = null;
   // The plan the model keeps with Plan.set / Plan.tick, and the pre-finish
   // check: the first Done of a run that wrote anything is held for one more
   // round so the model verifies its work before the answer goes out.
@@ -714,6 +721,7 @@ export async function runDeskLoop(
                 }
               }
               emit({ kind: "step", round, reply, text: frame.text });
+              handed = reply;
               last = { kind: "ran", round, reply, text: frame.text, effects };
               if (frame.files) fileIndex = frame.files.map((file) => (images.some((image) => image.path === file.path) ? { ...file, image: true } : file));
               compileStall = 0;
@@ -741,7 +749,13 @@ export async function runDeskLoop(
     }
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
     if (haltReason === "budget") {
-      return { ok: true, answer: pausedAnswer(round - roundBase, carried.steps), paused: true, ...carried };
+      return { ok: true, answer: pausedAnswer(round - roundBase, carried.steps), paused: true, ...carried, last: carryLast(last) };
+    }
+    if (result.status === "done" && handed === "continue" && binaryCut(result.answer)) {
+      // The binary finished because a .ml was written, though the step (or the
+      // pre-finish hold) asked to go on. Pause instead, so the next segment
+      // picks up with the same context and the check round still happens.
+      return { ok: true, answer: `${result.answer}；接着做。`, paused: true, ...carried, last: carryLast(last) };
     }
     if (haltReason) return { ok: false, error: stallAnswer(haltReason, haltDetail), ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
@@ -761,6 +775,18 @@ export async function runDeskLoop(
   } finally {
     clearTimeout(timer);
   }
+}
+
+// The loop binary's own early finish after a step wrote a .ml file.
+export function binaryCut(answer: string): boolean {
+  return /^已写下 /.test(answer.trim());
+}
+
+// A last outcome small enough to store with a paused run.
+function carryLast(last: LastOutcome): LastOutcome {
+  if (!last) return null;
+  if (last.kind !== "ran") return { ...last, message: clip(last.message, 1_500), ...(last.kind === "compile_failed" ? { code: clip(last.code, 3_000) } : {}) } as LastOutcome;
+  return { ...last, text: clip(last.text, 500), effects: last.effects.slice(0, 12).map((effect) => ({ tool: effect.tool, detail: clip(effect.detail, 200), output: clip(effect.output, 2_500) })) };
 }
 
 function pausedAnswer(rounds: number, steps: ToolStep[]): string {
@@ -972,6 +998,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
     const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched, plan: result.plan };
     if (status === "done" && endedWithAsk(events)) outcome.asked = true;
+    if (status === "paused" && result.last) outcome.last = result.last;
     const saved = await store.writeDesk(desk.id, state);
     await store.finishRun(run.id, status, rounds, outcome);
     const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
@@ -1009,6 +1036,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
       roundBase: run.rounds,
       segment: run.segment,
       plan: run.result?.plan,
+      last: run.result?.last ?? null,
       history,
       notes: desk.notes,
     });

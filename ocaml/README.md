@@ -38,6 +38,7 @@ dune exec ./bin/demo.exe
 - **Step API 里的 `Plan`**（`ocaml-run.ts` 的前导）：`Plan.set [...]` / `Plan.tick n "结果"` 只是写进 effect 日志的两行，由 Node 解析成清单、附回下一轮提示并推给页面；二进制对它一无所知。
 - **Step API 里的 `Memory`**：同样只是 effect 日志（`Memory.remember "…"` / `Memory.forget n`）。Node 把它们合并进工作区的 `notes`（数据库 `desks.notes`），之后这个工作区的每一个任务的提示都带【记住的】；页面的「它记住的」可以删。
 - **Step API 里的 `Json`、`Files.replace` / `append`、`Net.post`**：`Json.get / items / keys` 是前导里的纯 OCaml 解析器（会跳过 `Net.get` 返回开头的 HTTP 行），让"请求 → 取字段 → 再请求"在一步里做完；`Files.replace path 旧 新` 做局部修改而不是整份重写；`Net.post` 走桥接的 `net_post`（`net.ts` 的 `postPublic`，JSON 体按 JSON 发，不跟随跳转）。桥接给步骤的 Net / Search 返回最多 16k 字，提示里只显示头尾。
+- **二进制的"已写下"提前结束**：`agent.ml` 在某一步写出新的 `.ml` 且回复 Continue 时会自己结束运行（答案 `已写下 X.ml`），这会吞掉收尾核对那一轮和模型自己的答案。Node 识别这种结束（上一帧交给它的是 continue、答案以 `已写下` 开头），改记为 paused，页面自动接下一段；上一步的返回（`last`）和待核对的答案随运行结果一起带过去，所以下一段的第一轮提示里仍有【收尾前核对】和【上一步…】。
 - **桥接的临时文件**：步骤里每次桥接调用用 `ocagent_…in` 临时文件传参，用完即删；`isScratchFile` 再把早先漏进工作区的 `ocagentXXXX.in(.out)` 过滤掉。
 - **对话与笔记的边界**：二进制的 journal / memory 是**一个任务**的笔记和续跑点——新任务从空开始（`startRun` 传空 journal），之前的任务以【之前的对话】（最近几次的任务与回答，`historyFor`）附在提示里。
 - **数据库（`migrations/0002_desks_runs.sql`、`store.server.ts`）**：工作区文件 / harness / 模块 / journal 和每次运行的事件是持久的；浏览器只拿一个工作区 id，刷新或换设备都能接回去。

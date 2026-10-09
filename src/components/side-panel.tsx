@@ -162,7 +162,7 @@ export function SidePanel({
   const disabled = busy || working;
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex min-h-full flex-col">
       <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
         <p className="font-mono text-xs tracking-widest text-muted">工作区</p>
         <div className="flex items-center gap-1">
