@@ -496,3 +496,39 @@ test("historyFor leaves out the current run, running runs and runs without a res
   assert.equal(historyFor(many, "none")[0]?.task, "t-r4");
   assert.equal(historyBlock([]), "");
 });
+
+test("Memory.remember adds to the desk's notes: shown to the model next round, in the timeline, carried in the result", async () => {
+  const texts: string[] = [];
+  const kinds: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { input: { content: string }[] };
+    texts.push(body.input[0]!.content);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const frames = [okFrame("continue", "记下了", "Memory.remember\t\t用户偏好摄氏\nMemory.forget\t1\t"), okFrame("done", "好")];
+  let i = 0;
+  const events: AgentEventBody[] = [];
+  try {
+    const result = await runDeskLoop("key", "以后都用摄氏", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => {
+        kinds.push(event.kind);
+        events.push(event);
+      },
+      budgetMs: 60_000,
+      notes: ["用户在东京"],
+    });
+    assert.match(texts[0] ?? "", /【记住的】[^\n]*\n1\. 用户在东京/);
+    assert.match(texts[1] ?? "", /【记住的】[^\n]*\n1\. 用户偏好摄氏\n/);
+    assert.doesNotMatch(texts[1] ?? "", /用户在东京/);
+    const remembered = events.filter((event) => event.kind === "remember");
+    assert.deepEqual(remembered.map((event) => (event.kind === "remember" ? [event.text, event.forgot] : null)), [["用户偏好摄氏", false], ["用户在东京", true]]);
+    // Memory effects are bookkeeping, not visible calls.
+    assert.ok(!events.some((event) => event.kind === "effect" && event.tool.startsWith("Memory.")));
+    assert.deepEqual(result.notes, ["用户偏好摄氏"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

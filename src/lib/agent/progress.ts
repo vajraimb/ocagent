@@ -17,6 +17,7 @@ export type AgentEventBody =
   | { kind: "module_dropped"; name: string; reason: string }
   | { kind: "todo"; round: number; items: PlanItem[] }
   | { kind: "check"; round: number; answer: string }
+  | { kind: "remember"; round: number; text: string; forgot: boolean }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };
@@ -69,6 +70,50 @@ export function applyPlanEffects(plan: PlanState, effects: { tool: string; detai
 
 export function isPlanEffect(tool: string): boolean {
   return tool === "Plan.set" || tool === "Plan.tick";
+}
+
+// Notes the agent keeps about a desk across tasks (Memory.remember / forget):
+// few and short, so they fit in every prompt.
+export const MAX_NOTES = 24;
+export const MAX_NOTE_CHARS = 200;
+
+export function normalizeNotes(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const notes: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const text = item.replace(/\s+/g, " ").trim();
+    if (!text || notes.includes(text)) continue;
+    notes.push(clip(text, MAX_NOTE_CHARS));
+    if (notes.length >= MAX_NOTES) break;
+  }
+  return notes;
+}
+
+export type NoteChange = { text: string; forgot: boolean };
+
+/** Applies one step's Memory.* effects to the notes; returns what changed, in order. */
+export function applyMemoryEffects(notes: string[], effects: { tool: string; detail: string; output: string }[]): NoteChange[] {
+  const changes: NoteChange[] = [];
+  for (const effect of effects) {
+    if (effect.tool === "Memory.remember") {
+      const text = clip(effect.output.replace(/\s+/g, " ").trim(), MAX_NOTE_CHARS);
+      if (!text || notes.includes(text)) continue;
+      // The newest note wins when the list is full.
+      if (notes.length >= MAX_NOTES) notes.shift();
+      notes.push(text);
+      changes.push({ text, forgot: false });
+    } else if (effect.tool === "Memory.forget") {
+      const index = Number(effect.detail.trim()) - 1;
+      const [gone] = Number.isInteger(index) && index >= 0 ? notes.splice(index, 1) : [];
+      if (gone) changes.push({ text: gone, forgot: true });
+    }
+  }
+  return changes;
+}
+
+export function isMemoryEffect(tool: string): boolean {
+  return tool === "Memory.remember" || tool === "Memory.forget";
 }
 
 /** The plan as the timeline last saw it, or null when the run never set one. */
@@ -299,6 +344,8 @@ export type Round = {
   reply: { kind: string; text: string } | null;
   /** The answer the model wanted to end with, when the loop held it for a check. */
   check: string;
+  /** Notes remembered or forgotten in this round. */
+  remembered: NoteChange[];
 };
 
 export function foldRounds(events: AgentEvent[]): Round[] {
@@ -306,7 +353,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "" };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", remembered: [] };
       rounds.set(round, found);
     }
     return found;
@@ -361,6 +408,9 @@ export function foldRounds(events: AgentEvent[]): Round[] {
       }
       case "check":
         at(event.round).check = event.answer;
+        break;
+      case "remember":
+        at(event.round).remembered.push({ text: event.text, forgot: event.forgot });
         break;
       default:
         break;

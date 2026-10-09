@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   Blocks,
   Braces,
+  Brain,
   Check,
   ChevronDown,
   ChevronRight,
@@ -273,6 +274,9 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         ))}
         {round.modules.map((mod) => (
           <ModuleRow key={mod.name} name={mod.name} exports={mod.exports} />
+        ))}
+        {round.remembered.map((change, index) => (
+          <Row key={`${change.text}-${index}`} icon={<Brain className="h-3.5 w-3.5" aria-hidden />} label={change.forgot ? "忘掉了" : "记住了"} detail={change.text} tone={change.forgot ? "muted" : "accent"} />
         ))}
         {round.check ? <Row icon={<ListChecks className="h-3.5 w-3.5" aria-hidden />} label="想收尾了，先核对一遍再说" detail={round.check} tone="accent" /> : null}
         {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}

@@ -210,7 +210,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Plan、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Plan、Memory、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -820,7 +820,7 @@ function shortenDiagnostic(raw: string, source = ""): string {
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Search、Net、Trace、Clock、Harness、Plan、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Search、Net、Trace、Clock、Harness、Plan、Memory、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
   } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
     lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
@@ -1068,6 +1068,12 @@ module Plan = struct
 
   let tick n note =
     log_effect "Plan.tick" (string_of_int n) note
+end
+
+module Memory = struct
+  let remember text = log_effect "Memory.remember" "" text
+
+  let forget n = log_effect "Memory.forget" (string_of_int n) ""
 end
 
 module Harness = struct

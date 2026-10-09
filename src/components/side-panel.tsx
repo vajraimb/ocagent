@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Blocks, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Blocks, Brain, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
 
@@ -25,6 +25,8 @@ export function SidePanel({
   busy,
   onAddFiles,
   onRemoveFile,
+  notes,
+  onForget,
 }: {
   harnesses: HarnessId[];
   setHarnesses: (next: HarnessId[]) => void;
@@ -43,6 +45,9 @@ export function SidePanel({
   busy: boolean;
   onAddFiles: (files: FileList | File[]) => void;
   onRemoveFile: (path: string) => void;
+  /** What the agent remembered about this desk; shown in every task's prompt. */
+  notes: string[];
+  onForget: (index: number) => void;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -280,6 +285,27 @@ export function SidePanel({
           </ul>
         ) : null}
       </section>
+
+      {notes.length > 0 ? (
+        <section className="px-4 pb-4">
+          <h2 className="flex items-center gap-1.5 text-sm font-medium text-fg">
+            <Brain className="h-4 w-4 text-muted" aria-hidden />
+            它记住的
+            <span className="font-mono text-xs text-muted">{notes.length}</span>
+          </h2>
+          <p className="mt-1 text-xs leading-5 text-muted">它自己记下、以后每件事都会参考的。记错了就删掉。</p>
+          <ul className="mt-2 flex flex-col gap-1">
+            {notes.map((note, index) => (
+              <li key={`${index}-${note}`} className="group flex min-w-0 items-start gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs leading-5 text-fg">
+                <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{note}</span>
+                <button type="button" disabled={disabled} onClick={() => onForget(index)} aria-label={`忘掉：${note}`} className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted hover:text-danger disabled:opacity-50">
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <section
         className={`flex min-h-0 flex-1 flex-col px-4 pb-4 ${dragging ? "rounded-xl outline-2 outline-dashed outline-accent/60" : ""}`}

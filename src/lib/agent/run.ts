@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
-import { applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isPlanEffect, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
+import { applyMemoryEffects, applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isMemoryEffect, isPlanEffect, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
 import { imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
@@ -10,12 +10,12 @@ import { imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, typ
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
 
-type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
+type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[]; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
 
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
 /** The desk as the page sees it: the loop's journal and memory stay on the server. */
-export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; revision: number };
+export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number };
 
 /** One request's worth of a run, plus the desk as it left it. */
 export type RunReply = { run: RunRecord; desk: PublicDesk };
@@ -87,12 +87,15 @@ export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): 
 【图片】
 用户放进工作区的图片会直接随每一轮的提示一起给你看（提示末尾列出它们的路径）。要描述、判断、读取图片里的内容，直接看图后把结论写进 Done；不要 Files.read_file 图片，那只会返回一长串编码。
 
+【记忆】
+Memory.remember "一句话" 把一件以后每次都用得上的事记下来：用户明说要记住的偏好或事实（"以后都用摄氏"、"我在东京"）、费了劲才确认的稳定信息（能用的接口地址、文件的用途）。记下的会出现在这个工作区之后每一个任务的提示里（【记住的】），所以只记长期有用的，不记这次任务的中间结果（那是 Trace.note 和 Plan 的事）。过时了用 Memory.forget n 删掉第 n 条。
+
 【对话】
 提示里可能附有【之前的对话】：同一个工作区里用户之前说过的话和你当时的回答。用户这次的话可能是接着说的——追问、补充、改要求、回答你上次的 Ask——按上下文理解，不要当成孤立的新任务。上面已经有的结论直接用，不要重新查一遍；工作区里的文件也还在。
 真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
 
 【你能用什么】
-只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan、Memory，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
@@ -153,6 +156,11 @@ end
 module Plan : sig
   val set : string list -> unit
   val tick : int -> string -> unit
+end
+
+module Memory : sig
+  val remember : string -> unit
+  val forget : int -> unit
 end
 
 type reply =
@@ -235,6 +243,7 @@ export type PromptContext = {
   images?: string[];
   visionFailed?: boolean;
   history?: HistoryItem[];
+  notes?: string[];
 };
 
 export type FileEntry = { path: string; bytes: number; image?: boolean };
@@ -285,6 +294,9 @@ function effectLine(effect: { tool: string; detail: string; output: string }): s
 
 export function promptContext(ctx: PromptContext): string {
   const parts: string[] = [];
+  if (ctx.notes && ctx.notes.length > 0) {
+    parts.push(`【记住的】（你之前用 Memory.remember 记下的，对这个工作区一直有效）\n${ctx.notes.map((note, index) => `${index + 1}. ${note}`).join("\n")}`);
+  }
   const history = ctx.history ? historyBlock(ctx.history) : "";
   if (history) parts.push(history);
   const shown = ctx.files.slice(0, FILES_LISTED).map((file) => `- ${file.path}（${file.image ? "图片，" : ""}${kb(file.bytes)}）`);
@@ -354,7 +366,8 @@ export function parseDeskState(input: unknown): DeskState | { error: string } {
   const modules = normalizeModules("modules" in input ? input.modules : undefined);
   const journal = normalizeJournal("journal" in input ? input.journal : undefined);
   const memory = "memory" in input && typeof input.memory === "string" ? input.memory.slice(0, 4000) : "";
-  return { files, harnesses, modules, journal, memory };
+  const notes = normalizeNotes("notes" in input ? input.notes : undefined);
+  return { files, harnesses, modules, journal, memory, notes };
 }
 
 function normalizeJournal(raw: unknown): JournalItem[] {
@@ -478,6 +491,8 @@ export type LoopDeps = {
   plan?: PlanState;
   /** Earlier exchanges in this desk, oldest first, for follow-ups to read against. */
   history?: HistoryItem[];
+  /** What the agent remembered about this desk so far (Memory.remember). */
+  notes?: string[];
 };
 
 export async function runDeskLoop(
@@ -523,6 +538,8 @@ export async function runDeskLoop(
   // check: the first Done of a run that wrote anything is held for one more
   // round so the model verifies its work before the answer goes out.
   const plan: PlanState = deps.plan ? { ...deps.plan, items: deps.plan.items.map((item) => ({ ...item })) } : emptyPlan();
+  // Long-lived notes about the desk; steps add to them with Memory.remember.
+  const notes: string[] = [...(deps.notes ?? [])];
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -569,6 +586,7 @@ export async function runDeskLoop(
             images: shownImages.map((image) => image.path),
             visionFailed,
             history: deps.history,
+            notes,
           });
           plan.pending = null;
           // A failed compile deserves a more careful second look.
@@ -638,7 +656,8 @@ export async function runDeskLoop(
               if (compileStall >= MAX_COMPILE_STALL) cut("compile_stall", frame.message);
             } else if (frame?.kind === "ok") {
               if (applyPlanEffects(plan, frame.effects)) emit({ kind: "todo", round, items: plan.items.map((item) => ({ ...item })) });
-              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool));
+              for (const change of applyMemoryEffects(notes, frame.effects)) emit({ kind: "remember", round, text: change.text, forgot: change.forgot });
+              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool));
               for (const effect of effects) emit({ kind: "effect", round, ...effect });
               if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
               let reply = frame.reply;
@@ -673,6 +692,7 @@ export async function runDeskLoop(
       modules: mergeModules(Array.isArray(result?.modules) ? result.modules : modules, loaded, unloaded),
       journal: Array.isArray(result?.journal) ? result.journal : journal,
       memory: typeof result?.memory === "string" ? result.memory : memory,
+      notes,
       plan,
     };
     if (!result || (result.status !== "error" && result.status !== "stopped" && result.status !== "done")) {
@@ -694,6 +714,7 @@ export async function runDeskLoop(
       modules,
       journal,
       memory,
+      notes,
       plan,
     };
   } finally {
@@ -750,7 +771,7 @@ export function isRunId(value: unknown): value is string {
 }
 
 function publicDesk(desk: DeskRecord): PublicDesk {
-  return { id: desk.id, files: desk.files, harnesses: desk.harnesses, modules: desk.modules, revision: desk.revision };
+  return { id: desk.id, files: desk.files, harnesses: desk.harnesses, modules: desk.modules, notes: desk.notes, revision: desk.revision };
 }
 
 function readDeskId(input: unknown): { deskId: string } {
@@ -784,7 +805,7 @@ export const loadDesk = createServerFn({ method: "POST" })
 
 export type DeskSaved = { ok: true; desk: PublicDesk } | { ok: false; error: string };
 
-type SaveInput = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[] };
+type SaveInput = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[] };
 
 // The page's settings and files: everything but the loop's own journal/memory,
 // which only a run may change. Creating a desk is the same call.
@@ -793,7 +814,7 @@ export const saveDesk = createServerFn({ method: "POST" })
     const { deskId } = readDeskId(input);
     const parsed = parseDeskState({ ...(input as object), journal: [], memory: "" });
     if ("error" in parsed) throw new Error(parsed.error);
-    return { deskId, files: parsed.files, harnesses: parsed.harnesses, modules: parsed.modules };
+    return { deskId, files: parsed.files, harnesses: parsed.harnesses, modules: parsed.modules, notes: parsed.notes };
   })
   .handler(async ({ data }): Promise<DeskSaved> => {
     const store = await import("./store.server.ts");
@@ -806,6 +827,7 @@ export const saveDesk = createServerFn({ method: "POST" })
       modules: data.modules,
       journal: current?.journal ?? [],
       memory: current?.memory ?? "",
+      notes: data.notes,
     });
     return { ok: true, desk: publicDesk(saved) };
   });
@@ -901,9 +923,9 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     runProgress.close(run.id, reply, outcome.ok);
     return reply;
   };
-  const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory };
+  const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory, notes: desk.notes };
   if (!apiKey) {
-    return finish("failed", { ok: false, error: "Grok 没有接上。", files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, plan: run.result?.plan ?? emptyPlan() }, state);
+    return finish("failed", { ok: false, error: "Grok 没有接上。", files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, notes: desk.notes, plan: run.result?.plan ?? emptyPlan() }, state);
   }
   const started = Date.now();
   const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
@@ -932,14 +954,15 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
       segment: run.segment,
       plan: run.result?.plan,
       history,
+      notes: desk.notes,
     });
     await alive.stop();
     const events = runProgress.read(run.id).events;
-    return finish(statusFor(result, events), result, { files: result.files, harnesses: desk.harnesses, modules: result.modules, journal: result.journal, memory: result.memory });
+    return finish(statusFor(result, events), result, { files: result.files, harnesses: desk.harnesses, modules: result.modules, journal: result.journal, memory: result.memory, notes: result.notes });
   } catch (err) {
     await alive.stop();
     const message = err instanceof Error ? err.message : "循环没有跑起来。";
-    return finish("failed", { ok: false, error: message, files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, plan: run.result?.plan ?? emptyPlan() }, state);
+    return finish("failed", { ok: false, error: message, files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, notes: desk.notes, plan: run.result?.plan ?? emptyPlan() }, state);
   }
 }
 

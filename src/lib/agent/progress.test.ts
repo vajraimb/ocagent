@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { describeModelReply, describeStepFrame, extractCode, foldRounds, ProgressRegistry, type AgentEvent } from "./progress.ts";
+import { applyMemoryEffects, describeModelReply, describeStepFrame, extractCode, foldRounds, MAX_NOTES, normalizeNotes, ProgressRegistry, type AgentEvent } from "./progress.ts";
 
 function block(text: string): string {
   return `${Buffer.byteLength(text)}\n${text}\n`;
@@ -121,5 +121,34 @@ describe("timeline rounds", () => {
     ]);
     assert.equal(rounds[0]?.compileError, "编译失败");
     assert.equal(rounds[0]?.running, false);
+  });
+});
+
+describe("desk notes", () => {
+  it("remembers new notes, skips duplicates, forgets by 1-based index, and keeps the newest when full", () => {
+    const notes = ["旧的"];
+    const changes = applyMemoryEffects(notes, [
+      { tool: "Memory.remember", detail: "", output: "  用户偏好\n摄氏  " },
+      { tool: "Memory.remember", detail: "", output: "用户偏好 摄氏" },
+      { tool: "Memory.forget", detail: "1", output: "" },
+      { tool: "Memory.forget", detail: "9", output: "" },
+      { tool: "Files.write_file", detail: "a", output: "Ok" },
+    ]);
+    assert.deepEqual(changes, [
+      { text: "用户偏好 摄氏", forgot: false },
+      { text: "旧的", forgot: true },
+    ]);
+    assert.deepEqual(notes, ["用户偏好 摄氏"]);
+    const full = Array.from({ length: MAX_NOTES }, (_, n) => `n${n}`);
+    applyMemoryEffects(full, [{ tool: "Memory.remember", detail: "", output: "newest" }]);
+    assert.equal(full.length, MAX_NOTES);
+    assert.equal(full[0], "n1");
+    assert.equal(full[full.length - 1], "newest");
+  });
+
+  it("normalizes stored notes: strings only, trimmed, unique, capped", () => {
+    assert.deepEqual(normalizeNotes(["a", 1, " a ", "", "b\n c"]), ["a", "b c"]);
+    assert.equal(normalizeNotes(Array.from({ length: 40 }, (_, n) => `x${n}`)).length, MAX_NOTES);
+    assert.deepEqual(normalizeNotes("nope"), []);
   });
 });

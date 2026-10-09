@@ -36,6 +36,8 @@ dune exec ./bin/demo.exe
 - **二进制**：按轮次读模型回复，抽出 `ocaml` 代码块交给 `runStep`，收集 `Trace.note`，判断"模型答完了 / 轮数到了"。它看不到工作区文件，也不管时间。
 - **Node（`src/lib/agent/run.ts`）**：拥有每轮的 prompt 上下文（文件清单、上一步的返回、编译失败的代码、计划勾选状态、剩余时间）、时间预算与分段（`OCAGENT_RUN_BUDGET_MS`）、跨实例的停止标志、把过程写进数据库的进度日志，以及**收尾前核对**：写过文件的运行第一次 `Done` 会被改成 `Continue` 再给一轮，让模型读回文件或算一个已知值核对；核对过的 `Done` 原样放行。
 - **Step API 里的 `Plan`**（`ocaml-run.ts` 的前导）：`Plan.set [...]` / `Plan.tick n "结果"` 只是写进 effect 日志的两行，由 Node 解析成清单、附回下一轮提示并推给页面；二进制对它一无所知。
+- **Step API 里的 `Memory`**：同样只是 effect 日志（`Memory.remember "…"` / `Memory.forget n`）。Node 把它们合并进工作区的 `notes`（数据库 `desks.notes`），之后这个工作区的每一个任务的提示都带【记住的】；页面的「它记住的」可以删。
+- **对话与笔记的边界**：二进制的 journal / memory 是**一个任务**的笔记和续跑点——新任务从空开始（`startRun` 传空 journal），之前的任务以【之前的对话】（最近几次的任务与回答，`historyFor`）附在提示里。
 - **数据库（`migrations/0002_desks_runs.sql`、`store.server.ts`）**：工作区文件 / harness / 模块 / journal 和每次运行的事件是持久的；浏览器只拿一个工作区 id，刷新或换设备都能接回去。
 
 因此调整"什么时候停、每轮给模型看什么、一段最多跑多久"改 `run.ts` 即可，不需要重编 `agent.ml`。重编二进制时请保持它的 stdin/stdout 帧格式不变（`ok\n<kind>\n…` / `fail\n…`）。

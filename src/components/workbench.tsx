@@ -26,7 +26,7 @@ import { MAX_FILES, isImageFile, safePath, type DeskFile } from "@/lib/agent/wor
 
 // The browser keeps only the desk's key and a cache for the first paint; the
 // desk itself (files, harnesses, modules) and every run live on the server.
-type Cache = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; runs: RunRecord[] };
+type Cache = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; runs: RunRecord[] };
 
 type LegacySaved = { files?: DeskFile[]; harnesses?: string[]; modules?: DeskModule[] };
 
@@ -85,6 +85,7 @@ function readCache(raw: string | null): Cache | null {
             return ok ? [{ ...ok, source: mod.source, at: mod.at }] : [];
           })
         : [],
+      notes: Array.isArray(parsed.notes) ? parsed.notes.filter((note): note is string => typeof note === "string") : [],
       runs: Array.isArray(parsed.runs) ? parsed.runs.filter(isRun) : [],
     };
   } catch {
@@ -256,6 +257,8 @@ export function Workbench() {
   const [harnesses, setHarnesses] = useState<HarnessId[]>(DEFAULT_HARNESSES);
   const [modules, setModules] = useState<DeskModule[]>([]);
   const [files, setFiles] = useState<DeskFile[]>([]);
+  // What the agent has remembered about this desk (Memory.remember).
+  const [notes, setNotes] = useState<string[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [selected, setSelected] = useState("");
   const [ready, setReady] = useState(false);
@@ -272,8 +275,8 @@ export function Workbench() {
   // not stored yet (settings edited between runs).
   const synced = useRef(false);
   const dirty = useRef(false);
-  const latest = useRef({ files, harnesses, modules });
-  latest.current = { files, harnesses, modules };
+  const latest = useRef({ files, harnesses, modules, notes });
+  latest.current = { files, harnesses, modules, notes };
   const finished = useRef(new Set<string>());
   // Runs whose request died mid-flight; polling keeps looking for them on the
   // server until the deadline, then they are marked failed with this message.
@@ -294,6 +297,7 @@ export function Workbench() {
     setFiles(desk.files.filter(keepFile));
     setHarnesses(desk.harnesses.length ? desk.harnesses : DEFAULT_HARNESSES);
     setModules(desk.modules);
+    setNotes(desk.notes ?? []);
     synced.current = true;
     dirty.current = false;
   }, []);
@@ -304,7 +308,7 @@ export function Workbench() {
     if (!deskId) return false;
     const snapshot = latest.current;
     try {
-      const saved = await saveDesk({ data: { deskId, files: snapshot.files, harnesses: snapshot.harnesses, modules: snapshot.modules } });
+      const saved = await saveDesk({ data: { deskId, files: snapshot.files, harnesses: snapshot.harnesses, modules: snapshot.modules, notes: snapshot.notes } });
       if (!saved.ok) {
         saveFailed.current = true;
         setNotice(saved.error);
@@ -338,6 +342,7 @@ export function Workbench() {
       setFiles(cache.files);
       setHarnesses(cache.harnesses.length ? cache.harnesses : DEFAULT_HARNESSES);
       setModules(cache.modules);
+      setNotes(cache.notes);
       setRuns(cache.runs);
     } else if (legacy) {
       setFiles(legacy.files);
@@ -385,6 +390,7 @@ export function Workbench() {
       files,
       harnesses,
       modules,
+      notes,
       runs: runs.slice(-RUNS_CACHED).map((run) => ({ ...run, events: run.events.slice(-EVENTS_CACHED) })),
     };
     try {
@@ -392,14 +398,14 @@ export function Workbench() {
     } catch {
       /* storage full: the server copy is unaffected */
     }
-  }, [ready, deskId, files, harnesses, modules, runs]);
+  }, [ready, deskId, files, harnesses, modules, notes, runs]);
 
   // Settings edited between runs are stored shortly after.
   useEffect(() => {
     if (!ready || !deskId || running || !dirty.current) return;
     const timer = window.setTimeout(() => void sync(), 600);
     return () => window.clearTimeout(timer);
-  }, [ready, deskId, running, files, harnesses, modules, sync]);
+  }, [ready, deskId, running, files, harnesses, modules, notes, sync]);
 
   const settle = useCallback(
     (runId: string, patch: (run: RunRecord) => RunRecord) => {
@@ -663,6 +669,12 @@ export function Workbench() {
     markDirty();
   }
 
+  function forgetNote(index: number) {
+    if (running) return;
+    setNotes((current) => current.filter((_, at) => at !== index));
+    markDirty();
+  }
+
   function changeModules(next: DeskModule[]) {
     setModules(next);
     markDirty();
@@ -725,6 +737,8 @@ export function Workbench() {
       durable={durable}
       onAddFiles={(list) => void addFiles(list)}
       onRemoveFile={removeFile}
+      notes={notes}
+      onForget={forgetNote}
       busy={running}
     />
   );

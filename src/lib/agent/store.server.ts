@@ -3,10 +3,10 @@
 // unguessable key the browser holds, and that key is the whole access model.
 import { dbSource, getSql, type Sql } from "@/lib/db";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
-import type { AgentEvent, PlanItem, PlanState } from "./progress.ts";
+import { normalizeNotes, type AgentEvent, type PlanItem, type PlanState } from "./progress.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
-export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string };
+export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[] };
 export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: number };
 
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
@@ -46,7 +46,7 @@ const MAX_EVENTS_STORED = 400;
 const RUNS_LISTED = 24;
 const RUNS_WITH_EVENTS = 6;
 
-type DeskRow = { id: string; files: unknown; harnesses: unknown; modules: unknown; journal: unknown; memory: string; revision: number; updated_at: number };
+type DeskRow = { id: string; files: unknown; harnesses: unknown; modules: unknown; journal: unknown; memory: string; notes: unknown; revision: number; updated_at: number };
 type RunRow = {
   id: string;
   desk_id: string;
@@ -143,6 +143,7 @@ function deskOf(row: DeskRow): DeskRecord {
     modules: normalizeModules(parsed(row.modules)),
     journal: journalOf(row.journal),
     memory: typeof row.memory === "string" ? row.memory : "",
+    notes: normalizeNotes(parsed(row.notes)),
     revision: Number(row.revision) || 0,
     updatedAt: Number(row.updated_at) || 0,
   };
@@ -175,14 +176,15 @@ export async function writeDesk(id: string, state: DeskState): Promise<DeskRecor
   const sql = await getSql();
   const now = Date.now();
   const rows = await sql<DeskRow>`
-    insert into desks (id, files, harnesses, modules, journal, memory, revision, created_at, updated_at)
-    values (${id}, ${JSON.stringify(state.files)}::jsonb, ${JSON.stringify(state.harnesses)}::jsonb, ${JSON.stringify(state.modules)}::jsonb, ${JSON.stringify(state.journal)}::jsonb, ${state.memory}, 1, ${now}, ${now})
+    insert into desks (id, files, harnesses, modules, journal, memory, notes, revision, created_at, updated_at)
+    values (${id}, ${JSON.stringify(state.files)}::jsonb, ${JSON.stringify(state.harnesses)}::jsonb, ${JSON.stringify(state.modules)}::jsonb, ${JSON.stringify(state.journal)}::jsonb, ${state.memory}, ${JSON.stringify(normalizeNotes(state.notes))}::jsonb, 1, ${now}, ${now})
     on conflict (id) do update set
       files = excluded.files,
       harnesses = excluded.harnesses,
       modules = excluded.modules,
       journal = excluded.journal,
       memory = excluded.memory,
+      notes = excluded.notes,
       revision = desks.revision + 1,
       updated_at = excluded.updated_at
     returning *`;
@@ -190,7 +192,7 @@ export async function writeDesk(id: string, state: DeskState): Promise<DeskRecor
 }
 
 // Settings the user changes between runs; the loop's own state is untouched.
-export async function writeDeskSettings(id: string, patch: Partial<Pick<DeskState, "files" | "harnesses" | "modules">>): Promise<DeskRecord | null> {
+export async function writeDeskSettings(id: string, patch: Partial<Pick<DeskState, "files" | "harnesses" | "modules" | "notes">>): Promise<DeskRecord | null> {
   const current = await readDesk(id);
   if (!current) return null;
   return writeDesk(id, { ...current, ...patch });
@@ -286,5 +288,5 @@ export async function activeRun(deskId: string): Promise<RunRecord | null> {
 export async function clearDesk(id: string): Promise<void> {
   const sql = await getSql();
   await sql`delete from runs where desk_id = ${id} and status not in ('running')`;
-  await writeDesk(id, { files: [], harnesses: normalizeHarnesses(undefined), modules: [], journal: [], memory: "" });
+  await writeDesk(id, { files: [], harnesses: normalizeHarnesses(undefined), modules: [], journal: [], memory: "", notes: [] });
 }
