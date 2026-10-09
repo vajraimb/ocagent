@@ -434,6 +434,9 @@ export function Workbench() {
         if (cancelled || !loaded.found) return;
         setSchedules(loaded.schedules);
         setRuns((current) => (loaded.runs.length >= current.length ? loaded.runs : current));
+        // A scheduled run that already finished changed the files; take the
+        // server's copy unless this page has edits of its own waiting.
+        if (!dirty.current) absorbDesk(loaded.desk);
         const open = loaded.runs.find((run) => run.status === "running");
         if (open) setDriving(open.id);
       } catch {
@@ -454,7 +457,7 @@ export function Workbench() {
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [deskId, running, schedules]);
+  }, [deskId, running, schedules, absorbDesk]);
 
   useEffect(() => {
     if (!ready || !deskId) return;
