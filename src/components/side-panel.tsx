@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
-import { Blocks, Check, Download, FilePlus, FileText, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Blocks, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
-import type { DeskFile } from "@/lib/agent/workspace";
+import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
 
 const FIXED: HarnessId[] = ["ocaml"];
 
@@ -316,7 +316,7 @@ export function SidePanel({
             添加文件
           </button>
         </div>
-        {files.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">{dragging ? "松手就放进工作区。" : "还没有文件。让它写一个，或把自己的文本文件拖到这里、点「添加文件」放进来，然后让它处理。"}</p> : null}
+        {files.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">{dragging ? "松手就放进工作区。" : "还没有文件。让它写一个，或把自己的文本文件、图片拖到这里、点「添加文件」放进来，然后让它处理。"}</p> : null}
         {files.length > 0 ? (
           <ul className="mt-2 flex flex-col">
             {files.map((item) => {
@@ -328,7 +328,7 @@ export function SidePanel({
                     onClick={() => onSelect(active ? "" : item.path)}
                     className={`flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left font-mono text-xs ${active ? "bg-raised text-fg" : "text-muted hover:bg-raised hover:text-fg"}`}
                   >
-                    <FileText className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                    {isImageFile(item) ? <Image className="h-3.5 w-3.5 shrink-0" aria-hidden /> : <FileText className="h-3.5 w-3.5 shrink-0" aria-hidden />}
                     <span className="truncate">{item.path}</span>
                   </button>
                 </li>
@@ -352,7 +352,11 @@ export function SidePanel({
                 {installError?.path === file.path ? <p className="min-w-0 flex-1 text-xs leading-5 text-danger">{installError.text}</p> : null}
               </div>
             ) : null}
-            <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{file.content}</pre>
+            {isImageFile(file) ? (
+              <img src={file.content} alt={file.path} className="max-h-72 w-full rounded-lg border border-border bg-bg object-contain" />
+            ) : (
+              <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{file.content}</pre>
+            )}
             <div className="flex items-center justify-between gap-2 text-xs text-muted">
               <span className="font-mono">{sizeLabel(file.content)}</span>
               <button type="button" disabled={disabled} onClick={() => onRemoveFile(file.path)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs text-muted hover:text-danger disabled:opacity-50">
@@ -374,6 +378,10 @@ export function SidePanel({
 }
 
 function sizeLabel(content: string): string {
+  if (isImageFile({ content })) {
+    const bytes = imageBytes({ content });
+    return `图片 · ${bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`} · 它每轮都能看到`;
+  }
   const bytes = new TextEncoder().encode(content).length;
   const lines = content.split("\n").length;
   return bytes < 1024 ? `${bytes} B · ${lines} 行` : `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB · ${lines} 行`;

@@ -1,5 +1,16 @@
 export type DeskFile = { path: string; content: string };
 
+// Pictures the user puts in the workspace are kept as data URLs; the model is
+// shown them directly, and steps see only the encoded text.
+export function isImageFile(file: Pick<DeskFile, "content">): boolean {
+  return file.content.startsWith("data:image/");
+}
+
+export function imageBytes(file: Pick<DeskFile, "content">): number {
+  const comma = file.content.indexOf(",");
+  return comma < 0 ? 0 : Math.floor(((file.content.length - comma - 1) * 3) / 4);
+}
+
 export type ToolStep = {
   tool: string;
   detail: string;

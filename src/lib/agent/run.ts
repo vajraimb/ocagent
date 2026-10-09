@@ -5,7 +5,7 @@ import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
 import { applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isPlanEffect, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
-import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
+import { imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
@@ -82,6 +82,9 @@ export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): 
   end
 
 代码块之外不要写任何文字。想解释思路，写成 OCaml 注释 (* ... *)。
+
+【图片】
+用户放进工作区的图片会直接随每一轮的提示一起给你看（提示末尾列出它们的路径）。要描述、判断、读取图片里的内容，直接看图后把结论写进 Done；不要 Files.read_file 图片，那只会返回一长串编码。
 
 【你能用什么】
 只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
@@ -207,8 +210,6 @@ end`;
 // the model would otherwise have to re-discover (files, the last step's
 // returns, the code that failed to compile, time left) is appended here.
 
-export type FileEntry = { path: string; bytes: number };
-
 export type LastOutcome =
   | { kind: "compile_failed"; message: string; code: string }
   | { kind: "ran"; round: number; reply: string; text: string; effects: { tool: string; detail: string; output: string }[] }
@@ -216,7 +217,9 @@ export type LastOutcome =
   | { kind: "model_error"; message: string }
   | null;
 
-export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome; plan?: PlanItem[]; check?: string | null };
+export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome; plan?: PlanItem[]; check?: string | null; images?: string[]; visionFailed?: boolean };
+
+export type FileEntry = { path: string; bytes: number; image?: boolean };
 
 const MAX_PROMPT = 24_000;
 const MAX_CONTEXT = 20_000;
@@ -230,14 +233,15 @@ function kb(bytes: number): string {
 
 function effectLine(effect: { tool: string; detail: string; output: string }): string {
   const wide = effect.tool === "Files.read_file" || effect.tool === "Net.get" || effect.tool === "Search.query";
-  const output = clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 1_500 : 400);
+  const picture = /^(Ok )?data:image\//.test(effect.output);
+  const output = picture ? "Ok （这是一张图片的编码；图片本身已经附在提示里，直接看图）" : clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 1_500 : 400);
   const detail = effect.detail.trim() ? ` ${clip(effect.detail.trim(), 120)}` : "";
   return `- ${effect.tool}${detail} → ${output || "（没有输出）"}`;
 }
 
 export function promptContext(ctx: PromptContext): string {
   const parts: string[] = [];
-  const shown = ctx.files.slice(0, FILES_LISTED).map((file) => `- ${file.path}（${kb(file.bytes)}）`);
+  const shown = ctx.files.slice(0, FILES_LISTED).map((file) => `- ${file.path}（${file.image ? "图片，" : ""}${kb(file.bytes)}）`);
   const more = ctx.files.length > FILES_LISTED ? `\n…共 ${ctx.files.length} 个文件` : "";
   parts.push(`【工作区现在有】\n${shown.length ? shown.join("\n") + more : "（空，还没有文件）"}`);
   const last = ctx.last;
@@ -251,6 +255,13 @@ export function promptContext(ctx: PromptContext): string {
     parts.push(`【上一步没有跑起来】\n${clip(last.message, 600)}`);
   } else if (last?.kind === "model_error") {
     parts.push(`【上一轮模型没有回应】\n${clip(last.message, 400)}`);
+  }
+  if (ctx.images && ctx.images.length > 0) {
+    parts.push(
+      ctx.visionFailed
+        ? `【图片】工作区里有 ${ctx.images.length} 张图片（${ctx.images.join("、")}），但这次模型接口没有接受图片，你看不到它们的内容。如实说明，不要猜。`
+        : `【图片】下面 ${ctx.images.length} 张图片已经附在这条提示里，你现在就能看到：${ctx.images.join("、")}。要描述或判断它们，直接看图写结论。`,
+    );
   }
   if (ctx.plan && ctx.plan.length > 0) {
     const done = ctx.plan.filter((item) => item.done).length;
@@ -321,9 +332,21 @@ function block(text: string): string {
 
 type Effort = "low" | "medium";
 
-function askModel(apiKey: string, prompt: string, context: string, harnesses: HarnessId[], modules: DeskModule[], signal?: AbortSignal, effort: Effort = "low"): Promise<string> {
+export type ModelImage = { path: string; dataUrl: string };
+
+// How many pictures ride along with a round; the newest win.
+export const MAX_IMAGES_SHOWN = 4;
+
+type AskOptions = { signal?: AbortSignal; effort?: Effort; images?: ModelImage[]; onVisionFailed?: () => void };
+
+function askModel(apiKey: string, prompt: string, context: string, harnesses: HarnessId[], modules: DeskModule[], opts: AskOptions = {}): Promise<string> {
+  const { signal, effort = "low", images = [] } = opts;
   const slowGuard = AbortSignal.timeout(90_000);
   const input = `${prompt.slice(0, MAX_PROMPT)}\n\n${context}`;
+  const content =
+    images.length > 0
+      ? [{ type: "input_text", text: input }, ...images.map((image) => ({ type: "input_image", image_url: image.dataUrl, detail: "auto" }))]
+      : input;
   return fetch("https://api.x.ai/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
@@ -333,10 +356,16 @@ function askModel(apiKey: string, prompt: string, context: string, harnesses: Ha
       reasoning: { effort },
       max_output_tokens: 6000,
       instructions: instructionsFor(harnesses, modules),
-      input: [{ role: "user", content: input }],
+      input: [{ role: "user", content }],
     }),
   })
     .then(async (response) => {
+      if (!response.ok && images.length > 0 && response.status >= 400 && response.status < 500) {
+        // The endpoint would not take the pictures: say so in the next
+        // context and ask again with text only, rather than failing the round.
+        opts.onVisionFailed?.();
+        return askModel(apiKey, prompt, context, harnesses, modules, { ...opts, images: [] });
+      }
       if (!response.ok) return `error\n${block(`模型没有接上（${response.status}）。`)}`;
       const body = (await response.json()) as ResponseBody;
       const text = textOf(body);
@@ -435,7 +464,11 @@ export async function runDeskLoop(
   };
   // What the next prompt is told about: the workspace as the last step left
   // it, and how that step went.
-  let fileIndex: FileEntry[] = files.map((file) => ({ path: file.path, bytes: Buffer.byteLength(file.content) }));
+  let fileIndex: FileEntry[] = files.map((file) => (isImageFile(file) ? { path: file.path, bytes: imageBytes(file), image: true } : { path: file.path, bytes: Buffer.byteLength(file.content) }));
+  // Pictures the user put in the desk are shown to the model every round
+  // (steps cannot make new ones, so the starting set is the set).
+  const images: ModelImage[] = files.filter(isImageFile).slice(-MAX_IMAGES_SHOWN).map((file) => ({ path: file.path, dataUrl: file.content }));
+  let visionFailed = false;
   let lastCode = "";
   let last: LastOutcome = null;
   // The plan the model keeps with Plan.set / Plan.tick, and the pre-finish
@@ -476,11 +509,29 @@ export async function runDeskLoop(
           }
           round += 1;
           emit({ kind: "think", round });
-          const context = promptContext({ round, segment, remainingMs: deadline - Date.now(), files: fileIndex, last, plan: plan.items, check: plan.pending });
+          const shownImages = images.filter((image) => fileIndex.some((file) => file.path === image.path));
+          const context = promptContext({
+            round,
+            segment,
+            remainingMs: deadline - Date.now(),
+            files: fileIndex,
+            last,
+            plan: plan.items,
+            check: plan.pending,
+            images: shownImages.map((image) => image.path),
+            visionFailed,
+          });
           plan.pending = null;
           // A failed compile deserves a more careful second look.
           const effort: Effort = last?.kind === "compile_failed" ? "medium" : "low";
-          const raw = await askModel(apiKey, prompt, context, harnesses, loaded, signal, effort);
+          const raw = await askModel(apiKey, prompt, context, harnesses, loaded, {
+            signal,
+            effort,
+            images: visionFailed ? [] : shownImages,
+            onVisionFailed: () => {
+              visionFailed = true;
+            },
+          });
           const reply = describeModelReply(raw);
           if (reply?.kind === "error") {
             emit({ kind: "model_error", round, message: reply.message });
@@ -555,7 +606,7 @@ export async function runDeskLoop(
               }
               emit({ kind: "step", round, reply, text: frame.text });
               last = { kind: "ran", round, reply, text: frame.text, effects };
-              if (frame.files) fileIndex = frame.files;
+              if (frame.files) fileIndex = frame.files.map((file) => (images.some((image) => image.path === file.path) ? { ...file, image: true } : file));
               compileStall = 0;
               idleStall = reply === "continue" && effects.length === 0 && !plan.pending ? idleStall + 1 : 0;
               if (idleStall >= MAX_IDLE_STALL) cut("idle_stall", frame.text);

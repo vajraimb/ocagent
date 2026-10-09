@@ -379,3 +379,74 @@ test("a continued segment inherits the plan and does not check twice", async () 
   assert.ok(!events.some((event) => event.kind === "check"));
   assert.deepEqual(result.plan.items.map((item) => item.done), [true, true]);
 });
+
+test("pictures in the desk ride along with every model call, and a refusal falls back to text", async () => {
+  const bodies: { content: unknown }[] = [];
+  const realFetch = globalThis.fetch;
+  let refusals = 0;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { input: { content: unknown }[] };
+    bodies.push(body.input[0]!);
+    const hasImage = Array.isArray(body.input[0]!.content);
+    if (hasImage && refusals === 0) {
+      refusals += 1;
+      return new Response("{}", { status: 400 });
+    }
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const picture = { path: "images/cat.jpg", content: `data:image/jpeg;base64,${"A".repeat(400)}` };
+  const frames = [okFrame("done", "是一只猫", "")];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "照片里是什么", [picture, { path: "notes.md", content: "x" }], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: () => {},
+      budgetMs: 60_000,
+    });
+    assert.equal(result.ok, true);
+    // First attempt carried the picture as an input_image part…
+    const first = bodies[0]!.content as { type: string; image_url?: string; text?: string }[];
+    assert.ok(Array.isArray(first));
+    assert.equal(first[0]?.type, "input_text");
+    assert.match(first[0]?.text ?? "", /【图片】下面 1 张图片已经附在这条提示里[\s\S]*images\/cat\.jpg/);
+    assert.match(first[0]?.text ?? "", /images\/cat\.jpg（图片，300 B）/);
+    assert.equal(first[1]?.type, "input_image");
+    assert.equal(first[1]?.image_url, picture.content);
+    // …and after the 400 the same round was retried as plain text.
+    assert.equal(bodies.length, 2);
+    assert.equal(typeof bodies[1]!.content, "string");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("after a vision refusal the next round tells the model it cannot see the pictures", async () => {
+  const texts: string[] = [];
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { input: { content: unknown }[] };
+    calls += 1;
+    if (Array.isArray(body.input[0]!.content)) return new Response("{}", { status: 400 });
+    texts.push(body.input[0]!.content as string);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const picture = { path: "images/cat.jpg", content: `data:image/jpeg;base64,${"A".repeat(40)}` };
+  // The step's frame lists the workspace it left, picture included.
+  const withPicture = (reply: string, text: string, effects: string) => `ok\n${reply}\n${block(text)}${block("")}${block(effects)}1\n${picture.path}\n${block(picture.content)}`;
+  const frames = [withPicture("continue", "看看", "Trace.note\t\t想看图"), withPicture("done", "看不到图", "")];
+  let i = 0;
+  try {
+    await runDeskLoop("key", "照片里是什么", [picture], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: () => {},
+      budgetMs: 60_000,
+    });
+    assert.equal(calls, 3, "one refused attempt, then text-only rounds without retrying pictures");
+    assert.match(texts[1] ?? "", /模型接口没有接受图片，你看不到它们的内容/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

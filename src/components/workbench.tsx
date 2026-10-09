@@ -22,7 +22,7 @@ import {
   type RunRecord,
   type RunReply,
 } from "@/lib/agent/run";
-import { MAX_FILES, safePath, type DeskFile } from "@/lib/agent/workspace";
+import { MAX_FILES, isImageFile, safePath, type DeskFile } from "@/lib/agent/workspace";
 
 // The browser keeps only the desk's key and a cache for the first paint; the
 // desk itself (files, harnesses, modules) and every run live on the server.
@@ -127,6 +127,47 @@ function chooseDeskId(): string {
   const fresh = uid("desk");
   localStorage.setItem(DESK_KEY, fresh);
   return fresh;
+}
+
+function isPicture(item: File): boolean {
+  return item.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/i.test(item.name);
+}
+
+// The longest edge a picture is shrunk to, and the biggest encoded size that
+// fits a file slot (base64 grows it by a third) and a model call.
+const PICTURE_EDGE = 1280;
+const PICTURE_MAX_CHARS = 480_000;
+
+// Re-encodes a picture as a JPEG data URL small enough for the workspace.
+async function shrinkPicture(item: File): Promise<string | null> {
+  let bitmap: ImageBitmap;
+  try {
+    bitmap = await createImageBitmap(item);
+  } catch {
+    return null;
+  }
+  try {
+    const scale = Math.min(1, PICTURE_EDGE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    for (const quality of [0.85, 0.75, 0.65, 0.5, 0.4]) {
+      const url = canvas.toDataURL("image/jpeg", quality);
+      if (url.length <= PICTURE_MAX_CHARS) return url;
+    }
+    // Still too big: halve the edge and try once more.
+    const half = document.createElement("canvas");
+    half.width = Math.max(1, Math.round(canvas.width / 2));
+    half.height = Math.max(1, Math.round(canvas.height / 2));
+    half.getContext("2d")?.drawImage(canvas, 0, 0, half.width, half.height);
+    const url = half.toDataURL("image/jpeg", 0.6);
+    return url.length <= PICTURE_MAX_CHARS ? url : null;
+  } finally {
+    bitmap.close();
+  }
 }
 
 // The path a dropped or picked file gets: its folder path when a folder was
@@ -560,6 +601,21 @@ export function Workbench() {
     const refused: string[] = [];
     const accepted: DeskFile[] = [];
     for (const item of incoming) {
+      if (isPicture(item)) {
+        // Pictures are shrunk here so they fit a file slot and a model call.
+        const picture = await shrinkPicture(item);
+        if (!picture) {
+          refused.push(`${item.name}：这张图读不出来（HEIC 等格式请先转成 JPG）`);
+          continue;
+        }
+        const path = filePathFor(item).replace(/\.[^.]+$/, "") + ".jpg";
+        if (!safePath(path)) {
+          refused.push(`${item.name}：名字只能用字母、数字、点、下划线和横线`);
+          continue;
+        }
+        accepted.push({ path, content: picture });
+        continue;
+      }
       const path = filePathFor(item);
       if (!safePath(path)) {
         refused.push(`${item.name}：名字只能用字母、数字、点、下划线和横线`);
@@ -571,7 +627,7 @@ export function Workbench() {
       }
       const content = await item.text();
       if (content.includes("\u0000")) {
-        refused.push(`${item.name}：看起来是二进制文件，只收文本`);
+        refused.push(`${item.name}：看起来是二进制文件，只收文本和图片`);
         continue;
       }
       accepted.push({ path, content });
@@ -592,8 +648,9 @@ export function Workbench() {
       setSelected(accepted[accepted.length - 1]?.path ?? "");
     }
     const replaced = accepted.filter((next) => files.some((file) => file.path === next.path)).length;
+    const pictures = accepted.filter(isImageFile).length;
     const parts = [];
-    if (accepted.length) parts.push(`加了 ${accepted.length} 个文件${replaced ? `（覆盖 ${replaced} 个同名）` : ""}`);
+    if (accepted.length) parts.push(`加了 ${accepted.length} 个文件${pictures ? `（${pictures} 张图片，它每一轮都能直接看到）` : ""}${replaced ? `（覆盖 ${replaced} 个同名）` : ""}`);
     if (refused.length) parts.push(`没收：${refused.join("；")}`);
     setNotice(parts.join("。"));
   }
