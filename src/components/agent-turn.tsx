@@ -436,6 +436,7 @@ function iconFor(tool: string): ReactNode {
       return <Search className={cls} aria-hidden />;
     case "Net.get":
     case "Net.post":
+    case "Net.page":
     case "http_get":
       return <Globe className={cls} aria-hidden />;
     case "Files.write_file":
@@ -490,6 +491,7 @@ function toolLabel(tool: string): string {
     "Search.query": "搜索",
     "Net.get": "请求",
     "Net.post": "发送",
+    "Net.page": "翻页",
     "Json.get": "取字段",
     "Json.items": "取数组",
     "Json.keys": "看字段",

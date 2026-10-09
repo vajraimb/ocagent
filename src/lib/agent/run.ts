@@ -166,6 +166,7 @@ end
 module Net : sig
   val get : string -> string res
   val post : string -> string -> string res
+  val page : string -> int -> string res
 end
 
 module Trace : sig
@@ -220,7 +221,8 @@ end
 - 接口返回的是 JSON 时，在同一步里就能接着用：Json.get body "main.temp"、Json.get body "results.0.name"（路径用点分隔，数组用下标），Json.items body "results" 取数组各项，Json.keys body "" 看有哪些字段。Net.get / Net.post 的返回可以直接喂给 Json，开头的 HTTP 行会被跳过。这样「先请求、取字段、再请求」可以在一步里做完。
 - 要人读了才知道的内容（网页正文、搜索结果），才拆成两步：先 Continue，下一轮看着返回值再调用。
 - Net.post url body 发送一个请求体（是 JSON 就按 JSON 发）；返回和 Net.get 一样。
-- 只要这一步调用了 Net.get、Net.post 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用返回值或笔记里出现过的数字。
+- 网页正文一次给约 4000 字。返回末尾写着「第 1/3 页 … Net.page url 2 看下一页」时，内容还没完：要找的东西不在第 1 页就 Net.page url 2、3 翻下去（翻页不重新请求），找到为止再下结论；不要只看第一页就说"没有"。
+- 只要这一步调用了 Net.get、Net.page、Net.post 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用返回值或笔记里出现过的数字。
 
 【工作方式】
 - 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。

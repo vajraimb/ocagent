@@ -60,10 +60,14 @@ export async function fetchSource(raw: string): Promise<{ ok: true; text: string
   return { ok: false, error: "跳转太多次。" };
 }
 
-const MAX_PAGE_TEXT = 4_000;
-// Data replies (JSON, CSV, plain text) keep more: a step can take them apart
-// with Json.get even though the prompt only shows the head and tail.
-const MAX_DATA_TEXT = 16_000;
+// A web page is handed over in pages of this many characters; Net.page turns
+// to the next one. Data replies (JSON, CSV, plain text) keep more at once: a
+// step can take them apart with Json.get even though the prompt shows less.
+export const PAGE_CHARS = 4_000;
+const MAX_DATA_TEXT = 15_000;
+const MAX_PAGE_TOTAL = 400_000;
+const CACHE_MS = 10 * 60_000;
+const CACHE_SIZE = 24;
 const MAX_POST_BODY = 20_000;
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–", middot: "·" };
@@ -139,12 +143,48 @@ export function readablePage(html: string): string {
     .filter(Boolean)
     .join("\n");
   const head = [title ? `标题：${decodeEntities(title).replace(/\s+/g, " ").trim()}` : "", description ? `描述：${decodeEntities(description).replace(/\s+/g, " ").trim()}` : ""].filter(Boolean);
-  return [...head, text].filter(Boolean).join("\n").slice(0, MAX_PAGE_TEXT);
+  return [...head, text].filter(Boolean).join("\n").slice(0, MAX_PAGE_TOTAL);
 }
 
-export async function fetchPublic(raw: string): Promise<string> {
+/** One page of a long text, with a footer that says how to turn to the next. */
+export function pageOf(text: string, page: number, url = ""): string {
+  const pages = Math.max(1, Math.ceil(text.length / PAGE_CHARS));
+  const n = Math.min(Math.max(1, Math.floor(page)), pages);
+  // Break at a line end near the boundary when there is one.
+  let start = (n - 1) * PAGE_CHARS;
+  let end = Math.min(text.length, n * PAGE_CHARS);
+  if (n > 1) {
+    const back = text.lastIndexOf("\n", start);
+    if (back > start - 200) start = back + 1;
+  }
+  if (end < text.length) {
+    const cut = text.lastIndexOf("\n", end);
+    if (cut > end - 200 && cut > start) end = cut;
+  }
+  const body = text.slice(start, end).trim();
+  if (pages === 1) return body;
+  const next = n < pages ? `；Net.page ${url || "url"} ${n + 1} 看下一页` : "；这是最后一页";
+  const footer = `（第 ${n}/${pages} 页，全文约 ${text.length} 字${next}）`;
+  return `${n > 1 ? `（第 ${n}/${pages} 页）\n` : ""}${body}\n${footer}`;
+}
+
+type Fetched = { status: number; host: string; text: string; html: boolean; at: number };
+const recent = new Map<string, Fetched>();
+
+function remember(key: string, value: Fetched): void {
+  recent.set(key, value);
+  if (recent.size > CACHE_SIZE) {
+    const oldest = recent.keys().next().value;
+    if (oldest !== undefined) recent.delete(oldest);
+  }
+}
+
+async function fetchOnce(raw: string): Promise<Fetched | string> {
   let current = publicUrl(raw);
   if (!current) return "这个地址不能请求。";
+  const key = current.toString();
+  const cached = recent.get(key);
+  if (cached && Date.now() - cached.at < CACHE_MS) return cached;
   for (let hop = 0; hop < 3; hop += 1) {
     const response = await fetch(current, {
       method: "GET",
@@ -159,14 +199,35 @@ export async function fetchPublic(raw: string): Promise<string> {
       if (!current) return "跳转目标不能请求。";
       continue;
     }
-    return describeReply(response, current, await response.text());
+    const body = await response.text();
+    const type = response.headers.get("content-type") ?? "";
+    const html = looksLikeHtml(body, type);
+    const fetched: Fetched = { status: response.status, host: current.hostname, text: html ? readablePage(body) : compactData(body), html, at: Date.now() };
+    if (response.ok) remember(key, fetched);
+    return fetched;
   }
   return "跳转太多次。";
 }
 
+/**
+ * A public address as text: a web page one PAGE_CHARS page at a time (`page`
+ * picks which; the footer says how many there are), data replies whole up to
+ * MAX_DATA_TEXT. Pages are kept for a few minutes so turning to the next one
+ * does not fetch again.
+ */
+export async function fetchPublic(raw: string, page = 1): Promise<string> {
+  const got = await fetchOnce(raw);
+  if (typeof got === "string") return got;
+  const head = `HTTP ${got.status} ${got.host}`;
+  if (!got.text) return `${head}\n（没有正文）`;
+  if (got.html) return `${head}\n${pageOf(got.text, page, raw.trim())}`;
+  if (got.text.length > MAX_DATA_TEXT) return `${head}\n${got.text.slice(0, MAX_DATA_TEXT)}\n（只显示了前 ${MAX_DATA_TEXT} 字，全文约 ${got.text.length} 字）`;
+  return `${head}\n${got.text}`;
+}
+
 function describeReply(response: Response, url: URL, body: string): string {
   const type = response.headers.get("content-type") ?? "";
-  const text = looksLikeHtml(body, type) ? readablePage(body) : compactData(body);
+  const text = looksLikeHtml(body, type) ? pageOf(readablePage(body), 1, url.toString()) : compactData(body);
   return `HTTP ${response.status} ${url.hostname}\n${text || "（没有正文）"}`;
 }
 
@@ -176,12 +237,12 @@ function compactData(body: string): string {
   const trimmed = body.trim();
   if (/^[[{]/.test(trimmed)) {
     try {
-      return JSON.stringify(JSON.parse(trimmed)).slice(0, MAX_DATA_TEXT);
+      return JSON.stringify(JSON.parse(trimmed)).slice(0, MAX_PAGE_TOTAL);
     } catch {
       /* not JSON after all */
     }
   }
-  return trimmed.replace(/[ \t]+/g, " ").replace(/\n{2,}/g, "\n").slice(0, MAX_DATA_TEXT);
+  return trimmed.replace(/[ \t]+/g, " ").replace(/\n{2,}/g, "\n").slice(0, MAX_PAGE_TOTAL);
 }
 
 // POSTs a body to a public address: JSON when it parses as JSON, plain text

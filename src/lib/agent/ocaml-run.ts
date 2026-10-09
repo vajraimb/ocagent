@@ -358,7 +358,7 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?:
       return;
     }
     const payload = (body.payload ?? "").slice(0, op === "net_post" ? MAX_POST_PAYLOAD : 4000);
-    const permitted = ((op === "net" || op === "net_post") && allow.has("net")) || (op === "search" && allow.has("web"));
+    const permitted = ((op === "net" || op === "net_page" || op === "net_post") && allow.has("net")) || (op === "search" && allow.has("web"));
     if (!permitted) {
       res.writeHead(403);
       res.end("这个 harness 没开");
@@ -371,6 +371,12 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?:
         const url = cut < 0 ? payload : payload.slice(0, cut);
         hooks?.onCall?.("Net.post", url);
         text = await postPublic(url, cut < 0 ? "" : payload.slice(cut + 1));
+      } else if (op === "net_page") {
+        const cut = payload.indexOf("\n");
+        const url = cut < 0 ? payload : payload.slice(0, cut);
+        const page = cut < 0 ? 1 : Number(payload.slice(cut + 1)) || 1;
+        hooks?.onCall?.("Net.page", `${url} 第 ${page} 页`);
+        text = await fetchPublic(url, page);
       } else {
         hooks?.onCall?.(op === "net" ? "Net.get" : "Search.query", payload);
         text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
@@ -1334,6 +1340,16 @@ module Net = struct
       else bridge "net_post" (String.trim url ^ "\\n" ^ body)
     in
     log_effect "Net.post" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let page url n =
+    let result =
+      if not net_on then Error "网络没开"
+      else if String.trim url = "" then Error "地址是空的"
+      else if n < 1 then Error "页码从 1 数起"
+      else bridge "net_page" (String.trim url ^ "\\n" ^ string_of_int n)
+    in
+    log_effect "Net.page" (url ^ " 第 " ^ string_of_int n ^ " 页") (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
     result
 end
 

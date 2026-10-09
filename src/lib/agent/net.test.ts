@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { checkModule, moduleFromFile } from "./harness.ts";
-import { postPublic, publicUrl, readablePage } from "./net.ts";
+import { fetchPublic, pageOf, postPublic, publicUrl, readablePage, PAGE_CHARS } from "./net.ts";
 
 describe("public urls", () => {
   it("allows a public https url and rejects local targets", () => {
@@ -58,6 +58,48 @@ describe("postPublic", () => {
       assert.match(await postPublic("https://api.test/moved", "{}"), /HTTP 302 api\.test\n对方要求跳转到 https:\/\/api\.test\/v2/);
       assert.equal(await postPublic("http://127.0.0.1:8080/x", "{}"), "这个地址不能请求。");
       assert.match(await postPublic("https://api.test/items", "x".repeat(30_000)), /太长/);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("paged pages", () => {
+  it("cuts a long text into numbered pages with a footer that says how to turn", () => {
+    const lines = Array.from({ length: 400 }, (_, i) => `第 ${i + 1} 行，内容内容内容内容内容内容`);
+    const text = lines.join("\n");
+    const first = pageOf(text, 1, "https://a.test/long");
+    assert.ok(first.startsWith("第 1 行"));
+    assert.match(first, /\n（第 1\/\d+ 页，全文约 \d+ 字；Net\.page https:\/\/a\.test\/long 2 看下一页）$/);
+    assert.ok(first.length <= PAGE_CHARS + 120);
+    const second = pageOf(text, 2, "https://a.test/long");
+    assert.match(second, /^（第 2\/\d+ 页）\n第 \d+ 行/);
+    assert.ok(!second.includes("第 1 行，"), "page 2 starts after page 1");
+    const pages = Number(/第 1\/(\d+) 页/.exec(first)?.[1]);
+    const last = pageOf(text, 99, "https://a.test/long");
+    assert.match(last, new RegExp(`（第 ${pages}/${pages} 页，全文约 \\d+ 字；这是最后一页）$`));
+    assert.ok(last.includes("第 400 行"));
+    assert.equal(pageOf("短", 3), "短", "one page: no footer");
+  });
+
+  it("fetchPublic serves a web page by page from one fetch, and notes a cut data reply", async () => {
+    const realFetch = globalThis.fetch;
+    let fetches = 0;
+    const body = `<html><head><title>长文</title></head><body><main>${Array.from({ length: 300 }, (_, i) => `<p>段落 ${i + 1}，这里是一段正文，足够长到要翻页。</p>`).join("")}</main></body></html>`;
+    globalThis.fetch = (async (url: unknown) => {
+      fetches += 1;
+      if (String(url).endsWith("/data")) return new Response("x".repeat(20_000), { status: 200, headers: { "content-type": "text/plain" } });
+      return new Response(body, { status: 200, headers: { "content-type": "text/html" } });
+    }) as typeof fetch;
+    try {
+      const page1 = await fetchPublic("https://pages.test/article");
+      assert.match(page1, /^HTTP 200 pages\.test\n标题：长文\n段落 1，/);
+      assert.match(page1, /Net\.page https:\/\/pages\.test\/article 2 看下一页）$/);
+      const page2 = await fetchPublic("https://pages.test/article", 2);
+      assert.match(page2, /^HTTP 200 pages\.test\n（第 2\/\d+ 页）\n段落 /);
+      assert.equal(fetches, 1, "the second page comes from the cache");
+      const data = await fetchPublic("https://pages.test/data");
+      assert.match(data, /\n（只显示了前 15000 字，全文约 20000 字）$/);
     } finally {
       globalThis.fetch = realFetch;
     }
