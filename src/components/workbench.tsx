@@ -202,6 +202,8 @@ function turnOf(run: RunRecord): AgentTurnData {
 function unfinished(run: RunRecord): boolean {
   if (run.status === "stopped" || run.status === "failed" || run.status === "paused") return true;
   const last = [...run.events].reverse().find((event) => event.kind === "step");
+  // A Partial because the task asked for something it cannot do: trying again changes nothing.
+  if (last?.kind === "step" && run.events.some((event) => event.kind === "limit" && event.round === last.round)) return false;
   return last?.kind === "step" && last.reply === "partial";
 }
 

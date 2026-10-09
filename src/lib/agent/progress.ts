@@ -17,6 +17,7 @@ export type AgentEventBody =
   | { kind: "module_dropped"; name: string; reason: string }
   | { kind: "todo"; round: number; items: PlanItem[] }
   | { kind: "check"; round: number; answer: string; failed: string[]; gaveUp?: boolean }
+  | { kind: "limit"; round: number; what: string }
   | { kind: "need_input"; round: number; topics: string[]; question: string }
   | { kind: "remember"; round: number; text: string; forgot: boolean }
   | { kind: "finish"; ok: boolean };
@@ -392,6 +393,8 @@ export type Round = {
   checkGaveUp: boolean;
   /** The run turned this round's Done into a question: what it needs from the user. */
   needInput: { topics: string[]; question: string } | null;
+  /** The run turned this round's Done into a Partial: the task asked for something it cannot do. */
+  limit: string;
   /** Notes remembered or forgotten in this round. */
   remembered: NoteChange[];
 };
@@ -401,7 +404,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, remembered: [] };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [] };
       rounds.set(round, found);
     }
     return found;
@@ -463,6 +466,9 @@ export function foldRounds(events: AgentEvent[]): Round[] {
       }
       case "need_input":
         at(event.round).needInput = { topics: event.topics, question: event.question };
+        break;
+      case "limit":
+        at(event.round).limit = event.what;
         break;
       case "remember":
         at(event.round).remembered.push({ text: event.text, forgot: event.forgot });

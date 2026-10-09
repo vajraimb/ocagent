@@ -91,6 +91,9 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
 任务里出现"我的名字""我的城市""我的……"这类只有用户知道、结果里又必须用到的内容，而【记住的】和【之前的对话】里都没有时，就 Ask 一句问清楚，不要用占位符、示例值或改成参数来绕过——那样做出来的不是用户要的。
 
+【能力边界：做不到的事要直说】
+你只在用户说话时跑一次，步骤结束进程就没了。所以你做不到：定时 / 每天到点自动执行、过一会儿提醒、后台一直运行、发邮件 / 短信 / 微信 / 推送通知、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完（比如先把今天的汇总做出来），用 Partial 结束并写明「要每天得到它，到时候再对我说一句」。不要写一个"调度脚本""提醒脚本""发送脚本"放进工作区当作完成——没有任何东西会去执行它，那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
+
 【你能用什么】
 只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
@@ -616,6 +619,33 @@ export function missingInput(task: string, answer: string, written: { path: stri
   return { topics: unknown, question: `还差一样只有你知道的：${list}。现在写的是占位，告诉我之后我会直接填进去。` };
 }
 
+// ---------------------------------------------------------------------------
+// Things a run cannot do: it exists only while the user's request is served.
+// A Done on a task that asks for a schedule, a reminder, a background job or
+// an outbound message is a claim nothing will honour, so it becomes a Partial
+// that says what is missing.
+
+const CLOCKED = "(早上|上午|中午|下午|晚上|凌晨|\\d{1,2}\\s*[点:：时]|整点|准时|自动|帮我|给我|提醒|推送|发|跑|执行|汇总|更新|同步|检查|抓|查)";
+const BEYOND: { pattern: RegExp; what: string }[] = [
+  { pattern: new RegExp(`定时|到点|到时候自动|每(天|日|周|月|小时|分钟|隔\\s*\\S{1,6})\\s*(都\\s*)?${CLOCKED}|\\bcron\\b|schedule`, "i"), what: "定时或每天到点自动执行" },
+  { pattern: /提醒我|过\s*\S{1,6}\s*(提醒|叫我|通知我)|闹钟/, what: "过一会儿提醒" },
+  { pattern: /后台(一直|持续|常驻)|一直(跑|运行|盯着|监控)|持续(监控|运行)|常驻/, what: "后台一直运行" },
+  { pattern: /发\s*(邮件|短信|微信|消息|通知)|推送(到|给)|邮件(发|通知)|email/i, what: "发邮件、短信或消息" },
+];
+const BEYOND_NOTE = "我没有这个能力";
+
+export type BeyondReach = { what: string; note: string };
+
+export function beyondReach(task: string, reply: string): BeyondReach | null {
+  if (reply !== "done") return null;
+  const hit = BEYOND.find((item) => item.pattern.test(task));
+  if (!hit) return null;
+  return {
+    what: hit.what,
+    note: `（${BEYOND_NOTE}：${hit.what}。我只在你说话时跑一次，工作区里的脚本不会在到点时自己执行，也发不出消息。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
+  };
+}
+
 // True when the step read back what the run wrote: every file this step
 // changed is read (successfully) after its last change, and at least one file
 // written in this run is read. Such a step verified itself, so holding its
@@ -877,6 +907,19 @@ export async function runDeskLoop(
                 if (marked) {
                   raw = marked;
                   text = `${frame.text.trim()}\n\n（有 ${failed.length} 条核对没通过：${failed.map((item) => clip(item, 80)).join("；")}）`;
+                }
+              }
+              if (reply === "done") {
+                // A Done on a task that needs a schedule, a reminder or an
+                // outbound message claims something no one will carry out.
+                const beyond = beyondReach(task, reply);
+                const told = text.includes(BEYOND_NOTE) ? text : `${text.trim()}\n\n${beyond?.note ?? ""}`;
+                const limited = beyond ? patchFrame(raw, { kind: "partial", text: told }) : null;
+                if (beyond && limited) {
+                  raw = limited;
+                  reply = "partial";
+                  text = told;
+                  emit({ kind: "limit", round, what: beyond.what });
                 }
               }
               emit({ kind: "step", round, reply, text });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, blindMisses, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, beyondReach, blindMisses, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import { boundOrigin, type AgentEvent, type AgentEventBody } from "./progress.ts";
 
@@ -800,6 +800,44 @@ test("a Partial that gives up on a Check.contains miss without reading the file 
   assert.deepEqual(blindMisses(effects(miss)), ["weather/beijing.md 含 Beijing"]);
   assert.deepEqual(blindMisses(effects(`Files.read_file\tweather/beijing.md\tOk 北京\n${miss}`)), []);
   assert.deepEqual(blindMisses(effects("Check.contains\tnone.md 含 x\t没通过：没有这个文件\nCheck.that\t两行\t没通过")), []);
+});
+
+test("a Done on a task that needs a schedule, a reminder or an outbound message becomes a Partial that says so", async () => {
+  // The pure judgement: scheduling words with a time or an action, reminders, background jobs, messages.
+  assert.equal(beyondReach("定时北京时间每天早上8点把这5个城市天气预报汇总", "done")?.what, "定时或每天到点自动执行");
+  assert.equal(beyondReach("每天帮我查一次汇率", "done")?.what, "定时或每天到点自动执行");
+  assert.equal(beyondReach("过十分钟提醒我开会", "done")?.what, "过一会儿提醒");
+  assert.equal(beyondReach("后台一直盯着这个页面有没有更新", "done")?.what, "后台一直运行");
+  assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发邮件、短信或消息");
+  assert.equal(beyondReach("写一首关于每天早起的诗", "done"), null, "no schedule asked for");
+  assert.equal(beyondReach("每天的天气都不一样，查一下今天的", "done"), null);
+  assert.equal(beyondReach("定时北京时间每天早上8点汇总", "partial"), null, "a Partial already says it is not done");
+  // In the loop: the check round still happens; the Done that then goes through turns into a Partial with the note.
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  const frames = [
+    okFrame("done", "已写下 run_daily.ml 和调度说明。", "Files.write_file\trun_daily.ml\tOk\nCheck.contains\trun_daily.ml 含 08:00\t通过"),
+  ];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "定时北京时间每天早上8点把这5个城市天气预报汇总", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    const steps = events.filter((event) => event.kind === "step");
+    assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["partial"]);
+    const last = steps[0];
+    assert.match(last?.kind === "step" ? last.text : "", /已写下 run_daily\.ml[\s\S]*我没有这个能力：定时或每天到点自动执行[\s\S]*到时候对我说一句/);
+    const limit = events.find((event) => event.kind === "limit");
+    assert.ok(limit && limit.kind === "limit" && limit.what === "定时或每天到点自动执行");
+    assert.ok(result.ok);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("the origin of a changed file is kept for Files.restore, bounded, and carried across segments", async () => {
