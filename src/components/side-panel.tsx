@@ -4,6 +4,7 @@ import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, 
 import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
 import { describeWhen, stampIn } from "@/lib/agent/schedule";
 import type { NotifyInfo, ScheduleRecord } from "@/lib/agent/run";
+import { FilePreview } from "@/components/file-preview";
 
 const FIXED: HarnessId[] = ["ocaml"];
 
@@ -520,7 +521,7 @@ export function SidePanel({
             {isImageFile(file) ? (
               <img src={file.content} alt={file.path} className="max-h-72 w-full rounded-lg border border-border bg-bg object-contain" />
             ) : (
-              <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{file.content}</pre>
+              <FilePreview path={file.path} content={file.content} />
             )}
             <div className="flex items-center justify-between gap-2 text-xs text-muted">
               <span className="font-mono">{sizeLabel(file.content)}</span>

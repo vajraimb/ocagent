@@ -140,7 +140,9 @@ function chooseDeskId(): string {
   return fresh;
 }
 
+// SVG is text the agent can read and write; it is kept as a file, not shrunk into a picture.
 function isPicture(item: File): boolean {
+  if (/\.svg$/i.test(item.name) || item.type === "image/svg+xml") return false;
   return item.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|heic|heif)$/i.test(item.name);
 }
 
