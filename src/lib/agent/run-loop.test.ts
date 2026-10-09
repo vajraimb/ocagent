@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, readBackInStep, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import type { AgentEventBody } from "./progress.ts";
 
@@ -451,6 +451,28 @@ test("the first Done of a run that wrote files is held for one check round, the 
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("a step that reads back what it wrote is not held: it already checked", async () => {
+  const events: AgentEventBody[] = [];
+  const frames = [okFrame("done", "改好了 todo.md", "Files.replace\ttodo.md\tOk 替换了 1 处\nFiles.append\ttodo.md\tOk\nFiles.read_file\ttodo.md\tOk 买豆奶\n交电费\n预约牙医")];
+  let i = 0;
+  const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+    runCore: replyAwareCore(frames),
+    runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+    emit: (event) => events.push(event),
+    budgetMs: 60_000,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(i, 1, "one step: the Done went straight through");
+  assert.equal(events.some((event) => event.kind === "check"), false);
+  assert.equal(result.plan.checks, 0);
+  // Reading back in a later round counts too; a write with no read-back does not.
+  const written = new Set(["a.md"]);
+  assert.equal(readBackInStep([{ tool: "Files.read_file", detail: "a.md", output: "Ok hi" }], written), true);
+  assert.equal(readBackInStep([{ tool: "Files.read_file", detail: "b.md", output: "Ok hi" }], written), false);
+  assert.equal(readBackInStep([{ tool: "Files.read_file", detail: "a.md", output: "Ok hi" }, { tool: "Files.append", detail: "a.md", output: "Ok" }], written), false);
+  assert.equal(readBackInStep([{ tool: "Files.write_file", detail: "c.md", output: "Ok" }, { tool: "Files.read_file", detail: "c.md", output: "Error 没有" }], new Set(["c.md"])), false);
 });
 
 test("a run that only looked things up is not held for a check", async () => {

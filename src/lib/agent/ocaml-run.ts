@@ -1017,13 +1017,18 @@ module Files = struct
         | Error e -> Error e
         | Ok text ->
             let n = count_sub text old in
-            if n = 0 then Error "文件里没有这段文本（要一字不差，含空格和换行；先 read_file 看看）"
-            else (
+            if n > 0 then (
               let oc = open_out path in
               Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (replace_all text old by));
               Ok n)
+            else if by <> "" && count_sub text by > 0 then Ok 0
+            else Error "文件里没有这段文本（要一字不差，含空格和换行；先 read_file 看看）"
     in
-    log_effect "Files.replace" path (match result with Ok n -> "Ok 替换了 " ^ string_of_int n ^ " 处" | Error e -> "Error " ^ e);
+    log_effect "Files.replace" path
+      (match result with
+      | Ok 0 -> "Ok 已经是改过的内容（文件里没有旧文本、已有新文本），这次 0 处，不用再改"
+      | Ok n -> "Ok 替换了 " ^ string_of_int n ^ " 处"
+      | Error e -> "Error " ^ e);
     result
 
   let append path content =

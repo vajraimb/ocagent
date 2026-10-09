@@ -193,7 +193,7 @@ end
 - 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。
 - 只有用户明确说「加载」或 harness 时，才把对应的 .ml 写好并结束。其它任务不要提 harness。
 - 工作区的文件列表每轮都附在提示里，不要为了看它调用 list_files。
-- 改一个已有的文件，用 Files.replace path 旧文本 新文本（旧文本要一字不差，返回替换了几处），或 Files.append 在末尾加；不要把整个文件重写一遍。重写只用在文件很短或要全换的时候。
+- 改一个已有的文件，用 Files.replace path 旧文本 新文本（旧文本要一字不差，返回替换了几处；文件里已经是新文本时返回 Ok 0，表示早就改过了），或 Files.append 在末尾加；不要把整个文件重写一遍。重写只用在文件很短或要全换的时候。已经做过的修改不要再做一遍。
 - 收到编译错误时只改出错的地方，其余照抄；上一步的代码会一起附上。
 - 参数已经知道的多个请求写在同一步，记完再 Continue 一次。后一个请求要依赖前一个的结果时，拆成两步。
 - 还要再请求，就不要 Done。不再请求的那一轮，只用返回值或笔记里出现过的数字写结论。
@@ -338,7 +338,7 @@ export function promptContext(ctx: PromptContext): string {
   if (ctx.check) {
     const open = ctx.plan?.flatMap((item, index) => (item.done ? [] : [`${index + 1}. ${item.text}`])) ?? [];
     parts.push(
-      `【收尾前核对】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」。先核对一次再 Done：读一遍写出的文件、或用装好的 module 算一个已知的值，确认任务要的都在、内容没错。${open.length ? `计划里还有没打勾的：${open.join("；")}——做完或说明为什么不用做。` : ""}核对没问题，就在核对的同一步（或下一轮）Done，答案可以修正；发现遗漏就补上再 Done。这次不会再被拦。`,
+      `【收尾前核对】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」。上一步的修改都已经生效（结果在【上一步】里），不要再做一遍——再 replace 同一段旧文本会因为已经改过而找不到。这一步只核对：读一遍写出的文件、或用装好的 module 算一个已知的值，确认任务要的都在、内容没错。${open.length ? `计划里还有没打勾的：${open.join("；")}——做完或说明为什么不用做。` : ""}核对没问题，就在核对的同一步 Done，答案可以修正；发现遗漏就补上再 Done。这次不会再被拦。`,
     );
   }
   const seconds = Math.max(0, Math.round(ctx.remainingMs / 1000));
@@ -506,6 +506,21 @@ const MAX_IDLE_STALL = 5;
 const MAX_RUNNER_STALL = 2;
 // Effects that change the desk: a run that did any of these gets a check round.
 const WRITES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Harness.load", "Harness.install"]);
+const FILE_WRITES = new Set(["Files.write_file", "Files.replace", "Files.append"]);
+
+// True when the step read back what the run wrote: every file this step
+// changed is read (successfully) after its last change, and at least one file
+// written in this run is read. Such a step verified itself, so holding its
+// Done for a check round would only invite redoing the work.
+export function readBackInStep(effects: { tool: string; detail: string; output: string }[], written: ReadonlySet<string>): boolean {
+  const lastWrite = new Map<string, number>();
+  effects.forEach((effect, index) => {
+    if (FILE_WRITES.has(effect.tool) && effect.output.startsWith("Ok")) lastWrite.set(effect.detail, index);
+  });
+  const readAfter = (path: string, at: number) => effects.some((effect, index) => index > at && effect.tool === "Files.read_file" && effect.detail === path && effect.output.startsWith("Ok"));
+  for (const [path, at] of lastWrite) if (!readAfter(path, at)) return false;
+  return [...written].some((path) => readAfter(path, lastWrite.get(path) ?? -1));
+}
 
 export function runBudgetMs(): number {
   const raw = Number(process.env.OCAGENT_RUN_BUDGET_MS);
@@ -580,6 +595,8 @@ export async function runDeskLoop(
   const plan: PlanState = deps.plan ? { ...deps.plan, items: deps.plan.items.map((item) => ({ ...item })) } : emptyPlan();
   // Long-lived notes about the desk; steps add to them with Memory.remember.
   const notes: string[] = [...(deps.notes ?? [])];
+  // Files this segment wrote, so a later step's read-back counts as its check.
+  const written = new Set<string>();
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -688,9 +705,11 @@ export async function runDeskLoop(
               const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool));
               for (const effect of effects) emit({ kind: "effect", round, ...effect });
               if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
+              for (const effect of effects) if (FILE_WRITES.has(effect.tool) && effect.output.startsWith("Ok")) written.add(effect.detail);
               let reply = frame.reply;
               let raw = next.raw;
-              if (reply === "done" && plan.checks === 0 && (plan.wrote || plan.items.some((item) => !item.done))) {
+              const unchecked = plan.wrote && !readBackInStep(effects, written);
+              if (reply === "done" && plan.checks === 0 && (unchecked || plan.items.some((item) => !item.done))) {
                 const held = holdDone(raw);
                 if (held) {
                   plan.checks += 1;
