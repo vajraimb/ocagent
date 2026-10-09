@@ -5,12 +5,12 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkModule, prelude, type DeskModule, type HarnessId } from "./harness.ts";
-import { settle } from "./budget.ts";
-import { fetchPublic } from "./net.ts";
+import { bannedCall, MAX_MODULES, moduleFromFile, type DeskModule, type HarnessId } from "./harness.ts";
+import { fetchPublic, fetchSource, postPublic } from "./net.ts";
+import type { NotifySent } from "./notify.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
-import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
+import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 const SYSTEM_OCAML = "/root/.opam/5.3.0/bin/ocaml";
 
@@ -99,9 +99,26 @@ async function ocamlCommand(): Promise<{ bin: string; prefix: string[]; lib: str
   return null;
 }
 
+/** The step runner itself could not do its job (as opposed to the step's code failing). */
+export class RunnerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunnerError";
+  }
+}
+
+// Payloads carry the whole workspace on every step, so the cap is generous and
+// overshooting it is an error the loop can see, never a silent cut.
+export const MAX_BRIDGE_PAYLOAD = 16 * 1024 * 1024;
+
 const CLIENT = `import { readFileSync, writeFileSync } from "node:fs";
 const [op, inputPath, outputPath] = process.argv.slice(2);
-const payload = readFileSync(inputPath, "utf8").slice(0, 200000);
+const raw = readFileSync(inputPath);
+if (raw.length > ${MAX_BRIDGE_PAYLOAD}) {
+  writeFileSync(outputPath, "这一步要带的内容有 " + Math.round(raw.length / 1024) + " KB，超过了上限。工作区太大了，删掉或缩小几个文件。");
+  process.exit(1);
+}
+const payload = raw.toString("utf8");
 const res = await fetch("http://127.0.0.1:" + process.env.OCAGENT_PORT + "/call", {
   method: "POST",
   headers: { "content-type": "application/json", "x-ocagent-token": process.env.OCAGENT_TOKEN ?? "" },
@@ -112,62 +129,188 @@ writeFileSync(outputPath, text);
 process.exit(res.ok ? 0 : 1);
 `;
 
-export async function runOcaml(
-  files: DeskFile[],
-  entry: string,
-  opts?: { apiKey?: string; harnesses?: HarnessId[]; modules?: DeskModule[] },
-): Promise<string> {
-  if (!safePath(entry) || !entry.endsWith(".ml")) return "只能跑工作区里的一个 .ml 文件。";
-  const source = files.find((file) => file.path === entry);
-  if (!source) return `没有 ${entry}`;
-  const command = await ocamlCommand();
-  if (!command) return "这台服务器没有 OCaml 运行器。";
-  if (command.prefix.length > 0 && !command.lib) return "标准库没有装上。";
-  const harnesses = opts?.harnesses ?? [];
-  const bridge = harnesses.some((id) => id === "net" || id === "web")
-    ? await startBridge(opts?.apiKey, harnesses)
-    : null;
+export type RunHooks = {
+  signal?: AbortSignal;
+  onCall?: (tool: string, detail: string) => void;
+  // Modules loaded so far in this run; a step sees them all, and Harness.load
+  // / Harness.install add to them through onModule.
+  modules?: () => DeskModule[];
+  onModule?: (mod: DeskModule) => void;
+  onUnload?: (name: string) => void;
+  // Files as they were when the task began, for the ones it has changed so
+  // far (null: did not exist). A step can Files.restore any of them, and
+  // onOrigin records the pre-step content of a file the step changed first.
+  origin?: () => OriginMap;
+  onOrigin?: (path: string, content: string | null) => void;
+  // Sends a line to the desk's notify address (Notify.send); absent when the desk has none.
+  notify?: (text: string) => Promise<NotifySent>;
+};
 
+/** Task-start content by path for files the task changed; null when the file did not exist. */
+export type OriginMap = Record<string, string | null>;
+
+// Tools that change a file in the workspace, as logged in a step's effects.
+export const FILE_CHANGES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Files.restore"]);
+
+export function renderModules(mods: DeskModule[]): string {
+  return mods.map((mod) => `module ${mod.name} = struct\n${mod.body}\nend\n`).join("\n");
+}
+
+export type ModuleVerdict = { ok: true; module: DeskModule } | { ok: false; error: string };
+
+// A module becomes part of every later step's toplevel, so it has to pass the
+// same source bans as a step and actually compile against the harness API.
+export async function verifyModule(name: string, rawBody: string, context: DeskModule[] = []): Promise<ModuleVerdict> {
+  const stripped = moduleFromFile(name, rawBody);
+  if (!stripped) {
+    const trimmed = name.trim();
+    if (!/^[A-Z][A-Za-z0-9_]{0,24}$/.test(trimmed)) return { ok: false, error: `模块名 ${trimmed || "（空）"} 不行：大写开头，字母数字下划线。` };
+    if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
+    const offending = bannedCall(rawBody);
+    if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify、Step 是保留名），换一个。` };
+  }
+  const banned = rejectedSource(stripped.body);
+  if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
+  // Compiled together with what is already loaded, so a module that builds on
+  // another one passes, and one that clashes with the set is caught now.
+  const together = [...context.filter((mod) => mod.name !== stripped.name), stripped];
+  const outcome = await compileModules(together);
+  if (!outcome.ok) {
+    if (outcome.name === stripped.name) return { ok: false, error: outcome.error };
+    return { ok: false, error: `装上 ${stripped.name} 后，已装的 ${outcome.name} 编译不过了：${outcome.error}` };
+  }
+  return { ok: true, module: stripped };
+}
+
+export type SetVerdict = { kept: DeskModule[]; dropped: { name: string; error: string }[] };
+
+// Before a run, make sure the modules the page sent still compile as a set;
+// a broken one is dropped (and reported) instead of poisoning every step.
+export async function verifyModuleSet(modules: DeskModule[]): Promise<SetVerdict> {
+  let kept = [...modules];
+  const dropped: SetVerdict["dropped"] = [];
+  while (kept.length > 0) {
+    const outcome = await compileModules(kept);
+    if (outcome.ok) break;
+    const culprit = outcome.name;
+    dropped.push({ name: culprit, error: outcome.error });
+    kept = kept.filter((mod) => mod.name !== culprit);
+  }
+  return { kept, dropped };
+}
+
+type CompileOutcome = { ok: true } | { ok: false; name: string; error: string };
+
+async function compileModules(mods: DeskModule[]): Promise<CompileOutcome> {
+  const last = mods[mods.length - 1]?.name ?? "";
+  const command = await ocamlCommand();
+  if (!command) return { ok: false, name: last, error: "这台服务器没有 OCaml 运行器。" };
   await ensureRuntime();
-  const dir = await mkdtemp(rt("runs", "ml-"));
+  const dir = await mkdtemp(rt("runs", "mod-"));
   try {
-    for (const file of files) {
-      if (!file.path.endsWith(".ml") || !safePath(file.path)) continue;
-      const target = path.resolve(dir, file.path);
-      if (!target.startsWith(dir + path.sep)) continue;
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, file.content, "utf8");
-    }
-    await writeFile(path.join(dir, "ocagent_harness.ml"), prelude(harnesses, opts?.modules ?? []), "utf8");
-    await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
-    const driver = `#use "ocagent_harness.ml";;\n#use "${entry}";;\n`;
-    await writeFile(path.join(dir, "ocagent_driver.ml"), driver, "utf8");
-    const extra: Record<string, string> = {
-      OCAGENT_NODE: process.execPath,
-      OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
-    };
-    if (command.lib) {
-      extra.OCAMLLIB = command.lib;
-      extra.CAMLLIB = command.lib;
-    }
-    if (bridge) {
-      extra.OCAGENT_PORT = String(bridge.port);
-      extra.OCAGENT_TOKEN = bridge.token;
-    }
-    const runtimeLib = rt("lib");
-    extra.OCAMLLIB = runtimeLib;
-    extra.CAMLLIB = runtimeLib;
-    const run = rt("ocamlrun");
-    const image = rt("ocaml");
-    const ran = await execute(run, [image, path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 8_000 });
-    return ran.text;
+    await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(false, false, false, []), "utf8");
+    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules(mods), "utf8");
+    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_modules.ml";;\nlet () = print_string "harness-ok";;\n', "utf8");
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, { OCAMLLIB: rt("lib"), CAMLLIB: rt("lib") }, { sandbox: true, timeoutMs: 10_000 + 2_000 * mods.length });
+    if (ran.timedOut) return { ok: false, name: last, error: "编译或顶层求值超时。module 顶层不要做耗时的事。" };
+    if (ran.text.includes("harness-ok") && !/\bError\b/.test(ran.text)) return { ok: true };
+    const where = /ocagent_modules\.ml", line (\d+)/.exec(plainText(ran.text));
+    const name = (where ? moduleAtLine(mods, Number(where[1])) : null) ?? last;
+    return { ok: false, name, error: moduleDiagnostic(ran.text, name, moduleStart(mods, name)) };
   } finally {
-    if (bridge) await bridge.close();
     await rm(dir, { recursive: true, force: true });
   }
 }
 
-function startBridge(apiKey: string | undefined, harnesses: HarnessId[]) {
+function moduleAtLine(mods: DeskModule[], line: number): string | null {
+  let at = 1;
+  for (const mod of mods) {
+    const span = renderModules([mod]).split("\n").length;
+    if (line < at + span) return mod.name;
+    at += span;
+  }
+  return mods[mods.length - 1]?.name ?? null;
+}
+
+// Line on which a module's own `module X = struct` header sits in the rendered file.
+function moduleStart(mods: DeskModule[], name: string): number {
+  let at = 1;
+  for (const mod of mods) {
+    if (mod.name === name) return at;
+    at += renderModules([mod]).split("\n").length;
+  }
+  return 1;
+}
+
+// eslint-disable-next-line no-control-regex -- the toplevel colours its errors
+const ANSI = /\u001b\[[0-9;]*m/g;
+const plainText = (raw: string) => raw.replace(ANSI, "");
+
+function moduleDiagnostic(raw: string, name: string, start = 1): string {
+  const text = plainText(raw);
+  const where = /ocagent_modules\.ml", line (\d+)/.exec(text);
+  const error = /Error: ([\s\S]{0,400}?)(?:\n\s*\n|$)/.exec(text);
+  const line = where ? `第 ${Math.max(1, Number(where[1]) - start)} 行` : "";
+  const reason = error?.[1]?.trim().replace(/\s+/g, " ") ?? text.trim().slice(0, 300);
+  return `module ${name} 编译失败${line ? `（${line}）` : ""}：${reason || "没有输出"}`;
+}
+
+type BridgeContext = { dir: string; hooks?: RunHooks };
+
+async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status: number; text: string }> {
+  const first = payload.indexOf("\n");
+  const second = first < 0 ? -1 : payload.indexOf("\n", first + 1);
+  if (first < 0 || second < 0) return { status: 400, text: "请求不对" };
+  const op = payload.slice(0, first);
+  const name = payload.slice(first + 1, second).trim();
+  const rest = payload.slice(second + 1);
+  const loaded = ctx.hooks?.modules?.() ?? [];
+  if (op === "unload") {
+    if (!loaded.some((mod) => mod.name === name)) return { status: 404, text: `没有装着叫 ${name} 的 module。现在装着：${loaded.map((mod) => mod.name).join("、") || "（没有）"}。` };
+    ctx.hooks?.onUnload?.(name);
+    return { status: 200, text: `已卸下 module ${name}。` };
+  }
+  if (!loaded.some((mod) => mod.name === name) && loaded.length >= MAX_MODULES) {
+    return { status: 409, text: `最多同时装 ${MAX_MODULES} 个 module。先用 Harness.unload 卸下一个。` };
+  }
+  let body = rest;
+  let savedTo = "";
+  let source = "";
+  if (op === "install") {
+    source = rest.trim();
+    const fetched = await fetchSource(source);
+    if (!fetched.ok) return { status: 502, text: fetched.error };
+    body = fetched.text;
+    const stem = name ? name[0]!.toLowerCase() + name.slice(1) : "";
+    savedTo = `lib/${stem}.ml`;
+  } else if (op === "load") {
+    // load\n<name>\n<path>\n<body>: the path is only provenance.
+    const third = rest.indexOf("\n");
+    source = third < 0 ? "" : rest.slice(0, third).trim();
+    body = third < 0 ? rest : rest.slice(third + 1);
+  } else {
+    return { status: 400, text: "不支持的 harness 操作" };
+  }
+  const verdict = await verifyModule(name, body, loaded);
+  if (!verdict.ok) return { status: 422, text: verdict.error };
+  if (savedTo) {
+    if (!safePath(savedTo)) return { status: 422, text: "模块名不能当文件名。" };
+    const target = path.resolve(ctx.dir, savedTo);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, body, "utf8");
+  }
+  ctx.hooks?.onModule?.({ ...verdict.module, ...(source ? { source } : {}), at: Date.now() });
+  const where = savedTo ? `已安装到 ${savedTo}，` : "";
+  return { status: 200, text: `${where}已加载 module ${verdict.module.name}。从下一步起可以直接调用 ${verdict.module.name}.… 。` };
+}
+
+// A step sees up to this much of a Net / Search reply (the prompt shows less;
+// the step itself can pick fields out of the rest with Json.get).
+const MAX_BRIDGE_REPLY = 16_000;
+const MAX_POST_PAYLOAD = 24_000;
+
+function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?: RunHooks, ctx?: BridgeContext) {
   const allow = new Set<string>(harnesses.filter((id) => id === "net" || id === "web"));
   const token = randomBytes(16).toString("hex");
   const server = createServer(async (req, res) => {
@@ -187,17 +330,59 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[]) {
       return;
     }
     const op = body.op ?? "";
-    const payload = (body.payload ?? "").slice(0, 4000);
-    const permitted = (op === "net" && allow.has("net")) || (op === "search" && allow.has("web"));
+    if (op === "harness" && ctx) {
+      try {
+        const payload = (body.payload ?? "").slice(0, 250_000);
+        const kind = payload.startsWith("install\n") ? "Harness.install" : "Harness.load";
+        hooks?.onCall?.(kind, payload.split("\n")[1] ?? "");
+        const outcome = await harnessOp(payload, ctx);
+        res.writeHead(outcome.status, { "content-type": "text/plain; charset=utf-8" });
+        res.end(outcome.text);
+      } catch (err) {
+        res.writeHead(500);
+        res.end(err instanceof Error ? err.message : "失败");
+      }
+      return;
+    }
+    if (op === "notify") {
+      const text = (body.payload ?? "").slice(0, 1_600);
+      hooks?.onCall?.("Notify.send", "");
+      if (!hooks?.notify) {
+        res.writeHead(409, { "content-type": "text/plain; charset=utf-8" });
+        res.end("这个工作区还没填通知地址；用户要在面板「通知」里填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook，之后才能发。现在把要说的话写进 Done 里即可。");
+        return;
+      }
+      const sent = await hooks.notify(text);
+      res.writeHead(sent.ok ? 200 : 502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(sent.ok ? `已发到${sent.where}` : `没发出去（${sent.where}）：${sent.error}`);
+      return;
+    }
+    const payload = (body.payload ?? "").slice(0, op === "net_post" ? MAX_POST_PAYLOAD : 4000);
+    const permitted = ((op === "net" || op === "net_page" || op === "net_post") && allow.has("net")) || (op === "search" && allow.has("web"));
     if (!permitted) {
       res.writeHead(403);
       res.end("这个 harness 没开");
       return;
     }
     try {
-      const text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
+      let text: string;
+      if (op === "net_post") {
+        const cut = payload.indexOf("\n");
+        const url = cut < 0 ? payload : payload.slice(0, cut);
+        hooks?.onCall?.("Net.post", url);
+        text = await postPublic(url, cut < 0 ? "" : payload.slice(cut + 1));
+      } else if (op === "net_page") {
+        const cut = payload.indexOf("\n");
+        const url = cut < 0 ? payload : payload.slice(0, cut);
+        const page = cut < 0 ? 1 : Number(payload.slice(cut + 1)) || 1;
+        hooks?.onCall?.("Net.page", `${url} 第 ${page} 页`);
+        text = await fetchPublic(url, page);
+      } else {
+        hooks?.onCall?.(op === "net" ? "Net.get" : "Search.query", payload);
+        text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
+      }
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      res.end(text.slice(0, 4000));
+      res.end(text.slice(0, MAX_BRIDGE_REPLY));
     } catch (err) {
       res.writeHead(500);
       res.end(err instanceof Error ? err.message : "失败");
@@ -222,20 +407,31 @@ function execute(
   args: string[],
   cwd: string,
   extra: Record<string, string>,
-  opts?: { sandbox?: boolean; timeoutMs?: number },
-): Promise<{ text: string; timedOut: boolean }> {
+  opts?: { sandbox?: boolean; timeoutMs?: number; signal?: AbortSignal },
+): Promise<{ text: string; timedOut: boolean; aborted: boolean }> {
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let killer: ReturnType<typeof setTimeout> | undefined;
     let backup: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      aborted = true;
+      killTree();
+      backup = setTimeout(() => finish(Buffer.concat(chunks).toString("utf8").trim(), false), 1500);
+    };
     const finish = (text: string, timeout: boolean) => {
       if (settled) return;
       settled = true;
       if (killer) clearTimeout(killer);
       if (backup) clearTimeout(backup);
-      resolve({ text, timedOut: timeout });
+      opts?.signal?.removeEventListener("abort", onAbort);
+      resolve({ text, timedOut: timeout, aborted });
     };
+    if (opts?.signal?.aborted) {
+      resolve({ text: "", timedOut: false, aborted: true });
+      return;
+    }
     const env = { PATH: "/usr/bin:/bin", HOME: cwd, TMPDIR: cwd, LANG: "C.UTF-8", ...extra };
     const child = opts?.sandbox && sandboxReady
       ? spawn(unshareBin, ["--user", "--map-root-user", "--mount", rt("enter.sh"), cwd, bin, ...args], {
@@ -269,7 +465,8 @@ function execute(
     });
     child.on("close", (code, signal) => {
       const text = Buffer.concat(chunks).toString("utf8").trim().slice(0, 8000);
-      if (timedOut) finish(text || "时限到了，已经停掉。", true);
+      if (aborted) finish(text, false);
+      else if (timedOut) finish(text || "时限到了，已经停掉。", true);
       else if (signal === "SIGKILL") finish(text ? `${text}\n输出太长，已截断。` : "输出太长，已截断。", false);
       else if (code && code !== 0) finish(`退出码 ${code}\n${text || "没有输出"}`, false);
       else finish(text || "（没有输出）", false);
@@ -281,6 +478,7 @@ function execute(
         backup = setTimeout(() => finish(Buffer.concat(chunks).toString("utf8").trim() || "时限到了，已经停掉。", true), 1500);
       }, opts.timeoutMs);
     }
+    opts?.signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -456,62 +654,60 @@ function decodeResult(buf: Buffer): CoreResult {
   return { status, answer, files, modules, steps, journal, memory };
 }
 
-async function agentBin(): Promise<{ run: string; image: string }> {
+// The loop is OCaml source (assets/ocaml/bin/ocagent.ml) that the bundled
+// toplevel runs as a script, so changing it needs no compiler.
+export const LOOP_SCRIPT = "ocagent.ml";
+
+async function loopScript(): Promise<string> {
   await ensureRuntime();
-  const image = await fileAt("ocagent");
-  if (!image) throw new Error("没有 OCaml 循环");
-  await installBin(image, rt("ocagent"));
-  return { run: rt("ocamlrun"), image: rt("ocagent") };
+  const source = await fileAt(LOOP_SCRIPT);
+  if (!source) throw new Error("没有 OCaml 循环");
+  await copyFile(source, rt(LOOP_SCRIPT));
+  return rt(LOOP_SCRIPT);
 }
 
-export async function runCore(
-  job: CoreJob,
-  handlers: {
-    model: (prompt: string) => Promise<string>;
-    net: (url: string) => Promise<string>;
-    search: (query: string) => Promise<string>;
-    ocaml: (payload: string) => Promise<string>;
-  },
-): Promise<CoreResult> {
-  const { run, image } = await agentBin();
+export type CoreHandlers = {
+  model: (prompt: string) => Promise<string>;
+  ocaml: (payload: string) => Promise<string>;
+};
+
+export async function runCore(job: CoreJob, handlers: CoreHandlers, hooks?: RunHooks): Promise<CoreResult> {
+  const script = await loopScript();
   const dir = await mkdtemp(rt("runs", "job-"));
   const bridge = await startCoreBridge(handlers);
   try {
     await writeFile(path.join(dir, "job"), encodeJob(job));
     await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
     const ran = await execute(
-      run,
-      [image, path.join(dir, "job"), path.join(dir, "result")],
+      rt("ocamlrun"),
+      [rt("ocaml"), script, path.join(dir, "job"), path.join(dir, "result")],
       dir,
       {
+        OCAMLLIB: rt("lib"),
+        CAMLLIB: rt("lib"),
         OCAGENT_NODE: process.execPath,
         OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
         OCAGENT_PORT: String(bridge.port),
         OCAGENT_TOKEN: bridge.token,
       },
+      { signal: hooks?.signal },
     );
     const resultPath = path.join(dir, "result");
     if (await exists(resultPath)) {
       try {
         const decoded = decodeResult(await readFile(resultPath));
+        if (ran.aborted) return { ...decoded, status: "stopped", answer: stoppedAnswer(decoded.steps) };
         if (decoded.status === "error") return { ...decoded, answer: decoded.answer || "循环没有跑起来。" };
         if (decoded.status === "done" && decoded.answer.trim()) return decoded;
-        const answer =
-          decoded.answer.trim() ||
-          settle({
-            answer: "",
-            note: ran.timedOut ? "这一步到时限了。" : "循环停在半路。",
-            steps: decoded.steps,
-            timedOut: true,
-          });
+        const answer = decoded.answer.trim() || (ran.timedOut ? "这一步到时限了，上面是已经做出的部分。" : "循环停在半路，上面是已经做出的部分。");
         return { ...decoded, status: "done", answer };
       } catch {
         /* the checkpoint was only half written */
       }
     }
     return {
-      status: "done",
-      answer: ran.timedOut ? "时限到了，还没有结果。把任务写短一点，或点继续。" : ran.text || "循环没有留下结果。",
+      status: ran.aborted ? "stopped" : "done",
+      answer: ran.aborted ? stoppedAnswer([]) : ran.timedOut ? "时限到了，还没有结果。把任务写短一点，或点继续。" : ran.text || "循环没有留下结果。",
       files: job.files,
       modules: job.modules,
       steps: [],
@@ -524,12 +720,15 @@ export async function runCore(
   }
 }
 
-function startCoreBridge(handlers: {
-  model: (prompt: string) => Promise<string>;
-  net: (url: string) => Promise<string>;
-  search: (query: string) => Promise<string>;
-  ocaml: (payload: string) => Promise<string>;
-}) {
+function stoppedAnswer(steps: ToolStep[]): string {
+  const done = steps.filter((step) => step.tool !== "compile" && step.detail !== "推迟").slice(-4);
+  const lines = ["已按你的要求停下。"];
+  if (done.length) lines.push("停下之前做了：", ...done.map((step) => `${step.tool} ${step.detail}`.trim()));
+  lines.push("再发一句话就接着做；工作区里写好的文件都还在。");
+  return lines.join("\n");
+}
+
+function startCoreBridge(handlers: CoreHandlers) {
   const token = randomBytes(16).toString("hex");
   const server = createServer(async (req, res) => {
     if (req.headers["x-ocagent-token"] !== token) {
@@ -550,8 +749,7 @@ function startCoreBridge(handlers: {
     const op = body.op ?? "";
     const payload = body.payload ?? "";
     try {
-      const text =
-        op === "model" ? await handlers.model(payload) : op === "net" ? await handlers.net(payload) : op === "search" ? await handlers.search(payload) : op === "ocaml" ? await handlers.ocaml(payload) : "不支持的调用";
+      const text = op === "model" ? await handlers.model(payload) : op === "ocaml" ? await handlers.ocaml(payload) : "不支持的调用";
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(text);
     } catch (err) {
@@ -573,34 +771,41 @@ function startCoreBridge(handlers: {
   });
 }
 
-function shortenDiagnostic(raw: string): string {
+function shortenDiagnostic(raw: string, source = ""): string {
   const text = raw.replace(/\u001b\[[0-9;]*m/g, "");
   const spots = [...text.matchAll(/ocagent_step\.ml", line (\d+), characters (\d+)-(\d+)/g)];
   const actual = spots.at(-1);
+  // A syntax error in a step with quote-heavy lines is usually text that needed
+  // {|...|}: a quote inside a "..." literal. The parser blames the enclosing
+  // struct, so the whole source is looked at, not just the reported line.
+  const quoteTrouble = /Syntax error/.test(text) && source.split("\n").some((line) => (line.match(/"/g)?.length ?? 0) >= 3);
   const span = /ocagent_step\.ml", lines (\d+)-(\d+)/.exec(text);
   const where = actual
     ? `编译失败 (第 ${actual[1]} 行，第 ${actual[2]}-${actual[3]} 列)`
     : span
       ? `编译失败 (第 ${span[1]}-${span[2]} 行)`
       : "编译失败";
-  const pair = /Type "([^"]+)" is not compatible with type "([^"]+)"/.exec(text);
+  const pair = /Type "([^"]+)" is not compatible with type "([^"]+)"/.exec(text) ?? /has type "([^"]+)"\s+but an expression was expected of type\s+"([^"]+)"/.exec(text);
   const got = pair?.[1] ?? /has type ([^\n]+)/.exec(text)?.[1];
   const expected = pair?.[2] ?? /expected of type ([^\n]+)/.exec(text)?.[1];
   const pretty = (type: string) => type.replaceAll("(string, string) result", "string res").replaceAll("(unit, string) result", "unit res");
   const lines = [where];
   if (expected) lines.push(`这里期望: ${pretty(expected.trim())}`);
   if (got) lines.push(`实际是:   ${pretty(got.trim())}`);
+  if (!expected && !got) {
+    const err = /Error: ([^\n]+)/.exec(text);
+    if (err) lines.push(err[1].trim());
+  }
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Search、Net、Trace，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+  } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
+    lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
     lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
   } else if (/Signature mismatch/.test(text)) {
     lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
-  } else {
-    const err = /Error: ([^\n]+)/.exec(text);
-    if (err) lines.push(err[1].trim());
   }
   return lines.join("\n");
 }
@@ -662,7 +867,11 @@ function rejectedSource(source: string): string | null {
   return null;
 }
 
-function stepApi(filesOn: boolean, webOn: boolean, netOn: boolean): string {
+function ocamlStringList(items: string[]): string {
+  return `[ ${items.map((item) => JSON.stringify(item)).join("; ")} ]`;
+}
+
+function stepApi(filesOn: boolean, webOn: boolean, netOn: boolean, loaded: string[]): string {
   return `
 type 'a res = ('a, string) result
 
@@ -678,7 +887,7 @@ let slurp path =
   Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic))
 
 let bridge op payload =
-  let req = Filename.temp_file "ocagent" ".in" in
+  let req = Filename.temp_file "ocagent_" ".in" in
   let resp = req ^ ".out" in
   let oc = open_out req in
   output_string oc payload;
@@ -689,6 +898,8 @@ let bridge op payload =
   in
   let code = Sys.command cmd in
   let body = try slurp resp with _ -> "" in
+  (try Sys.remove req with Sys_error _ -> ());
+  (try Sys.remove resp with Sys_error _ -> ());
   if code <> 0 then Error (if body = "" then "调用失败" else body) else Ok body
 
 let effects = open_out_gen [ Open_append; Open_creat ] 0o644 "ocagent_effects"
@@ -721,6 +932,22 @@ let safe_rel path =
   && (not (String.ends_with ~suffix:"/" path))
   && (not (has_dotdot path))
   && not (String.contains path '\\\\')
+
+let count_sub text sub =
+  let n = String.length text and m = String.length sub in
+  let rec go i acc = if i + m > n then acc else if String.sub text i m = sub then go (i + m) (acc + 1) else go (i + 1) acc in
+  if m = 0 then 0 else go 0 0
+
+let replace_all text sub by =
+  let n = String.length text and m = String.length sub in
+  let buf = Buffer.create (n + 16) in
+  let rec go i =
+    if i >= n then ()
+    else if i + m <= n && String.sub text i m = sub then (Buffer.add_string buf by; go (i + m))
+    else (Buffer.add_char buf text.[i]; go (i + 1))
+  in
+  go 0;
+  Buffer.contents buf
 
 let rec mkdir_p path =
   if path = "" || path = "." then ()
@@ -787,7 +1014,6 @@ module Files = struct
     let result =
       if not files_on then Error "文件没开"
       else if not (safe_rel path) then Error "路径不行"
-      else if String.length content > 8000 then Error "内容太长"
       else (
         mkdir_p (Filename.dirname path);
         let oc = open_out path in
@@ -805,6 +1031,293 @@ module Files = struct
     in
     log_effect "Files.delete_file" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
     result
+
+  let replace path old by =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else if old = "" then Error "要替换的文本是空的"
+      else
+        match (try Ok (slurp path) with Sys_error _ -> Error "没有这个文件") with
+        | Error e -> Error e
+        | Ok text ->
+            let n = count_sub text old in
+            if n > 0 then (
+              let oc = open_out path in
+              Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (replace_all text old by));
+              Ok n)
+            else if by <> "" && count_sub text by > 0 then Ok 0
+            else Error "文件里没有这段文本（要一字不差，含空格和换行；先 read_file 看看）"
+    in
+    log_effect "Files.replace" path
+      (match result with
+      | Ok 0 -> "Ok 已经是改过的内容（文件里没有旧文本、已有新文本），这次 0 处，不用再改"
+      | Ok n -> "Ok 替换了 " ^ string_of_int n ^ " 处"
+      | Error e -> "Error " ^ e);
+    result
+
+  let append path content =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else (
+        mkdir_p (Filename.dirname path);
+        let oc = open_out_gen [ Open_append; Open_creat; Open_wronly ] 0o644 path in
+        Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc content);
+        Ok ())
+    in
+    log_effect "Files.append" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
+    result
+
+  (* Files as they were when this task began sit under ocagent_origin/ (only
+     those the task has changed so far); a path listed in ocagent_origin_absent
+     did not exist then. *)
+  let restore path =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else
+        let src = Filename.concat "ocagent_origin" path in
+        let absent =
+          match (try Some (slurp "ocagent_origin_absent") with Sys_error _ -> None) with
+          | None -> false
+          | Some listed -> List.mem path (String.split_on_char '\\n' listed)
+        in
+        if Sys.file_exists src then (
+          mkdir_p (Filename.dirname path);
+          let oc = open_out path in
+          Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (slurp src));
+          Ok "已退回任务开始时的版本")
+        else if absent then (
+          (try Sys.remove path with Sys_error _ -> ());
+          Ok "任务开始时没有这个文件，已删掉")
+        else if Sys.file_exists path then Ok "这次任务没改过它，现在就是开始时的版本"
+        else Error "没有这个文件，任务开始时也没有"
+    in
+    log_effect "Files.restore" path (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
+(* Assertions: each one is written to the timeline as 通过 / 没通过, so a
+   Done backed by passing checks needs no extra check round, and a Done with a
+   failing one is sent back. *)
+module Check = struct
+  let that cond desc =
+    log_effect "Check.that" desc (if cond then "通过" else "没通过");
+    cond
+
+  let equal expected actual desc =
+    let ok = expected = actual in
+    log_effect "Check.equal" desc (if ok then "通过" else "没通过：期望 " ^ clip_ends (one_line expected) 120 ^ "，实际 " ^ clip_ends (one_line actual) 120);
+    ok
+
+  (* A miss shows how the file actually starts, so a wrongly phrased needle
+     (English name vs the Chinese one the file has) is told apart from a
+     missing change without another read round. *)
+  let contains path needle =
+    let text = if files_on && safe_rel path then (try Some (slurp path) with Sys_error _ -> None) else None in
+    let ok = needle <> "" && (match text with Some t -> count_sub t needle > 0 | None -> false) in
+    let verdict =
+      if ok then "通过"
+      else match text with
+        | None -> "没通过：没有这个文件"
+        | Some t -> "没通过：文件里没有这段；文件里实际是：" ^ clip_ends (one_line (String.trim t)) 160
+    in
+    log_effect "Check.contains" (path ^ " 含 " ^ clip_ends (one_line needle) 80) verdict;
+    ok
+end
+
+module Json = struct
+  type t = Null | Bool of bool | Num of string | Str of string | Arr of t list | Obj of (string * t) list
+
+  exception Bad of string
+
+  let parse src =
+    let n = String.length src in
+    let i = ref 0 in
+    let peek () = if !i < n then src.[!i] else '\\000' in
+    let rec ws () = if !i < n && (match src.[!i] with ' ' | '\\n' | '\\t' | '\\r' -> true | _ -> false) then (incr i; ws ()) in
+    let expect c = if peek () = c then incr i else raise (Bad (Printf.sprintf "第 %d 字处应是 %c" !i c)) in
+    let add_utf8 buf code =
+      if code < 0x80 then Buffer.add_char buf (Char.chr code)
+      else if code < 0x800 then (
+        Buffer.add_char buf (Char.chr (0xC0 lor (code lsr 6)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+      else if code < 0x10000 then (
+        Buffer.add_char buf (Char.chr (0xE0 lor (code lsr 12)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+      else (
+        Buffer.add_char buf (Char.chr (0xF0 lor (code lsr 18)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 12) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+    in
+    let hex4 () =
+      if !i + 4 > n then raise (Bad "\\\\u 后面不够 4 位");
+      let v = int_of_string ("0x" ^ String.sub src !i 4) in
+      i := !i + 4;
+      v
+    in
+    let str () =
+      expect '"';
+      let buf = Buffer.create 32 in
+      let rec go () =
+        if !i >= n then raise (Bad "字符串没有结束（内容可能被截断了）");
+        let c = src.[!i] in
+        incr i;
+        if c = '"' then ()
+        else if c = '\\\\' then (
+          if !i >= n then raise (Bad "转义不完整");
+          let e = src.[!i] in
+          incr i;
+          (match e with
+          | 'n' -> Buffer.add_char buf '\\n'
+          | 't' -> Buffer.add_char buf '\\t'
+          | 'r' -> Buffer.add_char buf '\\r'
+          | 'b' -> Buffer.add_char buf '\\b'
+          | 'f' -> Buffer.add_char buf '\\012'
+          | 'u' ->
+              let hi = hex4 () in
+              if hi >= 0xD800 && hi <= 0xDBFF && !i + 1 < n && src.[!i] = '\\\\' && src.[!i + 1] = 'u' then (
+                i := !i + 2;
+                let lo = hex4 () in
+                add_utf8 buf (0x10000 + ((hi - 0xD800) lsl 10) + (lo - 0xDC00)))
+              else add_utf8 buf hi
+          | other -> Buffer.add_char buf other);
+          go ())
+        else (Buffer.add_char buf c; go ())
+      in
+      go ();
+      Buffer.contents buf
+    in
+    let rec value () =
+      ws ();
+      match peek () with
+      | '{' ->
+          incr i;
+          ws ();
+          if peek () = '}' then (incr i; Obj [])
+          else
+            let rec fields acc =
+              ws ();
+              let k = str () in
+              ws ();
+              expect ':';
+              let v = value () in
+              ws ();
+              match peek () with
+              | ',' -> incr i; fields ((k, v) :: acc)
+              | '}' -> incr i; Obj (List.rev ((k, v) :: acc))
+              | _ -> raise (Bad (Printf.sprintf "第 %d 字处的对象没有正常结束（内容可能被截断了）" !i))
+            in
+            fields []
+      | '[' ->
+          incr i;
+          ws ();
+          if peek () = ']' then (incr i; Arr [])
+          else
+            let rec items acc =
+              let v = value () in
+              ws ();
+              match peek () with
+              | ',' -> incr i; items (v :: acc)
+              | ']' -> incr i; Arr (List.rev (v :: acc))
+              | _ -> raise (Bad (Printf.sprintf "第 %d 字处的数组没有正常结束（内容可能被截断了）" !i))
+            in
+            items []
+      | '"' -> Str (str ())
+      | 't' when !i + 4 <= n && String.sub src !i 4 = "true" -> i := !i + 4; Bool true
+      | 'f' when !i + 5 <= n && String.sub src !i 5 = "false" -> i := !i + 5; Bool false
+      | 'n' when !i + 4 <= n && String.sub src !i 4 = "null" -> i := !i + 4; Null
+      | c when c = '-' || (c >= '0' && c <= '9') ->
+          let start = !i in
+          while !i < n && (match src.[!i] with '0' .. '9' | '-' | '+' | '.' | 'e' | 'E' -> true | _ -> false) do incr i done;
+          Num (String.sub src start (!i - start))
+      | _ -> raise (Bad (if !i >= n then "内容是空的或被截断了" else Printf.sprintf "第 %d 字处不是 JSON" !i))
+    in
+    (* Net.get prefixes its status line; anything before the first { or [ is skipped. *)
+    let first = ref n in
+    String.iteri (fun k c -> if !first = n && (c = '{' || c = '[') then first := k) src;
+    i := !first;
+    if !first >= n then raise (Bad "里面没有 JSON（没有 { 或 [）");
+    value ()
+
+  let rec print = function
+    | Null -> "null"
+    | Bool b -> string_of_bool b
+    | Num s -> s
+    | Str s ->
+        let buf = Buffer.create (String.length s + 2) in
+        Buffer.add_char buf '"';
+        String.iter
+          (fun c ->
+            match c with
+            | '"' -> Buffer.add_string buf "\\\\\\""
+            | '\\\\' -> Buffer.add_string buf "\\\\\\\\"
+            | '\\n' -> Buffer.add_string buf "\\\\n"
+            | '\\t' -> Buffer.add_string buf "\\\\t"
+            | '\\r' -> Buffer.add_string buf "\\\\r"
+            | c when Char.code c < 32 -> Buffer.add_string buf (Printf.sprintf "\\\\u%04x" (Char.code c))
+            | c -> Buffer.add_char buf c)
+          s;
+        Buffer.add_char buf '"';
+        Buffer.contents buf
+    | Arr xs -> "[" ^ String.concat "," (List.map print xs) ^ "]"
+    | Obj kv -> "{" ^ String.concat "," (List.map (fun (k, v) -> print (Str k) ^ ":" ^ print v) kv) ^ "}"
+
+  let scalar = function Str s -> s | v -> print v
+
+  let find text path =
+    match (try Ok (parse text) with Bad e -> Error ("JSON 解析失败：" ^ e) | _ -> Error "JSON 解析失败") with
+    | Error e -> Error e
+    | Ok root ->
+        let segs = List.filter (fun s -> s <> "") (String.split_on_char '.' (String.trim path)) in
+        let rec walk v = function
+          | [] -> Ok v
+          | seg :: rest -> (
+              match v with
+              | Obj kv -> (
+                  match List.assoc_opt seg kv with
+                  | Some next -> walk next rest
+                  | None ->
+                      let have = List.map fst kv in
+                      Error (Printf.sprintf "没有字段 %s（有：%s）" seg (String.concat "、" (List.filteri (fun k _ -> k < 12) have))))
+              | Arr xs -> (
+                  match int_of_string_opt seg with
+                  | None -> Error (Printf.sprintf "%s 处是数组（%d 项），要用下标，例如 %s" seg (List.length xs) (if rest = [] then "0" else "0." ^ String.concat "." rest))
+                  | Some k -> (
+                      match List.nth_opt xs k with
+                      | Some next -> walk next rest
+                      | None -> Error (Printf.sprintf "下标 %d 超出范围（共 %d 项）" k (List.length xs))))
+              | other -> Error (Printf.sprintf "%s 处不是对象或数组，是 %s" seg (clip_ends (print other) 60)))
+        in
+        walk root segs
+
+  let get text path =
+    let result = Result.map scalar (find text path) in
+    log_effect "Json.get" path (match result with Ok s -> "Ok " ^ clip_ends s 300 | Error e -> "Error " ^ e);
+    result
+
+  let items text path =
+    let result =
+      match find text path with
+      | Ok (Arr xs) -> Ok (List.map scalar xs)
+      | Ok other -> Error ("不是数组：" ^ clip_ends (print other) 60)
+      | Error e -> Error e
+    in
+    log_effect "Json.items" path (match result with Ok xs -> "Ok " ^ string_of_int (List.length xs) ^ " 项" | Error e -> "Error " ^ e);
+    result
+
+  let keys text path =
+    let result =
+      match find text path with
+      | Ok (Obj kv) -> Ok (List.map fst kv)
+      | Ok other -> Error ("不是对象：" ^ clip_ends (print other) 60)
+      | Error e -> Error e
+    in
+    log_effect "Json.keys" path (match result with Ok ks -> "Ok " ^ String.concat "、" ks | Error e -> "Error " ^ e);
+    result
 end
 
 module Search = struct
@@ -819,6 +1332,25 @@ module Net = struct
     let result = if not net_on then Error "网络没开" else if String.trim url = "" then Error "地址是空的" else bridge "net" url in
     log_effect "Net.get" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
     result
+
+  let post url body =
+    let result =
+      if not net_on then Error "网络没开"
+      else if String.trim url = "" then Error "地址是空的"
+      else bridge "net_post" (String.trim url ^ "\\n" ^ body)
+    in
+    log_effect "Net.post" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let page url n =
+    let result =
+      if not net_on then Error "网络没开"
+      else if String.trim url = "" then Error "地址是空的"
+      else if n < 1 then Error "页码从 1 数起"
+      else bridge "net_page" (String.trim url ^ "\\n" ^ string_of_int n)
+    in
+    log_effect "Net.page" (url ^ " 第 " ^ string_of_int n ^ " 页") (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
 end
 
 module Trace = struct
@@ -831,6 +1363,93 @@ module Clock = struct
     let t = Sys.time () in
     log_effect "Clock.now" "" (string_of_float t);
     t
+end
+
+module Plan = struct
+  let set items =
+    log_effect "Plan.set" "" (String.concat "\\031" (List.map String.trim items))
+
+  let tick n note =
+    log_effect "Plan.tick" (string_of_int n) note
+end
+
+module Memory = struct
+  let remember text = log_effect "Memory.remember" "" text
+
+  let forget n = log_effect "Memory.forget" (string_of_int n) ""
+end
+
+(* Daily schedules: the line is the whole registration; the server validates
+   the zone, stores it with the desk and starts a run when it is due. *)
+module Schedule = struct
+  let is_digit c = c >= '0' && c <= '9'
+
+  let clock_ok s =
+    match String.index_opt s ':' with
+    | Some i when i >= 1 && i <= 2 && String.length s - i - 1 = 2 ->
+        let h = String.sub s 0 i and m = String.sub s (i + 1) 2 in
+        String.for_all is_digit h && String.for_all is_digit m
+        && int_of_string h <= 23 && int_of_string m <= 59
+    | _ -> false
+
+  let daily when_ task =
+    let when_ = String.trim when_ in
+    let clock = match String.index_opt when_ ' ' with Some i -> String.sub when_ 0 i | None -> when_ in
+    let result =
+      if not (clock_ok clock) then Error "时间要写成 08:00（默认北京时间），要别的时区就写 08:00 Asia/Tokyo"
+      else if String.trim task = "" then Error "要定时做的事是空的"
+      else if String.length task > 300 then Error "要定时做的事太长了，一句话说清楚（300 字以内）"
+      else Ok ()
+    in
+    log_effect "Schedule.daily" when_ (match result with Ok () -> "Ok " ^ task | Error e -> "Error " ^ e);
+    result
+
+  let cancel n = log_effect "Schedule.cancel" (string_of_int n) ""
+end
+
+module Notify = struct
+  let send text =
+    let text = String.trim text in
+    let result =
+      if text = "" then Error "要发的内容是空的"
+      else if String.length text > 1500 then Error "一条消息最多 1500 字"
+      else bridge "notify" text
+    in
+    log_effect "Notify.send" "" (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
+module Harness = struct
+  let loaded () = ${ocamlStringList(loaded)}
+
+  let load name path =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else if not (safe_rel path) then Error "路径不行"
+      else
+        match (try Ok (slurp path) with Sys_error _ -> Error "没有这个文件") with
+        | Error e -> Error e
+        | Ok body -> bridge "harness" ("load\\n" ^ String.trim name ^ "\\n" ^ path ^ "\\n" ^ body)
+    in
+    log_effect "Harness.load" (String.trim name ^ " <- " ^ path) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let install name url =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else if String.trim url = "" then Error "地址是空的"
+      else bridge "harness" ("install\\n" ^ String.trim name ^ "\\n" ^ String.trim url)
+    in
+    log_effect "Harness.install" (String.trim name ^ " <- " ^ String.trim url) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let unload name =
+    let result =
+      if String.trim name = "" then Error "模块名是空的"
+      else bridge "harness" ("unload\\n" ^ String.trim name ^ "\\n")
+    in
+    log_effect "Harness.unload" (String.trim name) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
 end
 
 type reply =
@@ -872,7 +1491,7 @@ function encodeBlock(text: string): string {
 async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Promise<DeskFile[]> {
   const entries = await readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.name.startsWith("ocagent_") || entry.name.startsWith(".")) continue;
+    if (entry.name.startsWith("ocagent_") || entry.name.startsWith(".") || isScratchFile(entry.name)) continue;
     const abs = path.join(dir, entry.name);
     const rel = path.relative(root, abs).split(path.sep).join("/");
     if (!safePath(rel)) continue;
@@ -880,7 +1499,7 @@ async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Prom
     else if (entry.isFile()) {
       try {
         const content = await readFile(abs, "utf8");
-        if (!content.includes("\u0000") && content.length <= 8000) out.push({ path: rel, content });
+        if (!content.includes("\u0000")) out.push({ path: rel, content });
       } catch {
         /* skip unreadable files */
       }
@@ -889,19 +1508,25 @@ async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Prom
   return out;
 }
 
-export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
-  const cur = reader(Buffer.from(payload, "utf8"));
-  const source = cur.block();
-  const count = Number(cur.line());
+export async function runStep(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
+  let source = "";
   const files: DeskFile[] = [];
-  for (let i = 0; i < count; i += 1) files.push({ path: cur.line(), content: cur.block() });
+  try {
+    const cur = reader(Buffer.from(payload, "utf8"));
+    source = cur.block();
+    const count = Number(cur.line());
+    for (let i = 0; i < count; i += 1) files.push({ path: cur.line(), content: cur.block() });
+  } catch {
+    const kb = Math.round(Buffer.byteLength(payload) / 1024);
+    throw new RunnerError(`这一步的输入没有读全（收到 ${kb} KB，${files.length} 个文件后断了）。工作区可能太大，删掉或缩小几个大文件再试。`);
+  }
   const banned = rejectedSource(source);
   if (banned) return `fail\n${encodeBlock(banned)}`;
   const command = await ocamlCommand();
   if (!command) return `fail\n${encodeBlock("这台服务器没有 OCaml 运行器。")}`;
   await ensureRuntime();
-  const bridge = harnesses.some((id) => id === "net" || id === "web") ? await startBridge(apiKey, harnesses) : null;
   const dir = await mkdtemp(rt("runs", "step-"));
+  const bridge = await startBridge(apiKey, harnesses, hooks, { dir, hooks });
   try {
     for (const file of files) {
       if (!safePath(file.path)) continue;
@@ -910,10 +1535,35 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, file.content, "utf8");
     }
-    await writeFile(path.join(dir, "ocagent_api.ml"), stepApi(harnesses.includes("files"), harnesses.includes("web"), harnesses.includes("net")), "utf8");
+    const origin = hooks?.origin?.() ?? {};
+    const absent: string[] = [];
+    for (const [rel, content] of Object.entries(origin)) {
+      if (!safePath(rel)) continue;
+      if (content === null) {
+        absent.push(rel);
+        continue;
+      }
+      const target = path.resolve(dir, "ocagent_origin", rel);
+      if (!target.startsWith(path.join(dir, "ocagent_origin") + path.sep)) continue;
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, "utf8");
+    }
+    if (absent.length) await writeFile(path.join(dir, "ocagent_origin_absent"), absent.join("\n"), "utf8");
+    const loaded = hooks?.modules?.() ?? [];
+    await writeFile(
+      path.join(dir, "ocagent_api.ml"),
+      stepApi(
+        harnesses.includes("files"),
+        harnesses.includes("web"),
+        harnesses.includes("net"),
+        loaded.map((mod) => mod.name),
+      ),
+      "utf8",
+    );
+    await writeFile(path.join(dir, "ocagent_modules.ml"), renderModules(loaded), "utf8");
     await writeFile(path.join(dir, "ocagent_step.ml"), `${source.trim()}\n`, "utf8");
     await writeFile(path.join(dir, "ocagent_finish.ml"), STEP_FINISH, "utf8");
-    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_step.ml";;\n#use "ocagent_finish.ml";;\n', "utf8");
+    await writeFile(path.join(dir, "ocagent_driver.ml"), '#use "ocagent_api.ml";;\n#use "ocagent_modules.ml";;\n#use "ocagent_step.ml";;\n#use "ocagent_finish.ml";;\n', "utf8");
     await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
     const extra: Record<string, string> = {
       OCAGENT_NODE: process.execPath,
@@ -925,10 +1575,16 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       extra.OCAGENT_PORT = String(bridge.port);
       extra.OCAGENT_TOKEN = bridge.token;
     }
-    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 55_000 });
+    const ran = await execute(rt("ocamlrun"), [rt("ocaml"), path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 55_000, signal: hooks?.signal });
     const outPath = path.join(dir, "ocagent_step_out");
+    if (ran.aborted) return `fail\n${encodeBlock("已停下，这一步没有跑完。")}`;
     if (!(await exists(outPath))) {
-      return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;
+      const broken = /ocagent_modules\.ml", line (\d+)/.exec(ran.text.replace(/\u001b\[[0-9;]*m/g, ""));
+      if (broken) {
+        const culprit = moduleAtLine(loaded, Number(broken[1]));
+        return `fail\n${encodeBlock(`编译失败\n已加载的 module ${culprit ?? ""} 本身没有编译通过，这一步没有执行。先在工作区卸下它，或改好后重新 Harness.load。\n${moduleDiagnostic(ran.text, culprit ?? "?")}`)}`;
+      }
+      return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过", source))}`;
     }
     const outcome = reader(await readFile(outPath));
     const kind = outcome.line();
@@ -940,6 +1596,18 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       .map((line) => line.split("\t")[2] ?? "")
       .filter(Boolean)
       .join("\n");
+    // The first change to a file in this task: remember what it was before,
+    // so a later step can step back to it.
+    if (hooks?.onOrigin) {
+      const before = new Map(files.map((file) => [file.path, file.content]));
+      for (const line of effectText.split("\n")) {
+        const [tool = "", detail = "", ...rest] = line.split("\t");
+        if (!FILE_CHANGES.has(tool) || tool === "Files.restore" || !rest.join("\t").startsWith("Ok")) continue;
+        if (detail in origin) continue;
+        origin[detail] = before.get(detail) ?? null;
+        hooks.onOrigin(detail, origin[detail]);
+      }
+    }
     const written = await collectFiles(dir);
     let body = `ok\n${kind}\n${encodeBlock(text)}${encodeBlock(traces)}${encodeBlock(effectText.trim())}${written.length}\n`;
     for (const file of written) body += `${file.path}\n${encodeBlock(file.content)}`;
@@ -950,20 +1618,10 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
   }
 }
 
-export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined): Promise<string> {
-  if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey);
-  const cur = reader(Buffer.from(payload, "utf8"));
-  const entry = cur.block();
-  const source = cur.block();
-  const count = Number(cur.line());
-  const modules: DeskModule[] = [];
-  for (let i = 0; i < count; i += 1) modules.push({ name: cur.line(), body: cur.block() });
-  if (!safePath(entry) || !entry.endsWith(".ml")) return "只能跑工作区里的一个 .ml 文件。";
-  if (dangerous(source) || modules.some((mod) => !checkModule(mod.name, mod.body))) return "沙箱拒绝了这段代码：它想跑进程或离开工作区。";
-  return runOcaml([{ path: entry, content: source }], entry, { apiKey, harnesses, modules });
-}
-
-function dangerous(source: string): boolean {
-  return ["Sys.command", "Sys.getenv", "Sys.chdir", "Sys.remove", "Sys.rename", "Sys.set_signal", "Unix.", "#load", "#directory", "#use"].some((token) => source.includes(token));
+// Everything the loop hands the runner is a step; anything else is a protocol
+// mismatch, reported as a frame the loop understands.
+export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
+  if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey, hooks);
+  return `fail\n${encodeBlock("循环只会交来 step；这不是一个 step。")}`;
 }
 
