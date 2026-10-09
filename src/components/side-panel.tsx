@@ -1,9 +1,11 @@
-import { useState } from "react";
-import { Blocks, FileText, LoaderCircle, X } from "lucide-react";
-import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, type DeskModule, type HarnessId } from "@/lib/agent/harness";
+import { useRef, useState } from "react";
+import { Blocks, Check, Download, FileText, Link2, LoaderCircle, PackagePlus, RefreshCw, Upload, X } from "lucide-react";
+import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import type { DeskFile } from "@/lib/agent/workspace";
 
 const FIXED: HarnessId[] = ["ocaml"];
+
+type Verdict = { label: string; error: string | null };
 
 export function SidePanel({
   harnesses,
@@ -11,11 +13,14 @@ export function SidePanel({
   modules,
   setModules,
   onInstall,
+  onInstallUrl,
+  onImport,
   files,
   selected,
   onSelect,
   onReset,
   onClose,
+  shareUrl,
   busy,
 }: {
   harnesses: HarnessId[];
@@ -23,16 +28,25 @@ export function SidePanel({
   modules: DeskModule[];
   setModules: (next: DeskModule[]) => void;
   onInstall: (file: DeskFile) => Promise<string | null>;
+  onInstallUrl: (name: string | null, url: string) => Promise<string | null>;
+  onImport: (mod: DeskModule) => Promise<string | null>;
   files: DeskFile[];
   selected: string;
   onSelect: (path: string) => void;
   onReset: () => void;
   onClose?: () => void;
+  shareUrl: string;
   busy: boolean;
 }) {
   const file = files.find((item) => item.path === selected) ?? null;
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<{ path: string; text: string } | null>(null);
+  const [urlOpen, setUrlOpen] = useState(false);
+  const [urlText, setUrlText] = useState("");
+  const [working, setWorking] = useState(false);
+  const [verdicts, setVerdicts] = useState<Verdict[]>([]);
+  const [copied, setCopied] = useState(false);
+  const importInput = useRef<HTMLInputElement>(null);
   const candidate = file ? moduleNameFor(file.path) : null;
   const alreadyLoaded = candidate ? modules.some((mod) => mod.name === candidate) : false;
 
@@ -46,6 +60,94 @@ export function SidePanel({
       setInstalling(false);
     }
   }
+
+  // One raw URL per line, optionally "Name = url"; installed in order so a
+  // later module may build on an earlier one.
+  async function installUrls() {
+    const lines = urlText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (!lines.length) return;
+    setWorking(true);
+    const results: Verdict[] = [];
+    setVerdicts(results);
+    try {
+      for (const line of lines) {
+        const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(\S+)$/.exec(line);
+        const name = match ? match[1]! : null;
+        const url = match ? match[2]! : line;
+        const error = await onInstallUrl(name, url);
+        results.push({ label: name ?? moduleNameFromUrl(url) ?? url, error });
+        setVerdicts([...results]);
+      }
+      if (results.every((item) => !item.error)) setUrlText("");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  function exportModules() {
+    const payload = { "ocagent-harnesses": 1, exportedAt: new Date().toISOString(), modules: modules.map(({ name, body, source }) => ({ name, body, ...(source ? { source } : {}) })) };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `harnesses-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importFile(picked: File | undefined) {
+    if (!picked) return;
+    setWorking(true);
+    const results: Verdict[] = [];
+    setVerdicts(results);
+    try {
+      const parsed = JSON.parse(await picked.text()) as { modules?: unknown };
+      const list = Array.isArray(parsed.modules) ? parsed.modules : [];
+      if (!list.length) {
+        setVerdicts([{ label: picked.name, error: "这个文件里没有 module。" }]);
+        return;
+      }
+      for (const item of list) {
+        if (!item || typeof item !== "object" || typeof (item as DeskModule).name !== "string" || typeof (item as DeskModule).body !== "string") continue;
+        const mod = item as DeskModule;
+        const error = await onImport({ name: mod.name, body: mod.body, source: typeof mod.source === "string" ? mod.source : undefined });
+        results.push({ label: mod.name, error });
+        setVerdicts([...results]);
+      }
+    } catch {
+      setVerdicts([{ label: picked.name, error: "读不懂这个文件，要的是「导出」生成的 JSON。" }]);
+    } finally {
+      setWorking(false);
+      if (importInput.current) importInput.current.value = "";
+    }
+  }
+
+  async function refetch(mod: DeskModule) {
+    if (!mod.source || !/^https?:\/\//.test(mod.source)) return;
+    setWorking(true);
+    try {
+      const error = await onInstallUrl(mod.name, mod.source);
+      setVerdicts([{ label: mod.name, error: error ?? null }]);
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      window.prompt("复制这个链接：", shareUrl);
+    }
+  }
+
+  const disabled = busy || working;
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between px-4 pb-2 pt-4">
@@ -97,11 +199,59 @@ export function SidePanel({
             {modules.length}/{MAX_MODULES}
           </span>
         </h2>
-        {modules.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">还没有。它写好一个 .ml 后可以自己装上，或者你在下面的文件里点“装为 harness”。装上以后，每一步都能直接调用。</p> : null}
+        {modules.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">还没有。它写好一个 .ml 后可以自己装上；你也可以在下面的文件里点“装为 harness”，或从地址安装、导入别人导出的一组。装上以后，每一步都能直接调用。</p> : null}
         {modules.length > 0 ? (
           <ul className="mt-2 flex flex-col gap-2">
             {modules.map((mod) => (
-              <ModuleCard key={mod.name} mod={mod} busy={busy} onRemove={() => setModules(modules.filter((item) => item.name !== mod.name))} />
+              <ModuleCard key={mod.name} mod={mod} busy={disabled} onRemove={() => setModules(modules.filter((item) => item.name !== mod.name))} onRefetch={() => void refetch(mod)} />
+            ))}
+          </ul>
+        ) : null}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <button type="button" disabled={disabled} onClick={() => setUrlOpen((open) => !open)} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
+            <PackagePlus className="h-3.5 w-3.5" aria-hidden />
+            从地址安装
+          </button>
+          <button type="button" disabled={disabled} onClick={() => importInput.current?.click()} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
+            <Upload className="h-3.5 w-3.5" aria-hidden />
+            导入
+          </button>
+          <input ref={importInput} type="file" accept="application/json,.json" className="hidden" onChange={(event) => void importFile(event.target.files?.[0])} />
+          {modules.length > 0 ? (
+            <button type="button" onClick={exportModules} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent">
+              <Download className="h-3.5 w-3.5" aria-hidden />
+              导出
+            </button>
+          ) : null}
+        </div>
+        {urlOpen ? (
+          <div className="mt-2 flex flex-col gap-2">
+            <label className="block">
+              <span className="sr-only">要安装的地址</span>
+              <textarea
+                value={urlText}
+                onChange={(event) => setUrlText(event.target.value)}
+                rows={3}
+                disabled={disabled}
+                placeholder={"一行一个 raw .ml 地址；要指定名字就写\nMyopt = https://…/option.ml"}
+                className="block w-full resize-none rounded-lg border border-border bg-bg px-2.5 py-2 font-mono text-[11px] leading-5 text-fg outline-none placeholder:text-muted focus:border-primary"
+              />
+            </label>
+            <button type="button" disabled={disabled || !urlText.trim()} onClick={() => void installUrls()} className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 text-xs text-primary-fg disabled:opacity-40">
+              {working ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <PackagePlus className="h-3.5 w-3.5" aria-hidden />}
+              下载并编译检查
+            </button>
+          </div>
+        ) : null}
+        {verdicts.length > 0 ? (
+          <ul className="mt-2 flex flex-col gap-1">
+            {verdicts.map((item, index) => (
+              <li key={`${item.label}-${index}`} className={`flex min-w-0 items-start gap-1.5 text-xs leading-5 ${item.error ? "text-danger" : "text-accent"}`}>
+                {item.error ? <X className="mt-1 h-3 w-3 shrink-0" aria-hidden /> : <Check className="mt-1 h-3 w-3 shrink-0" aria-hidden />}
+                <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                  <span className="font-mono text-fg">{item.label}</span> {item.error ? item.error : "已装上"}
+                </span>
+              </li>
             ))}
           </ul>
         ) : null}
@@ -138,7 +288,7 @@ export function SidePanel({
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  disabled={busy || installing || alreadyLoaded}
+                  disabled={disabled || installing || alreadyLoaded}
                   onClick={() => void install(file)}
                   className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-border bg-bg px-2.5 text-xs text-fg hover:border-accent hover:text-accent disabled:opacity-50 disabled:hover:border-border disabled:hover:text-fg"
                 >
@@ -153,7 +303,11 @@ export function SidePanel({
         ) : null}
       </section>
 
-      <div className="mt-auto border-t border-border px-4 py-3">
+      <div className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-3">
+        <button type="button" onClick={() => void copyLink()} disabled={!shareUrl} className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-2 text-xs text-muted hover:text-fg disabled:opacity-50">
+          {copied ? <Check className="h-3.5 w-3.5 text-accent" aria-hidden /> : <Link2 className="h-3.5 w-3.5" aria-hidden />}
+          {copied ? "已复制，在别处打开就是这个工作区" : "复制工作区链接"}
+        </button>
         <button type="button" onClick={onReset} disabled={busy} className="min-h-10 rounded-lg px-2 text-xs text-muted hover:text-danger disabled:opacity-50">
           清空对话和文件
         </button>
@@ -162,16 +316,47 @@ export function SidePanel({
   );
 }
 
-function ModuleCard({ mod, busy, onRemove }: { mod: DeskModule; busy: boolean; onRemove: () => void }) {
+function sourceLabel(source: string | undefined): string {
+  if (!source) return "";
+  if (/^https?:\/\//.test(source)) {
+    try {
+      const url = new URL(source);
+      const tail = url.pathname.split("/").filter(Boolean).slice(-2).join("/");
+      return `${url.host}/…/${tail}`;
+    } catch {
+      return source;
+    }
+  }
+  return source;
+}
+
+function when(at: number | undefined): string {
+  if (!at) return "";
+  const diff = Date.now() - at;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  return new Date(at).toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+}
+
+function ModuleCard({ mod, busy, onRemove, onRefetch }: { mod: DeskModule; busy: boolean; onRemove: () => void; onRefetch: () => void }) {
   const [showSource, setShowSource] = useState(false);
   const exports = moduleExports(mod.body);
   const shown = exports.slice(0, 8);
   const more = exports.length - shown.length;
+  const fromUrl = Boolean(mod.source && /^https?:\/\//.test(mod.source));
+  const origin = sourceLabel(mod.source);
+  const stamp = when(mod.at);
   return (
     <li className="rounded-lg border border-border bg-surface px-3 py-2">
       <div className="flex items-center gap-2">
         <Blocks className="h-3.5 w-3.5 shrink-0 text-accent" aria-hidden />
         <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg">{mod.name}</span>
+        {fromUrl ? (
+          <button type="button" disabled={busy} onClick={onRefetch} aria-label={`重新下载 ${mod.name}`} title="重新下载并检查" className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted hover:text-fg disabled:opacity-50">
+            <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+          </button>
+        ) : null}
         <button type="button" onClick={() => setShowSource((value) => !value)} className="min-h-8 rounded-md px-1.5 text-xs text-muted hover:text-fg">
           {showSource ? "收起" : "源码"}
         </button>
@@ -179,6 +364,13 @@ function ModuleCard({ mod, busy, onRemove }: { mod: DeskModule; busy: boolean; o
           <X className="h-3.5 w-3.5" aria-hidden />
         </button>
       </div>
+      {origin || stamp ? (
+        <p className="mt-1 truncate font-mono text-[11px] text-muted" title={mod.source}>
+          {origin}
+          {origin && stamp ? " · " : ""}
+          {stamp}
+        </p>
+      ) : null}
       {shown.length ? (
         <p className="mt-1.5 flex flex-wrap gap-1">
           {shown.map((fn) => (

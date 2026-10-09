@@ -37,6 +37,8 @@ export type AgentTurnData = {
   steps: ToolStep[];
   code?: string;
   touched: string[];
+  /** Rounds the run took, known even when its timeline has not been fetched. */
+  rounds?: number;
 };
 
 function useNow(active: boolean): number {
@@ -60,19 +62,25 @@ function clean(text: string): string {
   return text.replaceAll("**", "").replaceAll("`", "");
 }
 
-export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnData; onOpenFile: (path: string) => void; onContinue?: () => void }) {
+export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: AgentTurnData; onOpenFile: (path: string) => void; onContinue?: () => void; onExpand?: () => void }) {
   const running = turn.status === "running";
   const now = useNow(running);
   const [open, setOpen] = useState(false);
   const rounds = foldRounds(turn.events);
   const calls = rounds.reduce((sum, round) => sum + round.effects.length, 0);
   const loaded = rounds.flatMap((round) => round.modules.map((mod) => mod.name));
-  const hasProcess = rounds.length > 0 || turn.steps.length > 0;
+  // An older run's timeline is fetched when it is first opened.
+  const unfetched = rounds.length === 0 && (turn.rounds ?? 0) > 0;
+  const hasProcess = rounds.length > 0 || turn.steps.length > 0 || unfetched;
   const showProcess = running || open;
+  const toggle = () => {
+    if (!open && unfetched) onExpand?.();
+    setOpen((value) => !value);
+  };
   const elapsed = seconds(turn.at, running ? now : (turn.endedAt ?? turn.at));
   const current = rounds[rounds.length - 1];
   const dropped = turn.events.flatMap((event) => (event.kind === "module_dropped" ? [event] : []));
-  const lastTrouble = !running && turn.status !== "done" ? troubleOf(current) : "";
+  const lastTrouble = !running && turn.status !== "done" && turn.status !== "stopped" ? troubleOf(current) : "";
 
   return (
     <article className="select-text">
@@ -93,7 +101,16 @@ export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnDat
         ) : null}
         {hasProcess && showProcess ? (
           <div className="border-b border-border px-4 py-3">
-            {rounds.length > 0 ? <Timeline rounds={rounds} running={running} /> : <LegacySteps steps={turn.steps} />}
+            {rounds.length > 0 ? (
+              <Timeline rounds={rounds} running={running} />
+            ) : unfetched ? (
+              <p className="flex items-center gap-2 text-sm text-muted">
+                <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden />
+                正在取回过程
+              </p>
+            ) : (
+              <LegacySteps steps={turn.steps} />
+            )}
           </div>
         ) : null}
         {running && !hasProcess ? (
@@ -115,9 +132,9 @@ export function AgentTurn({ turn, onOpenFile, onContinue }: { turn: AgentTurnDat
         {!running && (turn.touched.length > 0 || hasProcess || onContinue) ? (
           <footer className="flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-border px-4 py-2 text-xs text-muted">
             {hasProcess ? (
-              <button type="button" onClick={() => setOpen((value) => !value)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 -ml-1 text-xs text-muted hover:text-fg">
+              <button type="button" onClick={toggle} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 -ml-1 text-xs text-muted hover:text-fg">
                 {open ? <ChevronDown className="h-3.5 w-3.5" aria-hidden /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden />}
-                {rounds.length > 0 ? summaryLine(rounds.length, calls, loaded, elapsed) : `${turn.steps.length} 步`}
+                {rounds.length > 0 ? summaryLine(rounds.length, calls, loaded, elapsed) : unfetched ? `${turn.rounds} 轮 · ${elapsed}` : `${turn.steps.length} 步`}
               </button>
             ) : null}
             {turn.touched.map((path) => (
