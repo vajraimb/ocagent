@@ -1,9 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
-import { fetchPublic } from "./net.ts";
 import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isMemoryEffect, isPlanEffect, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
-import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
@@ -43,8 +41,6 @@ type CoreResult = {
 
 type CoreHandlers = {
   model: (prompt: string) => Promise<string>;
-  net: (url: string) => Promise<string>;
-  search: (query: string) => Promise<string>;
   ocaml: (payload: string) => Promise<string>;
 };
 
@@ -234,7 +230,7 @@ end`;
 
 // ---------------------------------------------------------------------------
 // Prompt context: what the Node side adds to the loop's own prompt each round.
-// The loop binary only relays the task and the model's Trace.notes; everything
+// The loop script only relays the task and the model's Trace.notes; everything
 // the model would otherwise have to re-discover (files, the last step's
 // returns, the code that failed to compile, time left) is appended here.
 
@@ -578,10 +574,6 @@ export async function runDeskLoop(
   let visionFailed = false;
   let lastCode = "";
   let last: LastOutcome = deps.last ?? null;
-  // What the last step frame told the loop binary to do. The binary ends a run
-  // on its own when a step wrote a .ml and said Continue ("已写下 …"); that
-  // is detected afterwards and the run carries on in a new segment.
-  let handed: string | null = null;
   // The plan the model keeps with Plan.set / Plan.tick, and the pre-finish
   // check: the first Done of a run that wrote anything is held for one more
   // round so the model verifies its work before the answer goes out.
@@ -657,18 +649,6 @@ export async function runDeskLoop(
           }
           return raw;
         },
-        net: async (url) => {
-          emit({ kind: "call", round, tool: "Net.get", detail: url });
-          const output = await fetchPublic(url);
-          emit({ kind: "effect", round, tool: "Net.get", detail: url, output });
-          return output;
-        },
-        search: async (query) => {
-          emit({ kind: "call", round, tool: "Search.query", detail: query });
-          const output = await searchWeb(apiKey, query);
-          emit({ kind: "effect", round, tool: "Search.query", detail: query, output });
-          return output;
-        },
         ocaml: async (payload) => {
           const isStep = payload.startsWith("step\n");
           if (isStep) emit({ kind: "run", round });
@@ -721,7 +701,6 @@ export async function runDeskLoop(
                 }
               }
               emit({ kind: "step", round, reply, text: frame.text });
-              handed = reply;
               last = { kind: "ran", round, reply, text: frame.text, effects };
               if (frame.files) fileIndex = frame.files.map((file) => (images.some((image) => image.path === file.path) ? { ...file, image: true } : file));
               compileStall = 0;
@@ -751,15 +730,9 @@ export async function runDeskLoop(
     if (haltReason === "budget") {
       return { ok: true, answer: pausedAnswer(round - roundBase, carried.steps), paused: true, ...carried, last: carryLast(last) };
     }
-    if (result.status === "done" && handed === "continue" && binaryCut(result.answer)) {
-      // The binary finished because a .ml was written, though the step (or the
-      // pre-finish hold) asked to go on. Pause instead, so the next segment
-      // picks up with the same context and the check round still happens.
-      return { ok: true, answer: `${result.answer}；接着做。`, paused: true, ...carried, last: carryLast(last) };
-    }
     if (haltReason) return { ok: false, error: stallAnswer(haltReason, haltDetail), ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
-    return { ok: true, answer: presentAnswer(task, dropBinaryNote(result.answer)), ...carried };
+    return { ok: true, answer: presentAnswer(task, result.answer), ...carried };
   } catch (err) {
     return {
       ok: false,
@@ -775,26 +748,6 @@ export async function runDeskLoop(
   } finally {
     clearTimeout(timer);
   }
-}
-
-// The loop binary's own early finish after a step wrote a .ml file.
-export function binaryCut(answer: string): boolean {
-  return /^已写下 /.test(answer.trim());
-}
-
-// The loop binary still has its own, older idea of loading a harness (picking a
-// .ml by name from the task). Installing now happens through Harness.install on
-// this side, so when a task merely mentions "harness" or "加载" the binary tacks
-// "没有加载成 harness。" onto an answer that is otherwise right. Drop that note;
-// the module row and the effect log already say what was installed.
-const BINARY_LOAD_NOTE = "没有加载成 harness。";
-
-export function dropBinaryNote(answer: string): string {
-  const lines = answer.split("\n");
-  while (lines.length > 0 && lines[lines.length - 1].trim() === BINARY_LOAD_NOTE) lines.pop();
-  const kept = lines.join("\n").trim();
-  if (kept) return kept;
-  return answer.trim() === BINARY_LOAD_NOTE ? "同一步重复了，没有写出文件。" : answer;
 }
 
 // A last outcome small enough to store with a paused run.

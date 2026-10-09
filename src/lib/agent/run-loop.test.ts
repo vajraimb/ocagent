@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, dropBinaryNote, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import type { AgentEventBody } from "./progress.ts";
 
@@ -190,67 +190,68 @@ test("a continued segment numbers its rounds after the earlier ones and tells th
   }
 });
 
-test("the binary's own finish after writing a .ml becomes a pause, with the check and last step carried", async () => {
-  const kinds: string[] = [];
-  const result = await runDeskLoop(
-    "key",
-    "写一个 greet.ml",
-    [],
-    ["ocaml", "files"],
-    [],
-    [],
-    "",
-    deps(
-      {
-        runCore: async (job, handlers) => {
-          await handlers.model("prompt");
-          const frame = await handlers.ocaml(`step\n${block("code")}0\n`);
-          // The binary sees a Continue with a freshly written .ml and stops the run itself.
-          assert.match(frame, /^ok\ncontinue\n/);
-          return { status: "done", answer: "已写下 greet.ml", files: [{ path: "greet.ml", content: "let hello n = n" }], modules: job.modules, steps: [], journal: [], memory: "" };
-        },
-        runPayload: async () => `ok\ndone\n${block("已写 greet.ml，hello name 会打招呼")}${block("")}${block("Files.write_file\tgreet.ml\tOk")}1\ngreet.ml\n${block("let hello n = n")}`,
+test("the real loop script: a held Done goes round again, and the step after it ends the run with the model's own answer", async () => {
+  const { runCore } = await import("./ocaml-run.ts");
+  const prompts: string[] = [];
+  let step = 0;
+  const result = await runCore(
+    { task: "把它装成 harness，然后调用一次给我看", harnesses: ["ocaml", "files"], files: [{ path: "greet.ml", content: "let hello n = \"Hello, \" ^ n" }], modules: [{ name: "Timer", body: "let t = 1" }], journal: [], memory: "" },
+    {
+      model: async (prompt) => {
+        prompts.push(prompt);
+        return `text\n${block(`\`\`\`ocaml\nmodule Step = struct let run () = Done "step ${prompts.length}" end\n\`\`\``)}`;
       },
-      kinds,
-    ),
+      ocaml: async (payload) => {
+        step += 1;
+        assert.match(payload, /^step\n/);
+        // Round 1: the step wrote a .ml and said Done; the Node side holds that
+        // Done for a check (hands back Continue). Round 2: the check ran.
+        if (step === 1) return `ok\ncontinue\n${block("已装成 harness 并调用 Greet.hello()")}${block("")}${block("Files.write_file\tgreet.ml\tOk\nHarness.install\tgreet.ml\tOk")}1\ngreet.ml\n${block("let hello n = n")}`;
+        return okFrame("done", "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!", "Files.read_file\tgreet.ml\tOk let hello n = n");
+      },
+    },
   );
-  assert.equal(result.ok, true);
-  assert.equal(result.paused, true);
-  assert.equal(result.answer, "已写下 greet.ml；接着做。");
-  // The Done was held for a check; the pending check and the step's returns ride into the next segment.
-  assert.equal(result.plan.pending, "已写 greet.ml，hello name 会打招呼");
-  assert.equal(result.last?.kind, "ran");
-  assert.ok(kinds.includes("check"));
-  // The next segment's first prompt shows both.
-  const text = promptContext({ round: 2, segment: 2, remainingMs: 60_000, files: [{ path: "greet.ml", bytes: 15 }], last: result.last ?? null, plan: result.plan.items, check: result.plan.pending ?? undefined });
-  assert.match(text, /【收尾前核对】[\s\S]*已写 greet\.ml/);
-  assert.match(text, /Files\.write_file greet\.ml → Ok/);
+  assert.equal(result.status, "done");
+  // No "已写下 …" stub, no trailing "没有加载成 harness。": the answer is the step's.
+  assert.equal(result.answer, "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!");
+  assert.equal(prompts.length, 2);
+  assert.equal(step, 2);
+  // Modules pass through untouched; the loop no longer installs anything itself.
+  assert.deepEqual(result.modules.map((mod) => mod.name), ["Timer"]);
+  assert.deepEqual(result.steps.map((item) => item.tool), ["Files.write_file", "Harness.install", "Files.read_file"]);
+  assert.ok(result.journal.some((item) => item.kind === "answer"));
 });
 
-test("the binary's stale '没有加载成 harness' note is dropped from an answer that installed through Harness.install", async () => {
-  const result = await runDeskLoop(
-    "key",
-    "把它装成 harness，然后调用一次给我看",
-    [],
-    ["ocaml", "files"],
-    [],
-    [],
-    "",
-    deps({
-      runCore: async (job, handlers) => {
-        await handlers.model("prompt");
-        await handlers.ocaml(`step\n${block("code")}0\n`);
-        // The binary's own loader found nothing to pick, so it tacks its note onto the model's answer.
-        return { status: "done", answer: "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!\n没有加载成 harness。", files: [], modules: [{ name: "Greet", body: "let hello n = n", source: "greet.ml" }], steps: [], journal: [], memory: "" };
-      },
-      runPayload: async () => okFrame("done", "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!", "Harness.install\tgreet.ml\tOk"),
-    }, []),
+test("the real loop script ends on its own only when the same step repeats or the model stops producing code", async () => {
+  const { runCore } = await import("./ocaml-run.ts");
+  const same = await runCore(
+    { task: "t", harnesses: ["ocaml"], files: [], modules: [], journal: [], memory: "" },
+    {
+      model: async () => `text\n${block("```ocaml\nmodule Step = struct let run () = Continue \"x\" end\n```")}`,
+      ocaml: async () => okFrame("continue", "x"),
+    },
   );
-  assert.equal(result.ok, true);
-  assert.equal(result.answer, "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!");
-  assert.deepEqual(dropBinaryNote("没有加载成 harness。"), "同一步重复了，没有写出文件。");
-  assert.deepEqual(dropBinaryNote("好了。\n没有加载成 harness。\n没有加载成 harness。"), "好了。");
-  assert.deepEqual(dropBinaryNote("好了。"), "好了。");
+  assert.equal(same.status, "done");
+  assert.equal(same.answer, "同一步重复了，没有新进展。");
+  let asked = 0;
+  const noCode = await runCore(
+    { task: "t", harnesses: ["ocaml"], files: [], modules: [], journal: [], memory: "" },
+    {
+      model: async () => {
+        asked += 1;
+        return `text\n${block("只是文字，没有代码")}`;
+      },
+      ocaml: async () => okFrame("continue", "x"),
+    },
+  );
+  assert.equal(noCode.answer, "没有拿到可执行的 OCaml。");
+  assert.equal(asked, 3);
+  const modelDown = await runCore(
+    { task: "t", harnesses: ["ocaml"], files: [], modules: [], journal: [], memory: "" },
+    { model: async () => `error\n${block("模型没有接上（503）。")}`, ocaml: async () => okFrame("continue", "x") },
+  );
+  assert.equal(modelDown.status, "done");
+  assert.equal(modelDown.answer, "模型没有接上（503）。");
 });
 
 test("a busy model endpoint is asked again before the round is given up", async () => {

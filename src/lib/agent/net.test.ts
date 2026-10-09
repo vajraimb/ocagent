@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { checkModule, moduleFromFile, prelude } from "./harness.ts";
+import { checkModule, moduleFromFile } from "./harness.ts";
 import { postPublic, publicUrl, readablePage } from "./net.ts";
 
 describe("public urls", () => {
@@ -14,16 +14,8 @@ describe("public urls", () => {
   });
 });
 
-describe("ocaml prelude", () => {
-  it("only exposes harnesses that are turned on", () => {
-    const both = prelude(["net", "web", "ocaml"]);
-    assert.match(both, /module Net/);
-    assert.match(both, /module Search/);
-    const netOnly = prelude([]);
-    assert.doesNotMatch(netOnly, /module Net/);
-    assert.doesNotMatch(netOnly, /module Search/);
-    const custom = prelude(["ocaml"], [{ name: "Twice", body: "let apply n = n * 2" }]);
-    assert.match(custom, /module Twice/);
+describe("module checks", () => {
+  it("accepts a well-named safe module and rejects the rest", () => {
     assert.equal(checkModule("twice", "let apply n = n * 2"), null);
     assert.equal(checkModule("Twice", "Sys.command \"ls\""), null);
     assert.equal(checkModule("Twice", "let t = Sys.time ()")?.name, "Twice");

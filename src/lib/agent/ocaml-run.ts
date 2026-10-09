@@ -5,7 +5,7 @@ import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFi
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { bannedCall, checkModule, MAX_MODULES, moduleFromFile, prelude, type DeskModule, type HarnessId } from "./harness.ts";
+import { bannedCall, MAX_MODULES, moduleFromFile, type DeskModule, type HarnessId } from "./harness.ts";
 import { settle } from "./budget.ts";
 import { fetchPublic, fetchSource, postPublic } from "./net.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
@@ -128,61 +128,6 @@ const text = await res.text();
 writeFileSync(outputPath, text);
 process.exit(res.ok ? 0 : 1);
 `;
-
-export async function runOcaml(
-  files: DeskFile[],
-  entry: string,
-  opts?: { apiKey?: string; harnesses?: HarnessId[]; modules?: DeskModule[] },
-): Promise<string> {
-  if (!safePath(entry) || !entry.endsWith(".ml")) return "只能跑工作区里的一个 .ml 文件。";
-  const source = files.find((file) => file.path === entry);
-  if (!source) return `没有 ${entry}`;
-  const command = await ocamlCommand();
-  if (!command) return "这台服务器没有 OCaml 运行器。";
-  if (command.prefix.length > 0 && !command.lib) return "标准库没有装上。";
-  const harnesses = opts?.harnesses ?? [];
-  const bridge = harnesses.some((id) => id === "net" || id === "web")
-    ? await startBridge(opts?.apiKey, harnesses)
-    : null;
-
-  await ensureRuntime();
-  const dir = await mkdtemp(rt("runs", "ml-"));
-  try {
-    for (const file of files) {
-      if (!file.path.endsWith(".ml") || !safePath(file.path)) continue;
-      const target = path.resolve(dir, file.path);
-      if (!target.startsWith(dir + path.sep)) continue;
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, file.content, "utf8");
-    }
-    await writeFile(path.join(dir, "ocagent_harness.ml"), prelude(harnesses, opts?.modules ?? []), "utf8");
-    await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
-    const driver = `#use "ocagent_harness.ml";;\n#use "${entry}";;\n`;
-    await writeFile(path.join(dir, "ocagent_driver.ml"), driver, "utf8");
-    const extra: Record<string, string> = {
-      OCAGENT_NODE: process.execPath,
-      OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
-    };
-    if (command.lib) {
-      extra.OCAMLLIB = command.lib;
-      extra.CAMLLIB = command.lib;
-    }
-    if (bridge) {
-      extra.OCAGENT_PORT = String(bridge.port);
-      extra.OCAGENT_TOKEN = bridge.token;
-    }
-    const runtimeLib = rt("lib");
-    extra.OCAMLLIB = runtimeLib;
-    extra.CAMLLIB = runtimeLib;
-    const run = rt("ocamlrun");
-    const image = rt("ocaml");
-    const ran = await execute(run, [image, path.join(dir, "ocagent_driver.ml")], dir, extra, { sandbox: true, timeoutMs: 8_000 });
-    return ran.text;
-  } finally {
-    if (bridge) await bridge.close();
-    await rm(dir, { recursive: true, force: true });
-  }
-}
 
 export type RunHooks = {
   signal?: AbortSignal;
@@ -677,35 +622,37 @@ function decodeResult(buf: Buffer): CoreResult {
   return { status, answer, files, modules, steps, journal, memory };
 }
 
-async function agentBin(): Promise<{ run: string; image: string }> {
+// The loop is OCaml source (assets/ocaml/bin/ocagent.ml) that the bundled
+// toplevel runs as a script, so changing it needs no compiler.
+export const LOOP_SCRIPT = "ocagent.ml";
+
+async function loopScript(): Promise<string> {
   await ensureRuntime();
-  const image = await fileAt("ocagent");
-  if (!image) throw new Error("没有 OCaml 循环");
-  await installBin(image, rt("ocagent"));
-  return { run: rt("ocamlrun"), image: rt("ocagent") };
+  const source = await fileAt(LOOP_SCRIPT);
+  if (!source) throw new Error("没有 OCaml 循环");
+  await copyFile(source, rt(LOOP_SCRIPT));
+  return rt(LOOP_SCRIPT);
 }
 
-export async function runCore(
-  job: CoreJob,
-  handlers: {
-    model: (prompt: string) => Promise<string>;
-    net: (url: string) => Promise<string>;
-    search: (query: string) => Promise<string>;
-    ocaml: (payload: string) => Promise<string>;
-  },
-  hooks?: RunHooks,
-): Promise<CoreResult> {
-  const { run, image } = await agentBin();
+export type CoreHandlers = {
+  model: (prompt: string) => Promise<string>;
+  ocaml: (payload: string) => Promise<string>;
+};
+
+export async function runCore(job: CoreJob, handlers: CoreHandlers, hooks?: RunHooks): Promise<CoreResult> {
+  const script = await loopScript();
   const dir = await mkdtemp(rt("runs", "job-"));
   const bridge = await startCoreBridge(handlers);
   try {
     await writeFile(path.join(dir, "job"), encodeJob(job));
     await writeFile(path.join(dir, "ocagent_client.mjs"), CLIENT, "utf8");
     const ran = await execute(
-      run,
-      [image, path.join(dir, "job"), path.join(dir, "result")],
+      rt("ocamlrun"),
+      [rt("ocaml"), script, path.join(dir, "job"), path.join(dir, "result")],
       dir,
       {
+        OCAMLLIB: rt("lib"),
+        CAMLLIB: rt("lib"),
         OCAGENT_NODE: process.execPath,
         OCAGENT_CLIENT: path.join(dir, "ocagent_client.mjs"),
         OCAGENT_PORT: String(bridge.port),
@@ -756,12 +703,7 @@ function stoppedAnswer(steps: ToolStep[]): string {
   return lines.join("\n");
 }
 
-function startCoreBridge(handlers: {
-  model: (prompt: string) => Promise<string>;
-  net: (url: string) => Promise<string>;
-  search: (query: string) => Promise<string>;
-  ocaml: (payload: string) => Promise<string>;
-}) {
+function startCoreBridge(handlers: CoreHandlers) {
   const token = randomBytes(16).toString("hex");
   const server = createServer(async (req, res) => {
     if (req.headers["x-ocagent-token"] !== token) {
@@ -782,8 +724,7 @@ function startCoreBridge(handlers: {
     const op = body.op ?? "";
     const payload = body.payload ?? "";
     try {
-      const text =
-        op === "model" ? await handlers.model(payload) : op === "net" ? await handlers.net(payload) : op === "search" ? await handlers.search(payload) : op === "ocaml" ? await handlers.ocaml(payload) : "不支持的调用";
+      const text = op === "model" ? await handlers.model(payload) : op === "ocaml" ? await handlers.ocaml(payload) : "不支持的调用";
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
       res.end(text);
     } catch (err) {
@@ -1514,20 +1455,10 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
   }
 }
 
+// Everything the loop hands the runner is a step; anything else is a protocol
+// mismatch, reported as a frame the loop understands.
 export async function runPayload(payload: string, harnesses: HarnessId[], apiKey: string | undefined, hooks?: RunHooks): Promise<string> {
   if (payload.startsWith("step\n")) return runStep(payload.slice(5), harnesses, apiKey, hooks);
-  const cur = reader(Buffer.from(payload, "utf8"));
-  const entry = cur.block();
-  const source = cur.block();
-  const count = Number(cur.line());
-  const modules: DeskModule[] = [];
-  for (let i = 0; i < count; i += 1) modules.push({ name: cur.line(), body: cur.block() });
-  if (!safePath(entry) || !entry.endsWith(".ml")) return "只能跑工作区里的一个 .ml 文件。";
-  if (dangerous(source) || modules.some((mod) => !checkModule(mod.name, mod.body))) return "沙箱拒绝了这段代码：它想跑进程或离开工作区。";
-  return runOcaml([{ path: entry, content: source }], entry, { apiKey, harnesses, modules });
-}
-
-function dangerous(source: string): boolean {
-  return ["Sys.command", "Sys.getenv", "Sys.chdir", "Sys.remove", "Sys.rename", "Sys.set_signal", "Unix.", "#load", "#directory", "#use"].some((token) => source.includes(token));
+  return `fail\n${encodeBlock("循环只会交来 step；这不是一个 step。")}`;
 }
 

@@ -31,17 +31,18 @@ dune exec ./bin/demo.exe
 
 ## 工作台里的循环：谁负责什么
 
-网页工作台跑的是 `assets/ocaml/bin/ocagent`（bytecode，源码 `agent.ml`，需要 OCaml 5.3 才能重新编译，沙箱里没有编译器）。它只是一个薄执行器：
+网页工作台跑的循环是 **`assets/ocaml/bin/ocagent.ml`**——一份 OCaml 源码，由随包的字节码顶层以脚本方式执行（`ocamlrun ocaml ocagent.ml <job> <result>`），所以改它不需要编译器。它只是一个薄执行器：
 
-- **二进制**：按轮次读模型回复，抽出 `ocaml` 代码块交给 `runStep`，收集 `Trace.note`，判断"模型答完了 / 轮数到了"。它看不到工作区文件，也不管时间。
+- **循环脚本**：每轮把"任务 + 自己的 Trace 笔记 + 上一次编译错误"交给 Node 当提示（Node 再加上指令和其余上下文），拿回模型回复，抽出 `ocaml` 代码块交给 `runStep`，把这一步的 effect 日志折进 journal。它**从不自己判断任务做没做完**：只在交回来的一步说 Done / Ask / Partial、同一步原样重复、或模型连续三轮不给代码时结束。它看不到工作区文件，不管时间，不装 harness，不改 modules。桥接只有两个调用：`model` 和 `ocaml`。
 - **Node（`src/lib/agent/run.ts`）**：拥有每轮的 prompt 上下文（文件清单、上一步的返回、编译失败的代码、计划勾选状态、剩余时间）、时间预算与分段（`OCAGENT_RUN_BUDGET_MS`）、跨实例的停止标志、把过程写进数据库的进度日志，以及**收尾前核对**：写过文件的运行第一次 `Done` 会被改成 `Continue` 再给一轮，让模型读回文件或算一个已知值核对；核对过的 `Done` 原样放行。
-- **Step API 里的 `Plan`**（`ocaml-run.ts` 的前导）：`Plan.set [...]` / `Plan.tick n "结果"` 只是写进 effect 日志的两行，由 Node 解析成清单、附回下一轮提示并推给页面；二进制对它一无所知。
+- **装 harness** 只有一条路：步骤里的 `Harness.load / install / unload`，走 `ocaml-run.ts` 的桥接，由 Node 验证、编译、记录（`onModule` / `onUnload`），运行结果里的 modules 由 `mergeModules` 合出。
+- **Step API 里的 `Plan`**（`ocaml-run.ts` 的前导）：`Plan.set [...]` / `Plan.tick n "结果"` 只是写进 effect 日志的两行，由 Node 解析成清单、附回下一轮提示并推给页面；循环脚本对它一无所知。
 - **Step API 里的 `Memory`**：同样只是 effect 日志（`Memory.remember "…"` / `Memory.forget n`）。Node 把它们合并进工作区的 `notes`（数据库 `desks.notes`），之后这个工作区的每一个任务的提示都带【记住的】；页面的「它记住的」可以删。
 - **Step API 里的 `Json`、`Files.replace` / `append`、`Net.post`**：`Json.get / items / keys` 是前导里的纯 OCaml 解析器（会跳过 `Net.get` 返回开头的 HTTP 行），让"请求 → 取字段 → 再请求"在一步里做完；`Files.replace path 旧 新` 做局部修改而不是整份重写；`Net.post` 走桥接的 `net_post`（`net.ts` 的 `postPublic`，JSON 体按 JSON 发，不跟随跳转）。桥接给步骤的 Net / Search 返回最多 16k 字，提示里只显示头尾。
-- **二进制的"已写下"提前结束**：`agent.ml` 在某一步写出新的 `.ml` 且回复 Continue 时会自己结束运行（答案 `已写下 X.ml`），这会吞掉收尾核对那一轮和模型自己的答案。Node 识别这种结束（上一帧交给它的是 continue、答案以 `已写下` 开头），改记为 paused，页面自动接下一段；上一步的返回（`last`）和待核对的答案随运行结果一起带过去，所以下一段的第一轮提示里仍有【收尾前核对】和【上一步…】。
-- **二进制的"没有加载成 harness。"**：`agent.ml` 还留着自己那套按任务里的词挑 `.ml` 装进 modules 的老逻辑（`wants_load`：任务含 "harness" 或 "加载"）。现在装 harness 走的是步骤里的 `Harness.install`（Node 侧），二进制自己什么也没挑到，就会在模型答案末尾补一句 `没有加载成 harness。`——哪怕刚刚装成了。Node 的 `dropBinaryNote` 去掉这句（整条答案只有这句时换成"同一步重复了"）；装没装成看模块一行和 effect 日志。
 - **桥接的临时文件**：步骤里每次桥接调用用 `ocagent_…in` 临时文件传参，用完即删；`isScratchFile` 再把早先漏进工作区的 `ocagentXXXX.in(.out)` 过滤掉。
-- **对话与笔记的边界**：二进制的 journal / memory 是**一个任务**的笔记和续跑点——新任务从空开始（`startRun` 传空 journal），之前的任务以【之前的对话】（最近几次的任务与回答，`historyFor`）附在提示里。
+- **对话与笔记的边界**：循环的 journal / memory 是**一个任务**的笔记和续跑点——新任务从空开始（`startRun` 传空 journal），之前的任务以【之前的对话】（最近几次的任务与回答，`historyFor`）附在提示里。
 - **数据库（`migrations/0002_desks_runs.sql`、`store.server.ts`）**：工作区文件 / harness / 模块 / journal 和每次运行的事件是持久的；浏览器只拿一个工作区 id，刷新或换设备都能接回去。
 
-因此调整"什么时候停、每轮给模型看什么、一段最多跑多久"改 `run.ts` 即可，不需要重编 `agent.ml`。重编二进制时请保持它的 stdin/stdout 帧格式不变（`ok\n<kind>\n…` / `fail\n…`）。
+以前这里是一个预编译的字节码 `ocagent`（源码 `agent.ml`），带着一套早期的工具调用和"按任务里的词挑 `.ml` 装成 harness"的逻辑：写出新 `.ml` 就自己结束（答案 `已写下 X.ml`）、任务提到 "harness" 又没挑到文件就在答案后补 `没有加载成 harness。`。沙箱里没有编译器，这些行为只能在 Node 侧绕；现在二进制、旧源码和那些绕法都删掉了，循环就是上面这份脚本。
+
+因此调整"什么时候停、每轮给模型看什么、一段最多跑多久"改 `run.ts`；改循环本身改 `ocagent.ml`，保持 job / result 文件格式和步骤帧格式不变（`ok\n<kind>\n…` / `fail\n…`），`run-loop.test.ts` 里有用真实运行时跑它的测试。

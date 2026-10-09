@@ -8,67 +8,11 @@ export type HarnessSpec = {
   moduleName: string;
   summary: string;
   tools: string;
-  source: string;
 };
 
 // `source` is where the module came from (a workspace path or a raw URL) and
 // `at` when it was installed, so the panel can show provenance and re-fetch.
 export type DeskModule = { name: string; body: string; source?: string; at?: number };
-
-const CALL = `let quote s =
-  let buf = Buffer.create (String.length s + 2) in
-  Buffer.add_char buf '\\'';
-  String.iter (fun c -> if c = '\\'' then Buffer.add_string buf "'\\\\''" else Buffer.add_char buf c) s;
-  Buffer.add_char buf '\\'';
-  Buffer.contents buf
-
-let slurp path =
-  let ic = open_in path in
-  let n = in_channel_length ic in
-  let s = really_input_string ic n in
-  close_in ic;
-  s
-
-let call op payload =
-  let req = Filename.temp_file "ocagent" ".in" in
-  let resp = req ^ ".out" in
-  let oc = open_out req in
-  output_string oc payload;
-  close_out oc;
-  let cmd = String.concat " " [
-    quote (Sys.getenv "OCAGENT_NODE");
-    quote (Sys.getenv "OCAGENT_CLIENT");
-    quote op;
-    quote req;
-    quote resp;
-  ] in
-  let code = Sys.command cmd in
-  let body = try slurp resp with _ -> "" in
-  if code <> 0 then failwith (if body = "" then "harness 调用失败" else body) else body
-`;
-
-const NET = `module Net = struct
-  let get url = call "net" url
-end
-`;
-
-const SEARCH = `module Search = struct
-  let query q = call "search" q
-end
-`;
-
-const FILES = `module Files = struct
-  (* list_files *)
-  (* read_file *)
-  (* find_in_files *)
-  (* write_file *)
-  (* delete_file *)
-end
-`;
-
-const RUNNER = `(* ocaml_run *)
-(* 只加载已经加上的 module *)
-`;
 
 export const CATALOG: HarnessSpec[] = [
   {
@@ -76,16 +20,14 @@ export const CATALOG: HarnessSpec[] = [
     name: "文件",
     moduleName: "Files",
     summary: "只动工作区里的文件，不看网页。",
-    tools: "list_files · read_file · find_in_files · write_file · delete_file",
-    source: FILES.trim(),
+    tools: "Files.read_file · write_file · replace · append · delete_file · find_in_files",
   },
   {
     id: "web",
     name: "网页",
     moduleName: "Search",
     summary: "查公开网页。没有第二个搜索。",
-    tools: "web_search · Search.query",
-    source: SEARCH.trim(),
+    tools: "Search.query",
   },
   {
     id: "net",
@@ -93,15 +35,13 @@ export const CATALOG: HarnessSpec[] = [
     moduleName: "Net",
     summary: "请求公网地址，GET 或 POST；返回的 JSON 可以直接取字段。",
     tools: "Net.get · Net.post · Json",
-    source: NET.trim(),
   },
   {
     id: "ocaml",
     name: "运行",
     moduleName: "OCaml",
-    summary: "跑工作区里的 .ml，并加载已经加上的 module。",
-    tools: "ocaml_run",
-    source: RUNNER.trim(),
+    summary: "把工作区或网上的 .ml 装成 module，之后每一步都能直接调用。",
+    tools: "Harness.load · Harness.install · Harness.unload",
   },
 ];
 
@@ -123,16 +63,6 @@ export function normalizeHarnesses(raw: unknown): HarnessId[] {
     ids.push(id);
   }
   return ids;
-}
-
-export function prelude(enabled: HarnessId[], modules: DeskModule[] = []): string {
-  const parts = [CALL];
-  if (enabled.includes("net")) parts.push(NET);
-  if (enabled.includes("web")) parts.push(SEARCH);
-  if (enabled.includes("ocaml")) {
-    for (const mod of modules) parts.push(`module ${mod.name} = struct\n${mod.body}\nend\n`);
-  }
-  return parts.join("\n");
 }
 
 const MODULE_NAME = /^[A-Z][A-Za-z0-9_]{0,24}$/;
