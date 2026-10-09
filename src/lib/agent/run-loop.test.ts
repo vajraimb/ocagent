@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, beyondReach, blindMisses, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, beyondReach, blindMisses, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, pauseNote, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import { boundOrigin, type AgentEvent, type AgentEventBody } from "./progress.ts";
 
@@ -236,7 +236,7 @@ test("a continued segment numbers its rounds after the earlier ones and tells th
     // Round 5's prompt: fresh segment, the workspace listed.
     assert.match(prompts[0] ?? "", /^low\n/);
     assert.match(prompts[0] ?? "", /第 5 轮/);
-    assert.match(prompts[0] ?? "", /第 2 段/);
+    assert.match(prompts[0] ?? "", /第 2\/10 段/);
     assert.match(prompts[0] ?? "", /notes\/a\.md（5 B）/);
     // Round 6 follows a compile failure: the error and the failed code ride along, with more care.
     assert.match(prompts[1] ?? "", /^medium\n/);
@@ -1140,6 +1140,28 @@ test("carriesOn: a paused run continues by itself while it makes progress and ha
   assert.equal(carriesOn({ ...base, events: progressed, segment: MAX_SEGMENTS }), false);
   assert.equal(carriesOn({ ...base, events: progressed, status: "done" }), false);
   assert.equal(MAX_SEGMENTS, 10);
+});
+
+test("a pause says what happens next: carrying on by itself, stopped at the cap with how to continue, or stopped for doing nothing", () => {
+  const seg = "这一段时间用完了（4 轮，3 次调用），做到的都留在工作区里。";
+  assert.equal(pauseNote(seg, 2, 9, true), `${seg}马上自动接着做（第 3/${MAX_SEGMENTS} 段）。`);
+  const capped = pauseNote(seg, MAX_SEGMENTS, 41, false);
+  assert.match(capped, new RegExp(`已经自动连做了 ${MAX_SEGMENTS} 段（共 41 轮），到了一次任务的上限`));
+  assert.match(capped, /「接着做」再续一段/);
+  assert.match(capped, /新任务/);
+  const idle = pauseNote(seg, 3, 12, false);
+  assert.match(idle, /没有做出任何一步有效果的事，所以没有自动继续/);
+  assert.match(idle, /「接着做」/);
+  // The last automatic segment is told to wrap up, not to start new work.
+  const ctx = { round: 30, remainingMs: 90_000, files: [], last: null, plan: [], check: null, checkFailed: [], written: [], modules: [] };
+  const lastSeg = promptContext({ ...ctx, segment: MAX_SEGMENTS });
+  assert.match(lastSeg, new RegExp(`自动接续的最后一段（第 ${MAX_SEGMENTS}/${MAX_SEGMENTS} 段）`));
+  assert.match(lastSeg, /Trace\.note 记下做到哪/);
+  assert.match(lastSeg, /Partial/);
+  const midSeg = promptContext({ ...ctx, segment: 2 });
+  assert.match(midSeg, new RegExp(`接着上一段继续的第 2/${MAX_SEGMENTS} 段`));
+  assert.doesNotMatch(midSeg, /最后一段/);
+  assert.doesNotMatch(promptContext({ ...ctx, segment: 1 }), /第 1\/|最后一段/);
 });
 
 test("Notify.send goes through the desk's address: a notify event (not an effect line), the prompt says it is connected, and a 发消息 Done stands only when one went through", async () => {

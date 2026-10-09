@@ -430,8 +430,14 @@ export function promptContext(ctx: PromptContext): string {
     }
   }
   const seconds = Math.max(0, Math.round(ctx.remainingMs / 1000));
-  const segment = ctx.segment > 1 ? `这是接着上一段继续的第 ${ctx.segment} 段。` : "";
-  parts.push(`【进度】这是第 ${ctx.round} 轮。${segment}这一段还剩约 ${seconds} 秒；时间用完会暂停，之后从工作区和笔记接着做，所以每一轮都要留下有效果的事。`);
+  if (ctx.segment >= MAX_SEGMENTS) {
+    parts.push(
+      `【进度】这是第 ${ctx.round} 轮，自动接续的最后一段（第 ${ctx.segment}/${MAX_SEGMENTS} 段），还剩约 ${seconds} 秒；这一段时间用完后不会再自动继续。这一段要收尾：先用 Trace.note 记下做到哪、还差什么、下一步该从哪接着做，把计划里做完的 Plan.tick 打勾；然后交出目前的结果——能 Done 就 Done，做不完就 Partial 写清楚已完成和未完成的部分。不要开新的大块工作。`,
+    );
+  } else {
+    const segment = ctx.segment > 1 ? `这是接着上一段继续的第 ${ctx.segment}/${MAX_SEGMENTS} 段。` : "";
+    parts.push(`【进度】这是第 ${ctx.round} 轮。${segment}这一段还剩约 ${seconds} 秒；时间用完会暂停，之后从工作区和笔记接着做，所以每一轮都要留下有效果的事。`);
+  }
   return clip(parts.join("\n\n"), MAX_CONTEXT);
 }
 
@@ -1134,7 +1140,21 @@ function carryLast(last: LastOutcome): LastOutcome {
 
 function pausedAnswer(rounds: number, steps: ToolStep[]): string {
   const done = steps.filter((step) => step.tool !== "compile").length;
-  return `这一段时间用完了（${rounds} 轮，${done} 次调用），做到的都留在工作区里；接着做就会从这里继续。`;
+  return `这一段时间用完了（${rounds} 轮，${done} 次调用），做到的都留在工作区里。`;
+}
+
+/**
+ * What a paused run says about going on: by itself (there are segments left
+ * and this one got somewhere), stopped at the cap, or stopped because the
+ * segment did nothing — each telling the user what happens next.
+ */
+export function pauseNote(segmentAnswer: string, segment: number, rounds: number, carryingOn: boolean): string {
+  const base = segmentAnswer.trim();
+  if (carryingOn) return `${base}马上自动接着做（第 ${segment + 1}/${MAX_SEGMENTS} 段）。`;
+  if (segment >= MAX_SEGMENTS) {
+    return `${base}已经自动连做了 ${segment} 段（共 ${rounds} 轮），到了一次任务的上限，先停在这里。做到哪、还差什么记在它的笔记和计划里；点「接着做」再续一段，或者把剩下的事作为一句新任务发给它。`;
+  }
+  return `${base}这一段没有做出任何一步有效果的事，所以没有自动继续。点「接着做」再试一段，或者换个说法、把任务拆小。`;
 }
 
 function stallAnswer(reason: HaltReason, detail: string): string {
@@ -1485,9 +1505,10 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
     // A scheduled run nobody is watching: its summary goes to the desk's
     // notify address (once, when the run is over for good).
     const carryingOn = status === "paused" && carriesOn({ ...run, status, events: [...run.events, ...soFar] });
+    const answer = !result.ok ? result.error : status === "paused" ? pauseNote(result.answer, run.segment, rounds, carryingOn) : result.answer;
     if (run.trigger === "schedule" && desk.notifyUrl && !carryingOn) {
       const when = (await store.listSchedules(desk.id)).find((item) => item.lastRunId === run.id);
-      const text = scheduleSummary({ when: when ? describeWhen(when.time, when.tz) : "每天", task: run.task, status, answer: result.ok ? result.answer : result.error, link: self ? `${self}/?desk=${desk.id}` : "" });
+      const text = scheduleSummary({ when: when ? describeWhen(when.time, when.tz) : "每天", task: run.task, status, answer, link: self ? `${self}/?desk=${desk.id}` : "" });
       const sent = await sendNotify(desk.notifyUrl, text);
       const event = runProgress.emit(run.id, sent.ok ? { kind: "notify", round: rounds, ok: true, where: sent.where, auto: true } : { kind: "notify", round: rounds, ok: false, where: sent.where, error: sent.error, auto: true });
       // The flusher has stopped by now; this one is written by hand.
@@ -1495,7 +1516,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
     }
     const events = runProgress.read(run.id).events;
     const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
-    const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched, plan: result.plan };
+    const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer, steps: result.steps, touched, plan: result.plan };
     if (status === "done" && endedWithAsk(events)) outcome.asked = true;
     if (status === "paused" && result.last) outcome.last = result.last;
     const saved = await store.writeDesk(desk.id, state);
