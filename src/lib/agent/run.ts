@@ -278,7 +278,7 @@ function kb(bytes: number): string {
 function effectLine(effect: { tool: string; detail: string; output: string }): string {
   const wide = effect.tool === "Files.read_file" || effect.tool === "Net.get" || effect.tool === "Search.query";
   const picture = /^(Ok )?data:image\//.test(effect.output);
-  const output = picture ? "Ok （这是一张图片的编码；图片本身已经附在提示里，直接看图）" : clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 1_500 : 400);
+  const output = picture ? "Ok （这是一张图片的编码；图片本身已经附在提示里，直接看图）" : clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 2_500 : 400);
   const detail = effect.detail.trim() ? ` ${clip(effect.detail.trim(), 120)}` : "";
   return `- ${effect.tool}${detail} → ${output || "（没有输出）"}`;
 }

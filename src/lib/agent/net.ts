@@ -60,6 +60,84 @@ export async function fetchSource(raw: string): Promise<{ ok: true; text: string
   return { ok: false, error: "跳转太多次。" };
 }
 
+const MAX_PAGE_TEXT = 4_000;
+
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–", middot: "·" };
+
+function decodeEntities(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (whole, body: string) => {
+    if (body[0] === "#") {
+      const code = body[1]?.toLowerCase() === "x" ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(code) && code > 0 && code < 0x110000 ? String.fromCodePoint(code) : whole;
+    }
+    return ENTITIES[body.toLowerCase()] ?? whole;
+  });
+}
+
+function looksLikeHtml(text: string, contentType: string): boolean {
+  return /text\/html|application\/xhtml/i.test(contentType) || /^\s*<(!doctype\s+html|html|head|body)\b/i.test(text);
+}
+
+const BLOCK_END = /^\/(p|div|li|tr|h[1-6]|section|article|header|footer|blockquote|pre|td|th|dt|dd)$/i;
+
+// Replaces tags with a space, or a newline after block elements. Attribute
+// values are skipped as quoted strings, so a ">" inside one (common in
+// data-* JSON and inline handlers) does not end the tag early.
+function stripTags(html: string): string {
+  let out = "";
+  let i = 0;
+  while (i < html.length) {
+    const ch = html[i];
+    if (ch !== "<" || !/[a-zA-Z/!]/.test(html[i + 1] ?? "")) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+    let j = i + 1;
+    let quote = "";
+    while (j < html.length) {
+      const c = html[j];
+      if (quote) {
+        if (c === quote) quote = "";
+      } else if (c === '"' || c === "'") {
+        quote = c;
+      } else if (c === ">") {
+        break;
+      }
+      j += 1;
+    }
+    const inner = html.slice(i + 1, j).trim();
+    const name = inner.split(/[\s/>]/, 1)[0] ?? "";
+    out += BLOCK_END.test(inner.replace(/\s.*$/s, "")) || /^br$/i.test(name) ? "\n" : " ";
+    i = j + 1;
+  }
+  return out;
+}
+
+// A web page as text the model can use: title and description first, then the
+// visible copy with markup, scripts and styles gone. Raw HTML in a 3,500-char
+// window is mostly boilerplate, which was what the model used to get.
+export function readablePage(html: string): string {
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
+  const description = /<meta\s+[^>]*(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']*)["']/i.exec(html)?.[1] ?? /<meta\s+[^>]*content=["']([^"']*)["'][^>]*(?:name|property)=["'](?:description|og:description)["']/i.exec(html)?.[1];
+  const stripped = html
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<(script|style|noscript|svg|template|iframe|canvas)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<(head)\b[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<(nav|aside|footer)\b[\s\S]*?<\/\1>/gi, " ");
+  // The main column when the page marks one and it has real copy.
+  const main = /<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i.exec(stripped)?.[2];
+  const mainText = main ? stripTags(main) : "";
+  const body = mainText.trim().length >= 400 ? mainText : stripTags(stripped);
+  const text = decodeEntities(body)
+    .split("\n")
+    .map((line) => line.replace(/[ \t\r\f\v\u00a0]+/g, " ").trim())
+    .filter(Boolean)
+    .join("\n");
+  const head = [title ? `标题：${decodeEntities(title).replace(/\s+/g, " ").trim()}` : "", description ? `描述：${decodeEntities(description).replace(/\s+/g, " ").trim()}` : ""].filter(Boolean);
+  return [...head, text].filter(Boolean).join("\n").slice(0, MAX_PAGE_TEXT);
+}
+
 export async function fetchPublic(raw: string): Promise<string> {
   let current = publicUrl(raw);
   if (!current) return "这个地址不能请求。";
@@ -77,7 +155,9 @@ export async function fetchPublic(raw: string): Promise<string> {
       if (!current) return "跳转目标不能请求。";
       continue;
     }
-    const text = (await response.text()).replace(/\s+/g, " ").trim().slice(0, 3500);
+    const body = await response.text();
+    const type = response.headers.get("content-type") ?? "";
+    const text = looksLikeHtml(body, type) ? readablePage(body) : body.replace(/\s+/g, " ").trim().slice(0, MAX_PAGE_TEXT);
     return `HTTP ${response.status} ${current.hostname}\n${text || "（没有正文）"}`;
   }
   return "跳转太多次。";

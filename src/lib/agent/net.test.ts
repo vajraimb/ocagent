@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { checkModule, moduleFromFile, prelude } from "./harness.ts";
-import { publicUrl } from "./net.ts";
+import { publicUrl, readablePage } from "./net.ts";
 
 describe("public urls", () => {
   it("allows a public https url and rejects local targets", () => {
@@ -30,5 +30,19 @@ describe("ocaml prelude", () => {
     const fromFile = moduleFromFile("Timer", "module Timer = struct\nlet t = Sys.time ()\nend\n");
     assert.equal(fromFile?.body, "let t = Sys.time ()");
     assert.equal(checkModule("Twice", "let apply n = n * 2")?.name, "Twice");
+  });
+});
+
+describe("readable pages", () => {
+  it("keeps the title, description and visible text, drops markup and scripts", () => {
+    const html = `<!DOCTYPE html><html><head><title> Example &amp; Co </title>
+<meta name="description" content="A tiny &quot;site&quot;"><style>body{color:red}</style>
+<script>window.x = "<p>not text</p>";</script></head>
+<body><nav><a href="/">Home</a></nav><h1>Hello&nbsp;world</h1><p>First&#8230; line.<br>Second line.</p>
+<ul><li>one</li><li>two</li></ul><svg><text>icon</text></svg><!-- hidden --></body></html>`;
+    const text = readablePage(html);
+    assert.match(text, /^标题：Example & Co\n描述：A tiny "site"\n/);
+    assert.match(text, /Hello world\nFirst… line\.\nSecond line\.\none\ntwo/);
+    assert.doesNotMatch(text, /not text|color:red|icon|hidden|<p>/);
   });
 });
