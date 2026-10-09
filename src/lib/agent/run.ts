@@ -1,18 +1,26 @@
 import { createServerFn } from "@tanstack/react-start";
-import { MAX_MODULES, moduleExports, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
+import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
 import { presentAnswer, rewriteStep } from "./present.ts";
-import { describeModelReply, describeStepFrame, extractCode, isJobId, type AgentEvent, type AgentEventBody, type JobSnapshot } from "./progress.ts";
+import { clip, describeModelReply, describeStepFrame, extractCode, type AgentEvent, type AgentEventBody } from "./progress.ts";
 import { searchWeb } from "./search.ts";
+import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
+export type { RunOutcome, RunRecord, RunStatus };
 
 type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
 
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
-export type DeskSnapshot = JobSnapshot<DeskResult>;
+/** The desk as the page sees it: the loop's journal and memory stay on the server. */
+export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; revision: number };
+
+/** One request's worth of a run, plus the desk as it left it. */
+export type RunReply = { run: RunRecord; desk: PublicDesk };
+
+export type RunSnapshot = { found: boolean; done: boolean; events: AgentEvent[]; reply: RunReply | null };
 
 type CoreJob = {
   task: string;
@@ -41,120 +49,10 @@ type CoreHandlers = {
 };
 
 const MAX_TASK = 1000;
-// The workspace rides along on every run (and every step inside it), so it has
-// to stay well under the deployment's request limit.
+// The workspace is stored whole and handed to every step, so it stays well
+// under the deployment's request limit.
 export const MAX_FILE_BYTES = 512 * 1024;
 export const MAX_WORKSPACE_BYTES = 3 * 1024 * 1024;
-
-const FILE_TOOLS = [
-  {
-    type: "function",
-    name: "list_files",
-    description: "List workspace files",
-    parameters: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    type: "function",
-    name: "read_file",
-    description: "Read one workspace file",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" } },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "find_in_files",
-    description: "Find a short string inside workspace files. This cannot see the web.",
-    parameters: {
-      type: "object",
-      properties: { query: { type: "string" } },
-      required: ["query"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "write_file",
-    description: "Create or replace a workspace file",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" }, content: { type: "string" } },
-      required: ["path", "content"],
-      additionalProperties: false,
-    },
-  },
-  {
-    type: "function",
-    name: "delete_file",
-    description: "Delete a workspace file",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" } },
-      required: ["path"],
-      additionalProperties: false,
-    },
-  },
-];
-
-const SEARCH_TOOL = {
-  type: "function",
-  name: "web_search",
-  description: "Search the public web. Pass a short query. Use this for weather, news, and facts that are not in the workspace.",
-  parameters: {
-    type: "object",
-    properties: { query: { type: "string" } },
-    required: ["query"],
-    additionalProperties: false,
-  },
-};
-
-const HTTP_TOOL = {
-  type: "function",
-  name: "http_get",
-  description: "Fetch one public http or https URL and return the status plus a text snippet.",
-  parameters: {
-    type: "object",
-    properties: { url: { type: "string" } },
-    required: ["url"],
-    additionalProperties: false,
-  },
-};
-
-const OCAML_TOOL = {
-  type: "function",
-  name: "ocaml_run",
-  description: "Run one workspace .ml file once. This does not add a harness. Use load_harness for that.",
-  parameters: {
-    type: "object",
-    properties: { path: { type: "string" } },
-    required: ["path"],
-    additionalProperties: false,
-  },
-};
-
-const LOAD_TOOL = {
-  type: "function",
-  name: "load_harness",
-  description: "Install a workspace .ml file as a named harness module. It then appears in the harness list and can be used by later OCaml. Call this after write_file. name is the module name, path is the file.",
-  parameters: {
-    type: "object",
-    properties: { name: { type: "string" }, path: { type: "string" } },
-    required: ["name", "path"],
-    additionalProperties: false,
-  },
-};
-
-function toolsFor(harnesses: HarnessId[]) {
-  const tools: object[] = [];
-  if (harnesses.includes("files")) tools.push(...FILE_TOOLS);
-  if (harnesses.includes("web")) tools.push(SEARCH_TOOL);
-  if (harnesses.includes("net")) tools.push(HTTP_TOOL);
-  if (harnesses.includes("ocaml")) tools.push(OCAML_TOOL, LOAD_TOOL);
-  return tools;
-}
 
 function describeModules(modules: DeskModule[]): string {
   if (modules.length === 0) return "（还没有。要复用一段代码，先用 Files.write_file 写成 .ml，再 Harness.load 装上。）";
@@ -191,6 +89,12 @@ Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执�
 要计时用 Clock.now () : float，单位是秒。
 
 这次开着的能力：${opened.length ? opened.join("、") : "没有"}。没开的调用会得到 Error。
+
+【节奏：先计划，再做，最后核对】
+- 第 1 轮：用 Trace.note 写下 2–5 条的计划（一行一条），并在同一步做第一件事。
+- 之后每轮做计划里的下一项；做完一项就 Trace.note 记一笔，写清结果里的关键值。
+- Done 之前先核对：读一遍写出的文件，或看一眼上一步的返回，确认任务要的都在了，再在下一轮 Done。
+- 每一轮的提示末尾会附上：工作区现在的文件列表、上一步每次调用的返回值、还剩多少时间。不必为了看见它们而专门 Trace.note，但更早几轮的返回只留在 note 里。
 
 【harness：把代码装成可复用的 module】
 - Harness.load "Name" "path/file.ml"：把工作区里的一个 .ml 装成 module Name。装上后，从下一步起可以直接写 Name.func …，不用再读文件。
@@ -249,19 +153,19 @@ end
 
 【怎么看到结果】
 - 每个有副作用的调用都返回 res，必须用 match 处理 Ok 和 Error，不要用 Result.get_ok。
-- 想让下一轮看到某个结果，用 Trace.note 写出来。下一轮只会收到这些 note，不会自动看到每次调用的返回值。
+- 这一步每次调用的返回值会附在下一轮的提示里（只保留一轮）；要留到更后面用的数值，用 Trace.note 记下。
 - Continue 表示还要再来一轮。Done、Ask、Partial 会结束这次任务。
 - 参数已经确定的多个调用，写在同一步里依次执行。全部 Trace.note 之后，只 Continue 一次。
-- 后一个调用的地址、查询或内容要等前一个的返回值，就不能写在同一步。先 Continue，下一轮再用笔记里的值去调用。
-- 只要这一步调用了 Net.get 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用笔记里出现过的数字。
+- 后一个调用的地址、查询或内容要等前一个的返回值，就不能写在同一步。先 Continue，下一轮再用返回值去调用。
+- 只要这一步调用了 Net.get 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用返回值或笔记里出现过的数字。
 
 【工作方式】
 - 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。
 - 只有用户明确说「加载」或 harness 时，才把对应的 .ml 写好并结束。其它任务不要提 harness。
-- 工作区是空的时候，不要反复列出文件。
-- 收到编译错误时只改出错的地方，不要重写整段。
+- 工作区的文件列表每轮都附在提示里，不要为了看它调用 list_files。
+- 收到编译错误时只改出错的地方，其余照抄；上一步的代码会一起附上。
 - 参数已经知道的多个请求写在同一步，记完再 Continue 一次。后一个请求要依赖前一个的结果时，拆成两步。
-- 还要再请求，就不要 Done。不再请求的那一轮，只用笔记里出现过的数字写结论。
+- 还要再请求，就不要 Done。不再请求的那一轮，只用返回值或笔记里出现过的数字写结论。
 - 不要调用没列出的模块。编译失败的那一步不会执行。
 
 【示例：写完并结束】
@@ -291,18 +195,71 @@ module Step : STEP = struct
 end`;
 }
 
-export type DeskInput = { task: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; jobId: string | null };
+// ---------------------------------------------------------------------------
+// Prompt context: what the Node side adds to the loop's own prompt each round.
+// The loop binary only relays the task and the model's Trace.notes; everything
+// the model would otherwise have to re-discover (files, the last step's
+// returns, the code that failed to compile, time left) is appended here.
 
-export function parseDeskInput(input: unknown): DeskInput | { error: string } {
+export type FileEntry = { path: string; bytes: number };
+
+export type LastOutcome =
+  | { kind: "compile_failed"; message: string; code: string }
+  | { kind: "ran"; round: number; reply: string; text: string; effects: { tool: string; detail: string; output: string }[] }
+  | { kind: "runner_failed"; message: string }
+  | { kind: "model_error"; message: string }
+  | null;
+
+export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome };
+
+const MAX_PROMPT = 24_000;
+const MAX_CONTEXT = 20_000;
+const FILES_LISTED = 60;
+const EFFECTS_LISTED = 14;
+
+function kb(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+}
+
+function effectLine(effect: { tool: string; detail: string; output: string }): string {
+  const wide = effect.tool === "Files.read_file" || effect.tool === "Net.get" || effect.tool === "Search.query";
+  const output = clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 1_500 : 400);
+  const detail = effect.detail.trim() ? ` ${clip(effect.detail.trim(), 120)}` : "";
+  return `- ${effect.tool}${detail} → ${output || "（没有输出）"}`;
+}
+
+export function promptContext(ctx: PromptContext): string {
+  const parts: string[] = [];
+  const shown = ctx.files.slice(0, FILES_LISTED).map((file) => `- ${file.path}（${kb(file.bytes)}）`);
+  const more = ctx.files.length > FILES_LISTED ? `\n…共 ${ctx.files.length} 个文件` : "";
+  parts.push(`【工作区现在有】\n${shown.length ? shown.join("\n") + more : "（空，还没有文件）"}`);
+  const last = ctx.last;
+  if (last?.kind === "compile_failed") {
+    parts.push(`【上一步没有执行：编译失败】\n${clip(last.message, 1_500)}${last.code ? `\n\n上一步的代码（只改出错的地方，其余照抄）：\n${clip(last.code, 3_000)}` : ""}`);
+  } else if (last?.kind === "ran") {
+    const lines = last.effects.slice(0, EFFECTS_LISTED).map(effectLine);
+    const extra = last.effects.length > EFFECTS_LISTED ? `\n…还有 ${last.effects.length - EFFECTS_LISTED} 次调用` : "";
+    parts.push(`【上一步（第 ${last.round} 轮）执行了，返回 ${last.reply}${last.text.trim() ? `：${clip(last.text.trim(), 300)}` : ""}】\n${lines.length ? lines.join("\n") + extra : "（没有任何调用）"}`);
+  } else if (last?.kind === "runner_failed") {
+    parts.push(`【上一步没有跑起来】\n${clip(last.message, 600)}`);
+  } else if (last?.kind === "model_error") {
+    parts.push(`【上一轮模型没有回应】\n${clip(last.message, 400)}`);
+  }
+  const seconds = Math.max(0, Math.round(ctx.remainingMs / 1000));
+  const segment = ctx.segment > 1 ? `这是接着上一段继续的第 ${ctx.segment} 段。` : "";
+  parts.push(`【进度】这是第 ${ctx.round} 轮。${segment}这一段还剩约 ${seconds} 秒；时间用完会暂停，之后从工作区和笔记接着做，所以每一轮都要留下有效果的事。`);
+  return clip(parts.join("\n\n"), MAX_CONTEXT);
+}
+
+// ---------------------------------------------------------------------------
+
+/** Validates the desk a page wants stored: the same caps a run enforces. */
+export function parseDeskState(input: unknown): DeskState | { error: string } {
   if (!input || typeof input !== "object") return { error: "请求不对" };
-  const task = "task" in input && typeof input.task === "string" ? input.task.trim() : "";
-  const rawJob = "jobId" in input ? input.jobId : null;
-  if (rawJob !== null && rawJob !== undefined && !isJobId(rawJob)) return { error: "任务编号不对。" };
-  const jobId = isJobId(rawJob) ? rawJob : null;
   const rawFiles = "files" in input && Array.isArray(input.files) ? input.files : null;
-  if (!task || task.length > MAX_TASK) return { error: "先写一句要做的事，别超过一千字。" };
   if (!rawFiles) return { error: "请求里没有工作区。" };
-  if (rawFiles.length > MAX_FILES) return { error: `工作区里有 ${rawFiles.length} 个文件，一次最多带 ${MAX_FILES} 个。` };
+  if (rawFiles.length > MAX_FILES) return { error: `工作区里有 ${rawFiles.length} 个文件，最多 ${MAX_FILES} 个。` };
   const files: DeskFile[] = [];
   let total = 0;
   for (const file of rawFiles) {
@@ -317,13 +274,13 @@ export function parseDeskInput(input: unknown): DeskInput | { error: string } {
   }
   if (total > MAX_WORKSPACE_BYTES) {
     const biggest = [...files].sort((a, b) => b.content.length - a.content.length).slice(0, 3).map((file) => file.path);
-    return { error: `工作区一共 ${(total / 1024 / 1024).toFixed(1)} MB，每次运行都要带上，最多 ${MAX_WORKSPACE_BYTES / 1024 / 1024} MB。最大的几个：${biggest.join("、")}。删掉用不着的再试。` };
+    return { error: `工作区一共 ${(total / 1024 / 1024).toFixed(1)} MB，最多 ${MAX_WORKSPACE_BYTES / 1024 / 1024} MB。最大的几个：${biggest.join("、")}。删掉用不着的再试。` };
   }
   const harnesses = normalizeHarnesses("harnesses" in input ? input.harnesses : undefined);
   const modules = normalizeModules("modules" in input ? input.modules : undefined);
   const journal = normalizeJournal("journal" in input ? input.journal : undefined);
   const memory = "memory" in input && typeof input.memory === "string" ? input.memory.slice(0, 4000) : "";
-  return { task, files, harnesses, modules, journal, memory, jobId };
+  return { files, harnesses, modules, journal, memory };
 }
 
 function normalizeJournal(raw: unknown): JournalItem[] {
@@ -345,18 +302,21 @@ function block(text: string): string {
   return `${body.length}\n${body.toString("utf8")}\n`;
 }
 
-function askModel(apiKey: string, prompt: string, harnesses: HarnessId[], modules: DeskModule[], signal?: AbortSignal): Promise<string> {
+type Effort = "low" | "medium";
+
+function askModel(apiKey: string, prompt: string, context: string, harnesses: HarnessId[], modules: DeskModule[], signal?: AbortSignal, effort: Effort = "low"): Promise<string> {
   const slowGuard = AbortSignal.timeout(90_000);
+  const input = `${prompt.slice(0, MAX_PROMPT)}\n\n${context}`;
   return fetch("https://api.x.ai/v1/responses", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     signal: signal ? AbortSignal.any([slowGuard, signal]) : slowGuard,
     body: JSON.stringify({
       model: "grok-4.5",
-      reasoning: { effort: "low" },
-      max_output_tokens: 4000,
+      reasoning: { effort },
+      max_output_tokens: 6000,
       instructions: instructionsFor(harnesses, modules),
-      input: [{ role: "user", content: prompt.slice(0, 24_000) }],
+      input: [{ role: "user", content: input }],
     }),
   })
     .then(async (response) => {
@@ -416,6 +376,10 @@ export type LoopDeps = {
   budgetMs?: number;
   /** Modules that failed the pre-flight compile and were left out of this run. */
   dropped?: { name: string; error: string }[];
+  /** Rounds already done by earlier segments of this run; numbering continues from here. */
+  roundBase?: number;
+  /** Which segment of the run this is (1 for a fresh run). */
+  segment?: number;
 };
 
 export async function runDeskLoop(
@@ -429,8 +393,10 @@ export async function runDeskLoop(
   deps: LoopDeps,
 ): Promise<DeskResult> {
   const emit = deps.emit ?? (() => {});
-  let round = 0;
-  // Modules loaded during this run join the ones the page sent, so every later
+  const roundBase = deps.roundBase ?? 0;
+  const segment = deps.segment ?? 1;
+  let round = roundBase;
+  // Modules loaded during this run join the ones the desk had, so every later
   // step (and every later prompt) sees them.
   const loaded: DeskModule[] = [...modules];
   const unloaded = new Set<string>();
@@ -446,6 +412,11 @@ export async function runDeskLoop(
     if (at >= 0) loaded.splice(at, 1);
     unloaded.add(name);
   };
+  // What the next prompt is told about: the workspace as the last step left
+  // it, and how that step went.
+  let fileIndex: FileEntry[] = files.map((file) => ({ path: file.path, bytes: Buffer.byteLength(file.content) }));
+  let lastCode = "";
+  let last: LastOutcome = null;
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -480,10 +451,18 @@ export async function runDeskLoop(
           }
           round += 1;
           emit({ kind: "think", round });
-          const raw = await askModel(apiKey, prompt, harnesses, loaded, signal);
+          const context = promptContext({ round, segment, remainingMs: deadline - Date.now(), files: fileIndex, last });
+          // A failed compile deserves a more careful second look.
+          const effort: Effort = last?.kind === "compile_failed" ? "medium" : "low";
+          const raw = await askModel(apiKey, prompt, context, harnesses, loaded, signal, effort);
           const reply = describeModelReply(raw);
-          if (reply?.kind === "error") emit({ kind: "model_error", round, message: reply.message });
-          else if (reply?.kind === "text") emit({ kind: "plan", round, code: extractCode(reply.text) || reply.text });
+          if (reply?.kind === "error") {
+            emit({ kind: "model_error", round, message: reply.message });
+            last = { kind: "model_error", message: reply.message };
+          } else if (reply?.kind === "text") {
+            lastCode = extractCode(reply.text) || reply.text;
+            emit({ kind: "plan", round, code: lastCode });
+          }
           return raw;
         },
         net: async (url) => {
@@ -515,6 +494,7 @@ export async function runDeskLoop(
             // cannot fix that, so two in a row end the run with the reason.
             const message = err instanceof Error && err.message.trim() ? err.message : "这一步没有跑起来。";
             if (isStep) emit({ kind: "runner_failed", round, message });
+            last = { kind: "runner_failed", message };
             runnerStall += 1;
             if (runnerStall >= MAX_RUNNER_STALL) cut("runner", message);
             return `fail\n${block(message)}`;
@@ -526,12 +506,15 @@ export async function runDeskLoop(
             const frame = describeStepFrame(next.raw);
             if (frame?.kind === "fail") {
               emit({ kind: "compile_failed", round, message: frame.message });
+              last = { kind: "compile_failed", message: frame.message, code: lastCode };
               compileStall += 1;
               idleStall = 0;
               if (compileStall >= MAX_COMPILE_STALL) cut("compile_stall", frame.message);
             } else if (frame?.kind === "ok") {
               for (const effect of frame.effects) emit({ kind: "effect", round, ...effect });
               emit({ kind: "step", round, reply: frame.reply, text: frame.text });
+              last = { kind: "ran", round, reply: frame.reply, text: frame.text, effects: frame.effects };
+              if (frame.files) fileIndex = frame.files;
               compileStall = 0;
               idleStall = frame.reply === "continue" && frame.effects.length === 0 ? idleStall + 1 : 0;
               if (idleStall >= MAX_IDLE_STALL) cut("idle_stall", frame.text);
@@ -554,7 +537,7 @@ export async function runDeskLoop(
     }
     if (result.status === "error") return { ok: false, error: result.answer || "循环没有跑起来。", ...carried };
     if (haltReason === "budget") {
-      return { ok: true, answer: pausedAnswer(round, carried.steps), paused: true, ...carried };
+      return { ok: true, answer: pausedAnswer(round - roundBase, carried.steps), paused: true, ...carried };
     }
     if (haltReason) return { ok: false, error: stallAnswer(haltReason, haltDetail), ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
@@ -607,101 +590,323 @@ function textOf(body: ResponseBody): string {
     .trim();
 }
 
-function parseArgs(raw: string | undefined): { args: Record<string, unknown>; error?: string } {
-  if (!raw) return { args: {} };
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return { args: parsed as Record<string, unknown> };
-    return { args: {}, error: "参数不是对象" };
-  } catch {
-    return { args: {}, error: "参数被截断了。把文件写短一点，一次只写一个文件。" };
-  }
+// ---------------------------------------------------------------------------
+// Server functions. The desk lives in the database; a run is a row that any
+// instance can report on, stop, or continue.
+
+const DESK_ID = /^desk-[a-z0-9-]{8,48}$/;
+const RUN_ID = /^run-[a-z0-9-]{8,48}$/;
+
+export function isDeskId(value: unknown): value is string {
+  return typeof value === "string" && DESK_ID.test(value);
 }
 
-export const runDesk = createServerFn({ method: "POST" })
-  .validator((input: unknown): DeskInput => {
-    const parsed = parseDeskInput(input);
+export function isRunId(value: unknown): value is string {
+  return typeof value === "string" && RUN_ID.test(value);
+}
+
+function publicDesk(desk: DeskRecord): PublicDesk {
+  return { id: desk.id, files: desk.files, harnesses: desk.harnesses, modules: desk.modules, revision: desk.revision };
+}
+
+function readDeskId(input: unknown): { deskId: string } {
+  if (!input || typeof input !== "object") throw new Error("请求不对");
+  const deskId = "deskId" in input ? input.deskId : null;
+  if (!isDeskId(deskId)) throw new Error("工作区编号不对。");
+  return { deskId };
+}
+
+function readRunId(input: unknown): { runId: string; after: number } {
+  if (!input || typeof input !== "object") throw new Error("请求不对");
+  const runId = "runId" in input ? input.runId : null;
+  if (!isRunId(runId)) throw new Error("任务编号不对。");
+  const rawAfter = "after" in input ? input.after : 0;
+  const after = typeof rawAfter === "number" && Number.isInteger(rawAfter) && rawAfter >= 0 ? rawAfter : 0;
+  return { runId, after };
+}
+
+export type DeskLoad = { found: false } | { found: true; desk: PublicDesk; runs: RunRecord[] };
+
+export const loadDesk = createServerFn({ method: "POST" })
+  .validator(readDeskId)
+  .handler(async ({ data }): Promise<DeskLoad> => {
+    const store = await import("./store.server.ts");
+    const desk = await store.readDesk(data.deskId);
+    if (!desk) return { found: false };
+    const runs = await store.listRuns(data.deskId);
+    return { found: true, desk: publicDesk(desk), runs };
+  });
+
+export type DeskSaved = { ok: true; desk: PublicDesk } | { ok: false; error: string };
+
+type SaveInput = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[] };
+
+// The page's settings and files: everything but the loop's own journal/memory,
+// which only a run may change. Creating a desk is the same call.
+export const saveDesk = createServerFn({ method: "POST" })
+  .validator((input: unknown): SaveInput => {
+    const { deskId } = readDeskId(input);
+    const parsed = parseDeskState({ ...(input as object), journal: [], memory: "" });
     if ("error" in parsed) throw new Error(parsed.error);
-    return parsed;
+    return { deskId, files: parsed.files, harnesses: parsed.harnesses, modules: parsed.modules };
   })
-  .handler(async ({ data }): Promise<DeskResult> => {
-    const apiKey = process.env.XAI_API_KEY;
-    const { deskProgress } = await import("./progress.server.ts");
-    const jobId = data.jobId;
-    if (!apiKey) {
-      const missing: DeskResult = { ok: false, error: "Grok 没有接上。", files: data.files, steps: [], modules: data.modules, journal: data.journal, memory: data.memory };
-      if (jobId) {
-        deskProgress.open(jobId);
-        deskProgress.close(jobId, missing, false);
-      }
-      return missing;
+  .handler(async ({ data }): Promise<DeskSaved> => {
+    const store = await import("./store.server.ts");
+    const live = await store.activeRun(data.deskId);
+    if (live?.status === "running") return { ok: false, error: "它还在做上一件事，做完再改工作区。" };
+    const current = await store.readDesk(data.deskId);
+    const saved = await store.writeDesk(data.deskId, {
+      files: data.files,
+      harnesses: data.harnesses,
+      modules: data.modules,
+      journal: current?.journal ?? [],
+      memory: current?.memory ?? "",
+    });
+    return { ok: true, desk: publicDesk(saved) };
+  });
+
+export const clearDesk = createServerFn({ method: "POST" })
+  .validator(readDeskId)
+  .handler(async ({ data }): Promise<DeskSaved> => {
+    const store = await import("./store.server.ts");
+    const live = await store.activeRun(data.deskId);
+    if (live?.status === "running") return { ok: false, error: "它还在做上一件事，做完再清空。" };
+    await store.clearDesk(data.deskId);
+    const desk = await store.readDesk(data.deskId);
+    if (!desk) return { ok: false, error: "工作区没有建起来。" };
+    return { ok: true, desk: publicDesk(desk) };
+  });
+
+// Writes the timeline to the run's row as it grows, so a page polling another
+// instance sees progress, and notices a stop requested from anywhere.
+function keepRunAlive(runId: string, read: (after: number) => AgentEvent[], rounds: () => number, onStop: () => void) {
+  let after = 0;
+  let busy = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const flush = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const store = await import("./store.server.ts");
+      const fresh = read(after);
+      if (fresh.length) after = fresh[fresh.length - 1]?.seq ?? after;
+      await store.appendRunEvents(runId, fresh, rounds());
+      if (await store.stopRequested(runId)) onStop();
+    } catch {
+      /* a missed flush only delays what other instances see */
+    } finally {
+      busy = false;
     }
-    const started = Date.now();
-    const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
-    const controller = new AbortController();
-    if (jobId) {
-      deskProgress.open(jobId);
-      deskProgress.attachAbort(jobId, () => controller.abort());
-    }
+  };
+  timer = setInterval(() => void flush(), 1_000);
+  return {
+    stop: async () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+      while (busy) await new Promise((resolve) => setTimeout(resolve, 20));
+      await flush();
+    },
+  };
+}
+
+function statusFor(result: DeskResult, events: AgentEvent[]): Exclude<RunStatus, "running"> {
+  if (result.stopped) return "stopped";
+  if (result.paused) return "paused";
+  if (!result.ok) return "failed";
+  // Rounds happened but no step ever ran to completion: whatever text came
+  // back is an error the loop relayed, not an answer.
+  const rounds = events.some((event) => event.kind === "think");
+  const stepped = events.some((event) => event.kind === "step" || event.kind === "effect");
+  return rounds && !stepped ? "failed" : "done";
+}
+
+async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
+  const store = await import("./store.server.ts");
+  const { runProgress } = await import("./progress.server.ts");
+  const apiKey = process.env.XAI_API_KEY;
+  const seqBase = run.events.length ? (run.events[run.events.length - 1]?.seq ?? 0) : 0;
+  runProgress.open(run.id, seqBase);
+  const finish = async (status: Exclude<RunStatus, "running">, result: DeskResult, state: DeskState): Promise<RunReply> => {
+    const events = runProgress.read(run.id).events;
+    const rounds = events.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds);
+    const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
+    const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched };
+    const saved = await store.writeDesk(desk.id, state);
+    await store.finishRun(run.id, status, rounds, outcome);
+    const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
+    const reply: RunReply = { run: fresh, desk: publicDesk(saved) };
+    runProgress.close(run.id, reply, outcome.ok);
+    return reply;
+  };
+  const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory };
+  if (!apiKey) {
+    return finish("failed", { ok: false, error: "Grok 没有接上。", files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory }, state);
+  }
+  const started = Date.now();
+  const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
+  const controller = new AbortController();
+  runProgress.attachAbort(run.id, () => controller.abort());
+  const alive = keepRunAlive(
+    run.id,
+    (after) => runProgress.read(run.id, after).events,
+    () => runProgress.read(run.id).events.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds),
+    () => controller.abort(),
+  );
+  try {
     // A module that no longer compiles as part of the set would make every
     // step fail; leave it out of this run and say so, instead of spinning.
-    const checked = data.modules.length ? await verifyModuleSet(data.modules) : { kept: data.modules, dropped: [] };
+    const checked = desk.modules.length ? await verifyModuleSet(desk.modules) : { kept: desk.modules, dropped: [] };
     const budgetMs = Math.max(15_000, runBudgetMs() - (Date.now() - started));
-    const result = await runDeskLoop(apiKey, data.task, data.files, data.harnesses, checked.kept, data.journal, data.memory, {
+    const result = await runDeskLoop(apiKey, run.task, desk.files, desk.harnesses, checked.kept, desk.journal, desk.memory, {
       runCore,
       runPayload,
       signal: controller.signal,
-      emit: jobId ? (event) => deskProgress.emit(jobId, event) : undefined,
+      emit: (event) => void runProgress.emit(run.id, event),
       budgetMs,
       dropped: checked.dropped,
+      roundBase: run.rounds,
+      segment: run.segment,
     });
-    if (!jobId) return result;
-    // The answer carries the whole timeline too, so a page that could not
-    // poll (or polled too slowly for a quick run) still shows the process.
-    deskProgress.close(jobId, result, result.ok);
-    return { ...result, events: deskProgress.read(jobId).events };
-  });
-
-function readJobInput(input: unknown): { jobId: string; after: number } {
-  if (!input || typeof input !== "object") throw new Error("请求不对");
-  const jobId = "jobId" in input ? input.jobId : null;
-  if (!isJobId(jobId)) throw new Error("任务编号不对。");
-  const rawAfter = "after" in input ? input.after : 0;
-  const after = typeof rawAfter === "number" && Number.isInteger(rawAfter) && rawAfter >= 0 ? rawAfter : 0;
-  return { jobId, after };
+    await alive.stop();
+    const events = runProgress.read(run.id).events;
+    return finish(statusFor(result, events), result, { files: result.files, harnesses: desk.harnesses, modules: result.modules, journal: result.journal, memory: result.memory });
+  } catch (err) {
+    await alive.stop();
+    const message = err instanceof Error ? err.message : "循环没有跑起来。";
+    return finish("failed", { ok: false, error: message, files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory }, state);
+  }
 }
 
-export const pollDesk = createServerFn({ method: "POST" })
-  .validator(readJobInput)
-  .handler(async ({ data }): Promise<DeskSnapshot> => {
-    const { deskProgress } = await import("./progress.server.ts");
-    return deskProgress.read(data.jobId, data.after);
+function readStart(input: unknown): { deskId: string; runId: string; task: string } {
+  const { deskId } = readDeskId(input);
+  const runId = input && typeof input === "object" && "runId" in input ? input.runId : null;
+  if (!isRunId(runId)) throw new Error("任务编号不对。");
+  const task = input && typeof input === "object" && "task" in input && typeof input.task === "string" ? input.task.trim() : "";
+  if (!task || task.length > MAX_TASK) throw new Error("先写一句要做的事，别超过一千字。");
+  return { deskId, runId, task };
+}
+
+export const startRun = createServerFn({ method: "POST" })
+  .validator(readStart)
+  .handler(async ({ data }): Promise<RunReply> => {
+    const store = await import("./store.server.ts");
+    const desk = await store.readDesk(data.deskId);
+    if (!desk) throw new Error("工作区还没有同步到服务器，稍等一下再发。");
+    const existing = await store.getRun(data.runId);
+    if (existing) {
+      // The page retried after losing the connection: the run is already on
+      // its way (or finished), so report it rather than start a second one.
+      return { run: existing, desk: publicDesk(desk) };
+    }
+    const live = await store.activeRun(data.deskId);
+    if (live?.status === "running") throw new Error("它还在做上一件事，做完再说下一件。");
+    const run = await store.createRun(data.deskId, data.runId, data.task);
+    return runSegment(run, desk);
+  });
+
+export const continueRun = createServerFn({ method: "POST" })
+  .validator(readRunId)
+  .handler(async ({ data }): Promise<RunReply> => {
+    const store = await import("./store.server.ts");
+    const run = await store.getRun(data.runId);
+    if (!run) throw new Error("服务器上没有这次运行。");
+    const desk = await store.readDesk(run.deskId);
+    if (!desk) throw new Error("这次运行的工作区不见了。");
+    if (run.status !== "paused") return { run, desk: publicDesk(desk) };
+    const segment = run.segment + 1;
+    await store.beginSegment(run.id, segment);
+    return runSegment({ ...run, status: "running", segment }, desk);
+  });
+
+export const pollRun = createServerFn({ method: "POST" })
+  .validator(readRunId)
+  .handler(async ({ data }): Promise<RunSnapshot> => {
+    const { runProgress } = await import("./progress.server.ts");
+    const live = runProgress.read(data.runId, data.after);
+    if (live.found) return { found: true, done: live.done, events: live.events, reply: live.done ? live.result : null };
+    // Another instance has (or had) this run: read what it wrote.
+    const store = await import("./store.server.ts");
+    const run = await store.getRun(data.runId);
+    if (!run) return { found: false, done: false, events: [], reply: null };
+    const done = run.status !== "running";
+    const desk = done ? await store.readDesk(run.deskId) : null;
+    return {
+      found: true,
+      done,
+      events: run.events.filter((event) => event.seq > data.after),
+      reply: done && desk ? { run, desk: publicDesk(desk) } : null,
+    };
+  });
+
+export const stopRun = createServerFn({ method: "POST" })
+  .validator(readRunId)
+  .handler(async ({ data }): Promise<{ stopped: boolean }> => {
+    const { runProgress } = await import("./progress.server.ts");
+    if (runProgress.cancel(data.runId)) return { stopped: true };
+    const store = await import("./store.server.ts");
+    return { stopped: await store.requestStop(data.runId) };
+  });
+
+export const getRun = createServerFn({ method: "POST" })
+  .validator(readRunId)
+  .handler(async ({ data }): Promise<RunRecord | null> => {
+    const store = await import("./store.server.ts");
+    return store.getRun(data.runId);
   });
 
 export type InstallVerdict = { ok: true; module: DeskModule; exports: string[] } | { ok: false; error: string };
 
-function readInstallInput(input: unknown): { name: string; body: string } {
+type InstallInput = { name: string; body: string; context: DeskModule[]; source?: string };
+
+function readContext(input: object): DeskModule[] {
+  return normalizeModules("context" in input ? input.context : undefined);
+}
+
+function readInstallInput(input: unknown): InstallInput {
   if (!input || typeof input !== "object") throw new Error("请求不对");
   const name = "name" in input && typeof input.name === "string" ? input.name.trim() : "";
   const body = "body" in input && typeof input.body === "string" ? input.body : "";
+  const source = "source" in input && typeof input.source === "string" ? input.source.slice(0, 300) : undefined;
   if (!name || name.length > 25) throw new Error("模块名不对。");
   if (!body.trim() || body.length > 200_000) throw new Error("源码是空的，或超过 200 KB。");
-  return { name, body };
+  return { name, body, context: readContext(input), source };
 }
 
-// The workspace panel's "装为 harness": the same checks a step's Harness.load runs.
+// The workspace panel's "装为 harness" (and a harness file being imported):
+// the same checks a step's Harness.load runs, against the modules already there.
 export const installModule = createServerFn({ method: "POST" })
   .validator(readInstallInput)
   .handler(async ({ data }): Promise<InstallVerdict> => {
     const { verifyModule } = await import("./ocaml-run.ts");
-    const verdict = await verifyModule(data.name, data.body);
+    const verdict = await verifyModule(data.name, data.body, data.context);
     if (!verdict.ok) return verdict;
-    return { ok: true, module: verdict.module, exports: moduleExports(verdict.module.body) };
+    const module: DeskModule = { ...verdict.module, source: data.source ?? verdict.module.source, at: Date.now() };
+    return { ok: true, module, exports: moduleExports(module.body) };
   });
 
-export const stopDesk = createServerFn({ method: "POST" })
-  .validator(readJobInput)
-  .handler(async ({ data }): Promise<{ stopped: boolean }> => {
-    const { deskProgress } = await import("./progress.server.ts");
-    return { stopped: deskProgress.cancel(data.jobId) };
+type UrlInstallInput = { name: string | null; url: string; context: DeskModule[] };
+
+function readUrlInstall(input: unknown): UrlInstallInput {
+  if (!input || typeof input !== "object") throw new Error("请求不对");
+  const url = "url" in input && typeof input.url === "string" ? input.url.trim() : "";
+  const rawName = "name" in input && typeof input.name === "string" ? input.name.trim() : "";
+  if (!/^https?:\/\/\S{4,500}$/.test(url)) throw new Error("地址不对，要以 http:// 或 https:// 开头。");
+  return { name: rawName || null, url, context: readContext(input) };
+}
+
+// The panel's "从地址安装": fetch a raw .ml, verify it against what is loaded,
+// and hand back the module with its source so it can be re-fetched later.
+export const installFromUrl = createServerFn({ method: "POST" })
+  .validator(readUrlInstall)
+  .handler(async ({ data }): Promise<InstallVerdict> => {
+    const name = data.name ?? moduleNameFromUrl(data.url);
+    if (!name) return { ok: false, error: "从地址看不出模块名，写成「Name = 地址」。" };
+    const { fetchSource } = await import("./net.ts");
+    const fetched = await fetchSource(data.url);
+    if (!fetched.ok) return { ok: false, error: fetched.error };
+    const { verifyModule } = await import("./ocaml-run.ts");
+    const verdict = await verifyModule(name, fetched.text, data.context);
+    if (!verdict.ok) return verdict;
+    const module: DeskModule = { ...verdict.module, source: data.url, at: Date.now() };
+    return { ok: true, module, exports: moduleExports(module.body) };
   });

@@ -318,13 +318,20 @@ async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status:
   }
   let body = rest;
   let savedTo = "";
+  let source = "";
   if (op === "install") {
-    const fetched = await fetchSource(rest.trim());
+    source = rest.trim();
+    const fetched = await fetchSource(source);
     if (!fetched.ok) return { status: 502, text: fetched.error };
     body = fetched.text;
     const stem = name ? name[0]!.toLowerCase() + name.slice(1) : "";
     savedTo = `lib/${stem}.ml`;
-  } else if (op !== "load") {
+  } else if (op === "load") {
+    // load\n<name>\n<path>\n<body>: the path is only provenance.
+    const third = rest.indexOf("\n");
+    source = third < 0 ? "" : rest.slice(0, third).trim();
+    body = third < 0 ? rest : rest.slice(third + 1);
+  } else {
     return { status: 400, text: "不支持的 harness 操作" };
   }
   const verdict = await verifyModule(name, body, loaded);
@@ -335,7 +342,7 @@ async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status:
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, body, "utf8");
   }
-  ctx.hooks?.onModule?.(verdict.module);
+  ctx.hooks?.onModule?.({ ...verdict.module, ...(source ? { source } : {}), at: Date.now() });
   const where = savedTo ? `已安装到 ${savedTo}，` : "";
   return { status: 200, text: `${where}已加载 module ${verdict.module.name}。从下一步起可以直接调用 ${verdict.module.name}.… 。` };
 }
@@ -1058,7 +1065,7 @@ module Harness = struct
       else
         match (try Ok (slurp path) with Sys_error _ -> Error "没有这个文件") with
         | Error e -> Error e
-        | Ok body -> bridge "harness" ("load\\n" ^ String.trim name ^ "\\n" ^ body)
+        | Ok body -> bridge "harness" ("load\\n" ^ String.trim name ^ "\\n" ^ path ^ "\\n" ^ body)
     in
     log_effect "Harness.load" (String.trim name ^ " <- " ^ path) (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
     result

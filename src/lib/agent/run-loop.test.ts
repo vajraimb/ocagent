@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { MAX_FILE_BYTES, mergeModules, parseDeskInput, runDeskLoop, type LoopDeps } from "./run.ts";
+import { moduleNameFromUrl } from "./harness.ts";
+import { MAX_FILE_BYTES, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 
 const block = (text: string) => `${Buffer.byteLength(text)}\n${text}\n`;
@@ -110,16 +111,99 @@ test("two runner failures in a row end the run with the runner's message", async
   assert.equal(kinds.filter((kind) => kind === "think").length, 2);
 });
 
-test("parseDeskInput refuses a workspace too big to ride along, naming the biggest files", () => {
-  const base = { task: "t", harnesses: ["ocaml"], modules: [], journal: [], memory: "" };
+test("parseDeskState refuses a workspace too big to store, naming the biggest files", () => {
+  const base = { harnesses: ["ocaml"], modules: [], journal: [], memory: "" };
   const huge = "x".repeat(MAX_FILE_BYTES + 1);
-  const single = parseDeskInput({ ...base, files: [{ path: "lib/big.ml", content: huge }] });
+  const single = parseDeskState({ ...base, files: [{ path: "lib/big.ml", content: huge }] });
   assert.ok("error" in single && /lib\/big\.ml.*单个文件最多/.test(single.error));
   const many = Array.from({ length: 8 }, (_, i) => ({ path: `lib/l${i}.ml`, content: "y".repeat(MAX_FILE_BYTES - 1) }));
-  const total = parseDeskInput({ ...base, files: many });
+  const total = parseDeskState({ ...base, files: many });
   assert.ok("error" in total && /工作区一共.*最大的几个：lib\/l0\.ml/.test(total.error));
-  const fine = parseDeskInput({ ...base, files: [{ path: "src/a.ml", content: "let a = 1" }] });
+  const fine = parseDeskState({ ...base, files: [{ path: "src/a.ml", content: "let a = 1" }], modules: [{ name: "Fib", body: "let fib n = n", source: "https://x.test/fib.ml", at: 1700000000000 }] });
   assert.ok(!("error" in fine) && fine.files.length === 1);
+  assert.deepEqual(!("error" in fine) ? fine.modules : [], [{ name: "Fib", body: "let fib n = n", source: "https://x.test/fib.ml", at: 1700000000000 }]);
+});
+
+test("a continued segment numbers its rounds after the earlier ones and tells the model so", async () => {
+  const kinds: string[] = [];
+  const rounds: number[] = [];
+  const prompts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { input: { content: string }[]; reasoning: { effort: string } };
+    prompts.push(`${body.reasoning.effort}\n${body.input[0]?.content ?? ""}`);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nmodule Step : STEP = struct let run () = Continue \"x\" end\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    let calls = 0;
+    const result = await runDeskLoop(
+      "key",
+      "task",
+      [{ path: "notes/a.md", content: "hello" }],
+      ["ocaml", "files"],
+      [],
+      [],
+      "",
+      deps(
+        {
+          runCore: async (job, handlers) => {
+            for (let i = 0; i < 3; i += 1) {
+              await handlers.model("prompt");
+              await handlers.ocaml(`step\n${block("code")}0\n`);
+            }
+            return { status: "done", answer: "ok", files: job.files, modules: job.modules, steps: [], journal: [], memory: "" };
+          },
+          runPayload: async () => {
+            calls += 1;
+            if (calls === 1) return failFrame("Line 2: Unbound value foo");
+            return `ok\ncontinue\n${block("x")}${block("")}${block("Files.read_file\tnotes/a.md\tOk hello")}1\nnotes/b.md\n${block("written")}`;
+          },
+          emit: (event) => {
+            kinds.push(event.kind);
+            if ("round" in event && event.kind === "think") rounds.push(event.round);
+          },
+          roundBase: 4,
+          segment: 2,
+        },
+        kinds,
+      ),
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(rounds, [5, 6, 7]);
+    // Round 5's prompt: fresh segment, the workspace listed.
+    assert.match(prompts[0] ?? "", /^low\n/);
+    assert.match(prompts[0] ?? "", /第 5 轮/);
+    assert.match(prompts[0] ?? "", /第 2 段/);
+    assert.match(prompts[0] ?? "", /notes\/a\.md（5 B）/);
+    // Round 6 follows a compile failure: the error and the failed code ride along, with more care.
+    assert.match(prompts[1] ?? "", /^medium\n/);
+    assert.match(prompts[1] ?? "", /编译失败[\s\S]*Unbound value foo[\s\S]*module Step/);
+    // Round 7 follows a step that ran: its returns and the files it left are listed.
+    assert.match(prompts[2] ?? "", /^low\n/);
+    assert.match(prompts[2] ?? "", /第 6 轮）执行了，返回 continue/);
+    assert.match(prompts[2] ?? "", /Files\.read_file notes\/a\.md → Ok hello/);
+    assert.match(prompts[2] ?? "", /notes\/b\.md（7 B）/);
+    assert.doesNotMatch(prompts[2] ?? "", /notes\/a\.md（5 B）/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("promptContext stays bounded and names what the model needs", () => {
+  const files = Array.from({ length: 80 }, (_, i) => ({ path: `src/f${i}.ml`, bytes: 2048 * (i + 1) }));
+  const effects = Array.from({ length: 20 }, (_, i) => ({ tool: "Files.read_file", detail: `src/f${i}.ml`, output: "x".repeat(5000) }));
+  const text = promptContext({ round: 3, segment: 1, remainingMs: 41_400, files, last: { kind: "ran", round: 2, reply: "continue", text: "", effects } });
+  assert.ok(text.length <= 20_100, `context is ${text.length} chars`);
+  assert.match(text, /共 80 个文件/);
+  assert.match(text, /还有 6 次调用/);
+  assert.match(text, /还剩约 41 秒/);
+  assert.doesNotMatch(text, /第 1 段|第 1 段/);
+});
+
+test("moduleNameFromUrl derives a module name from the file at the end of a URL", () => {
+  assert.equal(moduleNameFromUrl("https://raw.githubusercontent.com/ocaml/ocaml/trunk/stdlib/option.ml"), "Option");
+  assert.equal(moduleNameFromUrl("https://x.test/lib/pdf-gen.ml?raw=1"), "Pdf_gen");
+  assert.equal(moduleNameFromUrl("https://x.test/"), null);
 });
 
 test("a module unloaded by a step leaves the carried set; dropped modules are announced", async () => {

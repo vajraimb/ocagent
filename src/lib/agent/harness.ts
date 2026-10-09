@@ -11,7 +11,9 @@ export type HarnessSpec = {
   source: string;
 };
 
-export type DeskModule = { name: string; body: string };
+// `source` is where the module came from (a workspace path or a raw URL) and
+// `at` when it was installed, so the panel can show provenance and re-fetch.
+export type DeskModule = { name: string; body: string; source?: string; at?: number };
 
 const CALL = `let quote s =
   let buf = Buffer.create (String.length s + 2) in
@@ -174,6 +176,20 @@ export function moduleNameFor(path: string): string | null {
   return MODULE_NAME.test(name) && !RESERVED.has(name) ? name : null;
 }
 
+// "…/stdlib/option.ml" at the end of a URL → "Option".
+export function moduleNameFromUrl(url: string): string | null {
+  try {
+    const base = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "");
+    const stem = base.endsWith(".ml") ? base.slice(0, -3) : base;
+    if (!stem) return null;
+    const cleaned = stem.replace(/[^A-Za-z0-9_]/g, "_");
+    const name = cleaned[0]!.toUpperCase() + cleaned.slice(1);
+    return MODULE_NAME.test(name) && !RESERVED.has(name) ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 // Top-level bindings a module offers, so the panel and the prompt can say
 // "Fib: fib, fib_list" without compiling anything.
 export function moduleExports(body: string): string[] {
@@ -195,7 +211,9 @@ export function normalizeModules(raw: unknown): DeskModule[] {
     const body = "body" in item && typeof item.body === "string" ? item.body : "";
     const mod = checkModule(name, body);
     if (!mod || modules.some((kept) => kept.name === mod.name)) continue;
-    modules.push(mod);
+    const source = "source" in item && typeof item.source === "string" && item.source.trim() ? item.source.trim().slice(0, 300) : undefined;
+    const at = "at" in item && typeof item.at === "number" && Number.isFinite(item.at) && item.at > 0 ? Math.floor(item.at) : undefined;
+    modules.push({ ...mod, ...(source ? { source } : {}), ...(at ? { at } : {}) });
     if (modules.length >= MAX_MODULES) break;
   }
   return modules;
