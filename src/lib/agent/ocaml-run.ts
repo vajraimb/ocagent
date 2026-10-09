@@ -1097,12 +1097,19 @@ module Check = struct
     log_effect "Check.equal" desc (if ok then "通过" else "没通过：期望 " ^ clip_ends (one_line expected) 120 ^ "，实际 " ^ clip_ends (one_line actual) 120);
     ok
 
+  (* A miss shows how the file actually starts, so a wrongly phrased needle
+     (English name vs the Chinese one the file has) is told apart from a
+     missing change without another read round. *)
   let contains path needle =
-    let ok =
-      files_on && safe_rel path && needle <> ""
-      && (match (try Some (slurp path) with Sys_error _ -> None) with Some text -> count_sub text needle > 0 | None -> false)
+    let text = if files_on && safe_rel path then (try Some (slurp path) with Sys_error _ -> None) else None in
+    let ok = needle <> "" && (match text with Some t -> count_sub t needle > 0 | None -> false) in
+    let verdict =
+      if ok then "通过"
+      else match text with
+        | None -> "没通过：没有这个文件"
+        | Some t -> "没通过：文件里没有这段；文件里实际是：" ^ clip_ends (one_line (String.trim t)) 160
     in
-    log_effect "Check.contains" (path ^ " 含 " ^ clip_ends (one_line needle) 80) (if ok then "通过" else if not (Sys.file_exists path) then "没通过：没有这个文件" else "没通过：文件里没有这段");
+    log_effect "Check.contains" (path ^ " 含 " ^ clip_ends (one_line needle) 80) verdict;
     ok
 end
 

@@ -284,7 +284,12 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         ))}
         {round.check && round.checkFailed.length === 0 ? <Row icon={<ListChecks className="h-3.5 w-3.5" aria-hidden />} label="想收尾了，先核对一遍再说" detail={round.check} tone="accent" /> : null}
         {round.check && round.checkFailed.length > 0 ? (
-          <Row icon={<ShieldAlert className="h-3.5 w-3.5" aria-hidden />} label={`想收尾，但有 ${round.checkFailed.length} 条核对没通过，退回去先修`} detail={round.checkFailed.join("；")} tone="warn" />
+          <Row
+            icon={<ShieldAlert className="h-3.5 w-3.5" aria-hidden />}
+            label={round.checkGaveUp ? `想放弃，但 ${round.checkFailed.length} 条没通过的核对连文件都没看过，先去看一眼` : `想收尾，但有 ${round.checkFailed.length} 条核对没通过，退回去先修`}
+            detail={round.checkFailed.join("；")}
+            tone="warn"
+          />
         ) : null}
         {round.needInput ? <Row icon={<MessageCircleQuestion className="h-3.5 w-3.5" aria-hidden />} label={`结果里用了占位，缺${round.needInput.topics.map((topic) => `你的${topic}`).join("、")}，改成问你`} tone="fg" /> : null}
         {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}

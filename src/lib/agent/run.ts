@@ -102,7 +102,7 @@ Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执�
 - 一步做不完的任务，第 1 轮先 Plan.set ["第一件事"; "第二件事"; …]（2–6 条，每条一句话），并在同一步做第一件事。一步能做完的任务不用计划。
 - 做完一项就 Plan.tick n "结果里的关键值"（n 从 1 数起）。计划会原样附在每一轮的提示里，带上勾选状态，不必再用 Trace.note 重复。
 - 计划要改就再 Plan.set 一次：文字没变的项保留勾选。
-- Done 之前先核对，用断言写：Check.contains "path" "必须出现的内容"、Check.that (条件) "一句话说明"、Check.equal 期望 实际 "说明"，每条都返回 bool 并记进时间线（通过 / 没通过）。Done 的那一步里有断言且全部通过，就直接结束；写过文件却一条断言都没有（也没读回来看），第一次 Done 会被拦下来再给一轮核对；有断言没通过的 Done 也会被拦回去先修。
+- Done 之前先核对，用断言写：Check.contains "path" "必须出现的内容"、Check.that (条件) "一句话说明"、Check.equal 期望 实际 "说明"，每条都返回 bool 并记进时间线（通过 / 没通过）。Done 的那一步里有断言且全部通过，就直接结束；写过文件却一条断言都没有（也没读回来看），第一次 Done 会被拦下来再给一轮核对；有断言没通过的 Done 也会被拦回去先修。Check.contains 的内容要和文件里实际写的一字不差（文件里写的是「北京」就别查 "Beijing"）；没通过时它会带上文件里实际的内容，先对照再决定改文件还是改断言，不要没看过文件就 Partial 放弃。
 - 改坏了、方向错了，用 Files.restore "path" 把那个文件退回任务开始时的版本再来，不要在坏掉的内容上继续补。
 - 每一轮的提示末尾会附上：工作区现在的文件列表、上一步每次调用的返回值、计划、还剩多少时间。更早几轮的返回只留在 note 和计划的 tick 里。
 
@@ -367,7 +367,7 @@ export function promptContext(ctx: PromptContext): string {
     const targets = [written.length ? `这次任务写过的文件：${written.join("、")}` : "", ctx.modules?.length ? `装着的 module：${ctx.modules.join("、")}` : ""].filter(Boolean).join("；");
     if (failed.length) {
       parts.push(
-        `【核对没通过，不能这样结束】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」，但这些断言没通过：${failed.map((item) => `「${clip(item, 160)}」`).join("、")}。这一步先修：改坏了就 Files.restore "path" 退回任务开始时的版本重做，缺内容就补上；然后把同样的断言再写一遍，全部通过才 Done。真做不成，就用 Partial 说清楚哪一条做不到，不要把没通过的当做完。`,
+        `【核对没通过，不能这样结束】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」，但这些断言没通过：${failed.map((item) => `「${clip(item, 160)}」`).join("、")}。先分清是文件错了还是断言写错了：【上一步】里没通过的那条后面带着文件里实际的内容——内容其实在、只是写法不同（中文名 / 英文名、大小写、多个空格），就按文件里实际写的改断言；真缺就补上；改坏了就 Files.restore "path" 退回任务开始时的版本重做。然后把断言再写一遍，全部通过才 Done。确实做不成，再用 Partial 说清楚哪一条做不到，不要把没通过的当做完，也不要没看过文件就放弃。`,
       );
     } else {
       parts.push(
@@ -553,6 +553,17 @@ const MAX_CHECK_HOLDS = 2;
 export function assertedInStep(effects: { tool: string; detail: string; output: string }[]): boolean {
   const verdicts = checkVerdicts(effects);
   return verdicts.length > 0 && verdicts.every((item) => item.ok);
+}
+
+// Failed Check.contains assertions on files that exist but were never read in
+// this step. A Partial on the strength of those alone is giving up blind: the
+// file may well hold the content in other words (北京 where the check said
+// Beijing), so the model is sent to look before it concedes.
+export function blindMisses(effects: { tool: string; detail: string; output: string }[]): string[] {
+  const read = new Set(effects.filter((effect) => effect.tool === "Files.read_file" && effect.output.startsWith("Ok")).map((effect) => effect.detail));
+  return effects
+    .filter((effect) => effect.tool === "Check.contains" && effect.output.startsWith("没通过：文件里没有这段") && !read.has(effect.detail.split(" 含 ")[0] ?? ""))
+    .map((effect) => effect.detail);
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +856,19 @@ export async function runDeskLoop(
                   raw = held;
                   reply = "continue";
                   emit({ kind: "check", round, answer: frame.text, failed });
+                }
+              } else if (reply === "partial" && plan.checks < MAX_CHECK_HOLDS && blindMisses(effects).length > 0) {
+                // Giving up on "the file does not contain it" without having
+                // looked at the file: go and look first, then decide.
+                const failed = checkVerdicts(effects).filter((item) => !item.ok).map((item) => item.desc);
+                const held = patchFrame(raw, { kind: "continue" });
+                if (held) {
+                  plan.checks += 1;
+                  plan.pending = frame.text;
+                  plan.failed = failed;
+                  raw = held;
+                  reply = "continue";
+                  emit({ kind: "check", round, answer: frame.text, failed, gaveUp: true });
                 }
               } else if (reply === "done") {
                 // Out of holds: a Done that still has failing assertions says so.

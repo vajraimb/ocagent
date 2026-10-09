@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, blindMisses, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import { boundOrigin, type AgentEvent, type AgentEventBody } from "./progress.ts";
 
@@ -756,6 +756,52 @@ test("a Done with a failing assertion is sent back to fix it, at most twice; aft
   }
 });
 
+test("a Partial that gives up on a Check.contains miss without reading the file is sent to look first", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  const miss = "Check.contains\tweather/beijing.md 含 Beijing\t没通过：文件里没有这段；文件里实际是：北京：20.9°C";
+  const frames = [
+    okFrame("partial", "城市文件里没有英文名", `Files.write_file\tweather/beijing.md\tOk\n${miss}`),
+    okFrame("done", "文件里是中文名，断言改过后都通过", "Check.contains\tweather/beijing.md 含 北京\t通过"),
+  ];
+  let i = 0;
+  try {
+    await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    assert.equal(i, 2, "the Partial was held and the loop went on");
+    const check = events.find((event) => event.kind === "check");
+    assert.ok(check && check.kind === "check" && check.gaveUp === true && check.failed[0] === "weather/beijing.md 含 Beijing");
+    assert.match(contexts[1] ?? "", /【核对没通过，不能这样结束】[\s\S]*文件里实际的内容[\s\S]*改断言/);
+    assert.match(contexts[1] ?? "", /北京：20\.9°C/, "the prompt shows what the file holds");
+    const steps = events.filter((event) => event.kind === "step");
+    assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["continue", "done"]);
+    // A Partial with an honest, looked-into failure is not held.
+    const honest = [okFrame("partial", "文件看过了，确实缺第二节", "Files.read_file\tc.md\tOk 第一节\nCheck.contains\tc.md 含 第二节\t没通过：文件里没有这段；文件里实际是：第一节\nCheck.that\t拿到温度\t没通过")];
+    let k = 0;
+    const replies: string[] = [];
+    await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(honest),
+      runPayload: async () => honest[k++] ?? okFrame("done", "x"),
+      emit: (event) => { if (event.kind === "step") replies.push(event.reply); },
+      budgetMs: 60_000,
+    });
+    assert.deepEqual(replies, ["partial"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  // Only misses on files the step never read count as blind; a missing file or a Check.that does not.
+  const effects = (lines: string) => lines.split("\n").map((line) => { const [tool = "", detail = "", output = ""] = line.split("\t"); return { tool, detail, output }; });
+  assert.deepEqual(blindMisses(effects(miss)), ["weather/beijing.md 含 Beijing"]);
+  assert.deepEqual(blindMisses(effects(`Files.read_file\tweather/beijing.md\tOk 北京\n${miss}`)), []);
+  assert.deepEqual(blindMisses(effects("Check.contains\tnone.md 含 x\t没通过：没有这个文件\nCheck.that\t两行\t没通过")), []);
+});
+
 test("the origin of a changed file is kept for Files.restore, bounded, and carried across segments", async () => {
   const frames = [okFrameWithFiles("done", "改好了", "Files.replace\tnotes.md\tOk 替换了 1 处\nCheck.contains\tnotes.md 含 新\t通过", [{ path: "notes.md", content: "新" }])];
   let i = 0;
@@ -813,6 +859,8 @@ end`;
     ["Check.equal", "字母相同", false],
     ["Check.contains", "notes.md 含 原来的", true],
   ]);
+  const miss = frame.effects.find((effect) => effect.detail === "notes.md 含 第二节");
+  assert.equal(miss?.output, "没通过：文件里没有这段；文件里实际是：第一节 改坏了", "a miss shows what the file holds");
   const restored = frame.effects.filter((effect) => effect.tool === "Files.restore").map((effect) => effect.output);
   assert.match(restored[0] ?? "", /^Ok 已退回任务开始时的版本/);
   assert.match(restored[1] ?? "", /^Ok 任务开始时没有这个文件，已删掉/);

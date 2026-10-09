@@ -16,7 +16,7 @@ export type AgentEventBody =
   | { kind: "module"; round: number; name: string; exports: string[] }
   | { kind: "module_dropped"; name: string; reason: string }
   | { kind: "todo"; round: number; items: PlanItem[] }
-  | { kind: "check"; round: number; answer: string; failed: string[] }
+  | { kind: "check"; round: number; answer: string; failed: string[]; gaveUp?: boolean }
   | { kind: "need_input"; round: number; topics: string[]; question: string }
   | { kind: "remember"; round: number; text: string; forgot: boolean }
   | { kind: "finish"; ok: boolean };
@@ -388,6 +388,8 @@ export type Round = {
   check: string;
   /** Assertions that failed when the Done was held. */
   checkFailed: string[];
+  /** The held reply was a Partial: the model gave up on a failed check it never looked into. */
+  checkGaveUp: boolean;
   /** The run turned this round's Done into a question: what it needs from the user. */
   needInput: { topics: string[]; question: string } | null;
   /** Notes remembered or forgotten in this round. */
@@ -399,7 +401,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], needInput: null, remembered: [] };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, remembered: [] };
       rounds.set(round, found);
     }
     return found;
@@ -456,6 +458,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         const round = at(event.round);
         round.check = event.answer;
         round.checkFailed = event.failed;
+        round.checkGaveUp = event.gaveUp === true;
         break;
       }
       case "need_input":
