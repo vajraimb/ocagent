@@ -4,7 +4,7 @@
 import { dbSource, getSql, type Sql } from "@/lib/db";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { normalizeNotes, type AgentEvent, type PlanItem, type PlanState } from "./progress.ts";
-import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
+import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[] };
 export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: number };
@@ -79,7 +79,7 @@ function filesOf(raw: unknown): DeskFile[] {
     if (!item || typeof item !== "object") continue;
     const path = "path" in item && typeof item.path === "string" ? item.path : "";
     const content = "content" in item && typeof item.content === "string" ? item.content : "";
-    if (safePath(path)) files.push({ path, content });
+    if (safePath(path) && !isScratchFile(path)) files.push({ path, content });
   }
   return files;
 }

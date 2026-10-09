@@ -61,6 +61,10 @@ export async function fetchSource(raw: string): Promise<{ ok: true; text: string
 }
 
 const MAX_PAGE_TEXT = 4_000;
+// Data replies (JSON, CSV, plain text) keep more: a step can take them apart
+// with Json.get even though the prompt only shows the head and tail.
+const MAX_DATA_TEXT = 16_000;
+const MAX_POST_BODY = 20_000;
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…", mdash: "—", ndash: "–", middot: "·" };
 
@@ -155,10 +159,51 @@ export async function fetchPublic(raw: string): Promise<string> {
       if (!current) return "跳转目标不能请求。";
       continue;
     }
-    const body = await response.text();
-    const type = response.headers.get("content-type") ?? "";
-    const text = looksLikeHtml(body, type) ? readablePage(body) : body.replace(/\s+/g, " ").trim().slice(0, MAX_PAGE_TEXT);
-    return `HTTP ${response.status} ${current.hostname}\n${text || "（没有正文）"}`;
+    return describeReply(response, current, await response.text());
   }
   return "跳转太多次。";
+}
+
+function describeReply(response: Response, url: URL, body: string): string {
+  const type = response.headers.get("content-type") ?? "";
+  const text = looksLikeHtml(body, type) ? readablePage(body) : compactData(body);
+  return `HTTP ${response.status} ${url.hostname}\n${text || "（没有正文）"}`;
+}
+
+// JSON is left intact (whitespace outside strings only) so Json.get can parse
+// what the window keeps; other data is simply trimmed.
+function compactData(body: string): string {
+  const trimmed = body.trim();
+  if (/^[[{]/.test(trimmed)) {
+    try {
+      return JSON.stringify(JSON.parse(trimmed)).slice(0, MAX_DATA_TEXT);
+    } catch {
+      /* not JSON after all */
+    }
+  }
+  return trimmed.replace(/[ \t]+/g, " ").replace(/\n{2,}/g, "\n").slice(0, MAX_DATA_TEXT);
+}
+
+// POSTs a body to a public address: JSON when it parses as JSON, plain text
+// otherwise. Redirects are not followed (the body would have to be re-sent).
+export async function postPublic(raw: string, body: string): Promise<string> {
+  const url = publicUrl(raw);
+  if (!url) return "这个地址不能请求。";
+  if (body.length > MAX_POST_BODY) return `要发送的内容太长（${body.length} 字，最多 ${MAX_POST_BODY}）。`;
+  let json = false;
+  try {
+    JSON.parse(body);
+    json = true;
+  } catch {
+    /* plain text body */
+  }
+  const response = await fetch(url, {
+    method: "POST",
+    redirect: "manual",
+    signal: AbortSignal.timeout(15_000),
+    headers: { "User-Agent": "ocagent", "Content-Type": json ? "application/json" : "text/plain; charset=utf-8", Accept: "application/json, text/plain, */*" },
+    body,
+  });
+  if (response.status >= 300 && response.status < 400) return `HTTP ${response.status} ${url.hostname}\n对方要求跳转到 ${response.headers.get("location") ?? "（没给地址）"}；POST 不跟随跳转，直接请求那个地址。`;
+  return describeReply(response, url, await response.text());
 }

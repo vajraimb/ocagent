@@ -114,7 +114,7 @@ function writeFrame(frame: { kind: string; text: string; traces: string; effects
 function effectOutputs(effects: string): string[] {
   return effects
     .split("\n")
-    .filter((line) => line.startsWith("Net.get\t") || line.startsWith("Search.query\t"))
+    .filter((line) => line.startsWith("Net.get\t") || line.startsWith("Net.post\t") || line.startsWith("Search.query\t"))
     .map((line) => line.split("\t").slice(2).join("\t"));
 }
 

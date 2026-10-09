@@ -385,10 +385,16 @@ export function SidePanel({
             )}
             <div className="flex items-center justify-between gap-2 text-xs text-muted">
               <span className="font-mono">{sizeLabel(file.content)}</span>
-              <button type="button" disabled={disabled} onClick={() => onRemoveFile(file.path)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs text-muted hover:text-danger disabled:opacity-50">
-                <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                删除这个文件
-              </button>
+              <div className="flex items-center gap-1">
+                <button type="button" onClick={() => downloadFile(file)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs text-muted hover:text-fg">
+                  <Download className="h-3.5 w-3.5" aria-hidden />
+                  下载
+                </button>
+                <button type="button" disabled={disabled} onClick={() => onRemoveFile(file.path)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs text-muted hover:text-danger disabled:opacity-50">
+                  <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                  删除
+                </button>
+              </div>
             </div>
           </div>
         ) : null}
@@ -401,6 +407,17 @@ export function SidePanel({
       </div>
     </div>
   );
+}
+
+// Saves one workspace file to the viewer's device, under its own name.
+function downloadFile(file: DeskFile): void {
+  const picture = isImageFile(file);
+  const url = picture ? file.content : URL.createObjectURL(new Blob([file.content], { type: "text/plain;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = file.path.split("/").pop() || "file.txt";
+  anchor.click();
+  if (!picture) setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }
 
 function sizeLabel(content: string): string {

@@ -7,10 +7,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bannedCall, checkModule, MAX_MODULES, moduleFromFile, prelude, type DeskModule, type HarnessId } from "./harness.ts";
 import { settle } from "./budget.ts";
-import { fetchPublic, fetchSource } from "./net.ts";
+import { fetchPublic, fetchSource, postPublic } from "./net.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
-import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
+import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 const SYSTEM_OCAML = "/root/.opam/5.3.0/bin/ocaml";
 
@@ -210,7 +210,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Plan、Memory、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -347,6 +347,11 @@ async function harnessOp(payload: string, ctx: BridgeContext): Promise<{ status:
   return { status: 200, text: `${where}已加载 module ${verdict.module.name}。从下一步起可以直接调用 ${verdict.module.name}.… 。` };
 }
 
+// A step sees up to this much of a Net / Search reply (the prompt shows less;
+// the step itself can pick fields out of the rest with Json.get).
+const MAX_BRIDGE_REPLY = 16_000;
+const MAX_POST_PAYLOAD = 24_000;
+
 function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?: RunHooks, ctx?: BridgeContext) {
   const allow = new Set<string>(harnesses.filter((id) => id === "net" || id === "web"));
   const token = randomBytes(16).toString("hex");
@@ -381,18 +386,26 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?:
       }
       return;
     }
-    const payload = (body.payload ?? "").slice(0, 4000);
-    const permitted = (op === "net" && allow.has("net")) || (op === "search" && allow.has("web"));
+    const payload = (body.payload ?? "").slice(0, op === "net_post" ? MAX_POST_PAYLOAD : 4000);
+    const permitted = ((op === "net" || op === "net_post") && allow.has("net")) || (op === "search" && allow.has("web"));
     if (!permitted) {
       res.writeHead(403);
       res.end("这个 harness 没开");
       return;
     }
     try {
-      hooks?.onCall?.(op === "net" ? "Net.get" : "Search.query", payload);
-      const text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
+      let text: string;
+      if (op === "net_post") {
+        const cut = payload.indexOf("\n");
+        const url = cut < 0 ? payload : payload.slice(0, cut);
+        hooks?.onCall?.("Net.post", url);
+        text = await postPublic(url, cut < 0 ? "" : payload.slice(cut + 1));
+      } else {
+        hooks?.onCall?.(op === "net" ? "Net.get" : "Search.query", payload);
+        text = op === "net" ? await fetchPublic(payload) : apiKey ? await searchWeb(apiKey, payload) : "Grok 没有接上。";
+      }
       res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-      res.end(text.slice(0, 4000));
+      res.end(text.slice(0, MAX_BRIDGE_REPLY));
     } catch (err) {
       res.writeHead(500);
       res.end(err instanceof Error ? err.message : "失败");
@@ -820,7 +833,7 @@ function shortenDiagnostic(raw: string, source = ""): string {
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Search、Net、Trace、Clock、Harness、Plan、Memory、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
   } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
     lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
@@ -908,7 +921,7 @@ let slurp path =
   Fun.protect ~finally:(fun () -> close_in ic) (fun () -> really_input_string ic (in_channel_length ic))
 
 let bridge op payload =
-  let req = Filename.temp_file "ocagent" ".in" in
+  let req = Filename.temp_file "ocagent_" ".in" in
   let resp = req ^ ".out" in
   let oc = open_out req in
   output_string oc payload;
@@ -919,6 +932,8 @@ let bridge op payload =
   in
   let code = Sys.command cmd in
   let body = try slurp resp with _ -> "" in
+  (try Sys.remove req with Sys_error _ -> ());
+  (try Sys.remove resp with Sys_error _ -> ());
   if code <> 0 then Error (if body = "" then "调用失败" else body) else Ok body
 
 let effects = open_out_gen [ Open_append; Open_creat ] 0o644 "ocagent_effects"
@@ -951,6 +966,22 @@ let safe_rel path =
   && (not (String.ends_with ~suffix:"/" path))
   && (not (has_dotdot path))
   && not (String.contains path '\\\\')
+
+let count_sub text sub =
+  let n = String.length text and m = String.length sub in
+  let rec go i acc = if i + m > n then acc else if String.sub text i m = sub then go (i + m) (acc + 1) else go (i + 1) acc in
+  if m = 0 then 0 else go 0 0
+
+let replace_all text sub by =
+  let n = String.length text and m = String.length sub in
+  let buf = Buffer.create (n + 16) in
+  let rec go i =
+    if i >= n then ()
+    else if i + m <= n && String.sub text i m = sub then (Buffer.add_string buf by; go (i + m))
+    else (Buffer.add_char buf text.[i]; go (i + 1))
+  in
+  go 0;
+  Buffer.contents buf
 
 let rec mkdir_p path =
   if path = "" || path = "." then ()
@@ -1034,6 +1065,231 @@ module Files = struct
     in
     log_effect "Files.delete_file" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
     result
+
+  let replace path old by =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else if old = "" then Error "要替换的文本是空的"
+      else
+        match (try Ok (slurp path) with Sys_error _ -> Error "没有这个文件") with
+        | Error e -> Error e
+        | Ok text ->
+            let n = count_sub text old in
+            if n = 0 then Error "文件里没有这段文本（要一字不差，含空格和换行；先 read_file 看看）"
+            else (
+              let oc = open_out path in
+              Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (replace_all text old by));
+              Ok n)
+    in
+    log_effect "Files.replace" path (match result with Ok n -> "Ok 替换了 " ^ string_of_int n ^ " 处" | Error e -> "Error " ^ e);
+    result
+
+  let append path content =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else (
+        mkdir_p (Filename.dirname path);
+        let oc = open_out_gen [ Open_append; Open_creat; Open_wronly ] 0o644 path in
+        Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc content);
+        Ok ())
+    in
+    log_effect "Files.append" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
+    result
+end
+
+module Json = struct
+  type t = Null | Bool of bool | Num of string | Str of string | Arr of t list | Obj of (string * t) list
+
+  exception Bad of string
+
+  let parse src =
+    let n = String.length src in
+    let i = ref 0 in
+    let peek () = if !i < n then src.[!i] else '\\000' in
+    let rec ws () = if !i < n && (match src.[!i] with ' ' | '\\n' | '\\t' | '\\r' -> true | _ -> false) then (incr i; ws ()) in
+    let expect c = if peek () = c then incr i else raise (Bad (Printf.sprintf "第 %d 字处应是 %c" !i c)) in
+    let add_utf8 buf code =
+      if code < 0x80 then Buffer.add_char buf (Char.chr code)
+      else if code < 0x800 then (
+        Buffer.add_char buf (Char.chr (0xC0 lor (code lsr 6)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+      else if code < 0x10000 then (
+        Buffer.add_char buf (Char.chr (0xE0 lor (code lsr 12)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+      else (
+        Buffer.add_char buf (Char.chr (0xF0 lor (code lsr 18)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 12) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((code lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (code land 0x3F))))
+    in
+    let hex4 () =
+      if !i + 4 > n then raise (Bad "\\\\u 后面不够 4 位");
+      let v = int_of_string ("0x" ^ String.sub src !i 4) in
+      i := !i + 4;
+      v
+    in
+    let str () =
+      expect '"';
+      let buf = Buffer.create 32 in
+      let rec go () =
+        if !i >= n then raise (Bad "字符串没有结束（内容可能被截断了）");
+        let c = src.[!i] in
+        incr i;
+        if c = '"' then ()
+        else if c = '\\\\' then (
+          if !i >= n then raise (Bad "转义不完整");
+          let e = src.[!i] in
+          incr i;
+          (match e with
+          | 'n' -> Buffer.add_char buf '\\n'
+          | 't' -> Buffer.add_char buf '\\t'
+          | 'r' -> Buffer.add_char buf '\\r'
+          | 'b' -> Buffer.add_char buf '\\b'
+          | 'f' -> Buffer.add_char buf '\\012'
+          | 'u' ->
+              let hi = hex4 () in
+              if hi >= 0xD800 && hi <= 0xDBFF && !i + 1 < n && src.[!i] = '\\\\' && src.[!i + 1] = 'u' then (
+                i := !i + 2;
+                let lo = hex4 () in
+                add_utf8 buf (0x10000 + ((hi - 0xD800) lsl 10) + (lo - 0xDC00)))
+              else add_utf8 buf hi
+          | other -> Buffer.add_char buf other);
+          go ())
+        else (Buffer.add_char buf c; go ())
+      in
+      go ();
+      Buffer.contents buf
+    in
+    let rec value () =
+      ws ();
+      match peek () with
+      | '{' ->
+          incr i;
+          ws ();
+          if peek () = '}' then (incr i; Obj [])
+          else
+            let rec fields acc =
+              ws ();
+              let k = str () in
+              ws ();
+              expect ':';
+              let v = value () in
+              ws ();
+              match peek () with
+              | ',' -> incr i; fields ((k, v) :: acc)
+              | '}' -> incr i; Obj (List.rev ((k, v) :: acc))
+              | _ -> raise (Bad (Printf.sprintf "第 %d 字处的对象没有正常结束（内容可能被截断了）" !i))
+            in
+            fields []
+      | '[' ->
+          incr i;
+          ws ();
+          if peek () = ']' then (incr i; Arr [])
+          else
+            let rec items acc =
+              let v = value () in
+              ws ();
+              match peek () with
+              | ',' -> incr i; items (v :: acc)
+              | ']' -> incr i; Arr (List.rev (v :: acc))
+              | _ -> raise (Bad (Printf.sprintf "第 %d 字处的数组没有正常结束（内容可能被截断了）" !i))
+            in
+            items []
+      | '"' -> Str (str ())
+      | 't' when !i + 4 <= n && String.sub src !i 4 = "true" -> i := !i + 4; Bool true
+      | 'f' when !i + 5 <= n && String.sub src !i 5 = "false" -> i := !i + 5; Bool false
+      | 'n' when !i + 4 <= n && String.sub src !i 4 = "null" -> i := !i + 4; Null
+      | c when c = '-' || (c >= '0' && c <= '9') ->
+          let start = !i in
+          while !i < n && (match src.[!i] with '0' .. '9' | '-' | '+' | '.' | 'e' | 'E' -> true | _ -> false) do incr i done;
+          Num (String.sub src start (!i - start))
+      | _ -> raise (Bad (if !i >= n then "内容是空的或被截断了" else Printf.sprintf "第 %d 字处不是 JSON" !i))
+    in
+    (* Net.get prefixes its status line; anything before the first { or [ is skipped. *)
+    let first = ref n in
+    String.iteri (fun k c -> if !first = n && (c = '{' || c = '[') then first := k) src;
+    i := !first;
+    if !first >= n then raise (Bad "里面没有 JSON（没有 { 或 [）");
+    value ()
+
+  let rec print = function
+    | Null -> "null"
+    | Bool b -> string_of_bool b
+    | Num s -> s
+    | Str s ->
+        let buf = Buffer.create (String.length s + 2) in
+        Buffer.add_char buf '"';
+        String.iter
+          (fun c ->
+            match c with
+            | '"' -> Buffer.add_string buf "\\\\\\""
+            | '\\\\' -> Buffer.add_string buf "\\\\\\\\"
+            | '\\n' -> Buffer.add_string buf "\\\\n"
+            | '\\t' -> Buffer.add_string buf "\\\\t"
+            | '\\r' -> Buffer.add_string buf "\\\\r"
+            | c when Char.code c < 32 -> Buffer.add_string buf (Printf.sprintf "\\\\u%04x" (Char.code c))
+            | c -> Buffer.add_char buf c)
+          s;
+        Buffer.add_char buf '"';
+        Buffer.contents buf
+    | Arr xs -> "[" ^ String.concat "," (List.map print xs) ^ "]"
+    | Obj kv -> "{" ^ String.concat "," (List.map (fun (k, v) -> print (Str k) ^ ":" ^ print v) kv) ^ "}"
+
+  let scalar = function Str s -> s | v -> print v
+
+  let find text path =
+    match (try Ok (parse text) with Bad e -> Error ("JSON 解析失败：" ^ e) | _ -> Error "JSON 解析失败") with
+    | Error e -> Error e
+    | Ok root ->
+        let segs = List.filter (fun s -> s <> "") (String.split_on_char '.' (String.trim path)) in
+        let rec walk v = function
+          | [] -> Ok v
+          | seg :: rest -> (
+              match v with
+              | Obj kv -> (
+                  match List.assoc_opt seg kv with
+                  | Some next -> walk next rest
+                  | None ->
+                      let have = List.map fst kv in
+                      Error (Printf.sprintf "没有字段 %s（有：%s）" seg (String.concat "、" (List.filteri (fun k _ -> k < 12) have))))
+              | Arr xs -> (
+                  match int_of_string_opt seg with
+                  | None -> Error (Printf.sprintf "%s 处是数组（%d 项），要用下标，例如 %s" seg (List.length xs) (if rest = [] then "0" else "0." ^ String.concat "." rest))
+                  | Some k -> (
+                      match List.nth_opt xs k with
+                      | Some next -> walk next rest
+                      | None -> Error (Printf.sprintf "下标 %d 超出范围（共 %d 项）" k (List.length xs))))
+              | other -> Error (Printf.sprintf "%s 处不是对象或数组，是 %s" seg (clip_ends (print other) 60)))
+        in
+        walk root segs
+
+  let get text path =
+    let result = Result.map scalar (find text path) in
+    log_effect "Json.get" path (match result with Ok s -> "Ok " ^ clip_ends s 300 | Error e -> "Error " ^ e);
+    result
+
+  let items text path =
+    let result =
+      match find text path with
+      | Ok (Arr xs) -> Ok (List.map scalar xs)
+      | Ok other -> Error ("不是数组：" ^ clip_ends (print other) 60)
+      | Error e -> Error e
+    in
+    log_effect "Json.items" path (match result with Ok xs -> "Ok " ^ string_of_int (List.length xs) ^ " 项" | Error e -> "Error " ^ e);
+    result
+
+  let keys text path =
+    let result =
+      match find text path with
+      | Ok (Obj kv) -> Ok (List.map fst kv)
+      | Ok other -> Error ("不是对象：" ^ clip_ends (print other) 60)
+      | Error e -> Error e
+    in
+    log_effect "Json.keys" path (match result with Ok ks -> "Ok " ^ String.concat "、" ks | Error e -> "Error " ^ e);
+    result
 end
 
 module Search = struct
@@ -1047,6 +1303,15 @@ module Net = struct
   let get url =
     let result = if not net_on then Error "网络没开" else if String.trim url = "" then Error "地址是空的" else bridge "net" url in
     log_effect "Net.get" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+
+  let post url body =
+    let result =
+      if not net_on then Error "网络没开"
+      else if String.trim url = "" then Error "地址是空的"
+      else bridge "net_post" (String.trim url ^ "\\n" ^ body)
+    in
+    log_effect "Net.post" url (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
     result
 end
 
@@ -1148,7 +1413,7 @@ function encodeBlock(text: string): string {
 async function collectFiles(dir: string, root = dir, out: DeskFile[] = []): Promise<DeskFile[]> {
   const entries = await readdir(dir, { withFileTypes: true });
   for (const entry of entries) {
-    if (entry.name.startsWith("ocagent_") || entry.name.startsWith(".")) continue;
+    if (entry.name.startsWith("ocagent_") || entry.name.startsWith(".") || isScratchFile(entry.name)) continue;
     const abs = path.join(dir, entry.name);
     const rel = path.relative(root, abs).split(path.sep).join("/");
     if (!safePath(rel)) continue;

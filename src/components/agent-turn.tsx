@@ -382,9 +382,12 @@ function iconFor(tool: string): ReactNode {
     case "web_search":
       return <Search className={cls} aria-hidden />;
     case "Net.get":
+    case "Net.post":
     case "http_get":
       return <Globe className={cls} aria-hidden />;
     case "Files.write_file":
+    case "Files.replace":
+    case "Files.append":
     case "write_file":
       return <FilePen className={cls} aria-hidden />;
     case "Files.read_file":
@@ -420,9 +423,15 @@ function toolLabel(tool: string): string {
     "Files.read_file": "读文件",
     "Files.find_in_files": "查找",
     "Files.write_file": "写入",
+    "Files.replace": "改文件",
+    "Files.append": "追加",
     "Files.delete_file": "删除",
     "Search.query": "搜索",
     "Net.get": "请求",
+    "Net.post": "发送",
+    "Json.get": "取字段",
+    "Json.items": "取数组",
+    "Json.keys": "看字段",
     "Trace.note": "记下",
     "Clock.now": "计时",
     "Harness.load": "装为 harness",

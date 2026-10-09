@@ -70,6 +70,12 @@ export const SEED: DeskFile[] = [];
 
 export const MAX_FILES = 80;
 
+// Scratch files the step runtime's bridge used to leave behind
+// (ocagent1a2b3c.in / .in.out); never part of the desk.
+export function isScratchFile(path: string): boolean {
+  return /^ocagent[0-9a-f]+\.in(\.out)?$/.test(path.split("/").pop() ?? "");
+}
+
 export function safePath(path: string): boolean {
   if (!path || path.length > 80) return false;
   if (path.startsWith("/") || path.startsWith(".") || path.endsWith("/")) return false;

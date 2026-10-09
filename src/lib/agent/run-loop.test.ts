@@ -190,6 +190,50 @@ test("a continued segment numbers its rounds after the earlier ones and tells th
   }
 });
 
+test("a busy model endpoint is asked again before the round is given up", async () => {
+  const realFetch = globalThis.fetch;
+  const statuses = [429, 503, 200, 400];
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    const status = statuses[calls] ?? 200;
+    calls += 1;
+    if (status !== 200) return new Response("busy", { status });
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nmodule Step : STEP = struct let run () = Done \"x\" end\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const kinds: string[] = [];
+  const replies: string[] = [];
+  try {
+    const started = Date.now();
+    await runDeskLoop(
+      "key",
+      "task",
+      [],
+      ["ocaml"],
+      [],
+      [],
+      "",
+      deps(
+        {
+          runCore: async (job, handlers) => {
+            replies.push(await handlers.model("prompt"));
+            replies.push(await handlers.model("prompt"));
+            return { status: "done", answer: "ok", files: job.files, modules: job.modules, steps: [], journal: [], memory: "" };
+          },
+        },
+        kinds,
+      ),
+    );
+    // 429 and 503 were retried (two pauses), 200 answered; the 400 was not retried.
+    assert.equal(calls, 4);
+    assert.ok(Date.now() - started >= 3_500);
+    assert.match(replies[0] ?? "", /^text\n/);
+    assert.match(replies[1] ?? "", /^error\n[\s\S]*模型没有接上（400）/);
+    assert.equal(kinds.filter((kind) => kind === "model_error").length, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test("promptContext stays bounded and names what the model needs", () => {
   const files = Array.from({ length: 80 }, (_, i) => ({ path: `src/f${i}.ml`, bytes: 2048 * (i + 1) }));
   const effects = Array.from({ length: 20 }, (_, i) => ({ tool: "Files.read_file", detail: `src/f${i}.ml`, output: "x".repeat(5000) }));

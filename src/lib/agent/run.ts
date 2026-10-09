@@ -5,7 +5,7 @@ import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isMemoryEffect, isPlanEffect, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
-import { applyFileDelta, imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
+import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
@@ -95,7 +95,7 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
 
 【你能用什么】
-只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan、Memory，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
@@ -127,7 +127,15 @@ module Files : sig
   val read_file : string -> string res
   val find_in_files : string -> (string * int * string) list
   val write_file : string -> string -> unit res
+  val replace : string -> string -> string -> int res
+  val append : string -> string -> unit res
   val delete_file : string -> unit res
+end
+
+module Json : sig
+  val get : string -> string -> string res
+  val items : string -> string -> string list res
+  val keys : string -> string -> string list res
 end
 
 module Search : sig
@@ -136,6 +144,7 @@ end
 
 module Net : sig
   val get : string -> string res
+  val post : string -> string -> string res
 end
 
 module Trace : sig
@@ -175,16 +184,19 @@ end
 
 【怎么看到结果】
 - 每个有副作用的调用都返回 res，必须用 match 处理 Ok 和 Error，不要用 Result.get_ok。
-- 这一步每次调用的返回值会附在下一轮的提示里（只保留一轮）；要留到更后面用的数值，用 Trace.note 记下。
+- 这一步每次调用的返回值会附在下一轮的提示里（只保留一轮；长返回只显示头尾）；要留到更后面用的数值，用 Trace.note 记下。
 - Continue 表示还要再来一轮。Done、Ask、Partial 会结束这次任务。
 - 参数已经确定的多个调用，写在同一步里依次执行。全部 Trace.note 之后，只 Continue 一次。
-- 后一个调用的地址、查询或内容要等前一个的返回值，就不能写在同一步。先 Continue，下一轮再用返回值去调用。
-- 只要这一步调用了 Net.get 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用返回值或笔记里出现过的数字。
+- 接口返回的是 JSON 时，在同一步里就能接着用：Json.get body "main.temp"、Json.get body "results.0.name"（路径用点分隔，数组用下标），Json.items body "results" 取数组各项，Json.keys body "" 看有哪些字段。Net.get / Net.post 的返回可以直接喂给 Json，开头的 HTTP 行会被跳过。这样「先请求、取字段、再请求」可以在一步里做完。
+- 要人读了才知道的内容（网页正文、搜索结果），才拆成两步：先 Continue，下一轮看着返回值再调用。
+- Net.post url body 发送一个请求体（是 JSON 就按 JSON 发）；返回和 Net.get 一样。
+- 只要这一步调用了 Net.get、Net.post 或 Search.query，就不能 Done。Done 只写在不再请求的那一轮，并且只用返回值或笔记里出现过的数字。
 
 【工作方式】
 - 用户要你写代码或文件时，这一轮就用 Files.write_file 把完整源码写进文件，成功后 Done。不要先 list_files，也不要只 Trace.note。
 - 只有用户明确说「加载」或 harness 时，才把对应的 .ml 写好并结束。其它任务不要提 harness。
 - 工作区的文件列表每轮都附在提示里，不要为了看它调用 list_files。
+- 改一个已有的文件，用 Files.replace path 旧文本 新文本（旧文本要一字不差，返回替换了几处），或 Files.append 在末尾加；不要把整个文件重写一遍。重写只用在文件很短或要全换的时候。
 - 收到编译错误时只改出错的地方，其余照抄；上一步的代码会一起附上。
 - 参数已经知道的多个请求写在同一步，记完再 Continue 一次。后一个请求要依赖前一个的结果时，拆成两步。
 - 还要再请求，就不要 Done。不再请求的那一轮，只用返回值或笔记里出现过的数字写结论。
@@ -285,7 +297,7 @@ function kb(bytes: number): string {
 }
 
 function effectLine(effect: { tool: string; detail: string; output: string }): string {
-  const wide = effect.tool === "Files.read_file" || effect.tool === "Net.get" || effect.tool === "Search.query";
+  const wide = effect.tool === "Files.read_file" || effect.tool === "Net.get" || effect.tool === "Net.post" || effect.tool === "Search.query";
   const picture = /^(Ok )?data:image\//.test(effect.output);
   const output = picture ? "Ok （这是一张图片的编码；图片本身已经附在提示里，直接看图）" : clip(effect.output.replace(/\s+/g, " ").trim(), wide ? 2_500 : 400);
   const detail = effect.detail.trim() ? ` ${clip(effect.detail.trim(), 120)}` : "";
@@ -353,6 +365,7 @@ export function parseDeskState(input: unknown): DeskState | { error: string } {
     const path = "path" in file && typeof file.path === "string" ? file.path : "";
     const content = "content" in file && typeof file.content === "string" ? file.content : "";
     if (!safePath(path)) return { error: `不能收下 ${path || "这个文件"}。` };
+    if (isScratchFile(path)) continue;
     const size = Buffer.byteLength(content);
     if (size > MAX_FILE_BYTES) return { error: `${path} 有 ${Math.round(size / 1024)} KB，单个文件最多 ${MAX_FILE_BYTES / 1024} KB。缩小或删掉它再试。` };
     total += size;
@@ -398,46 +411,74 @@ export const MAX_IMAGES_SHOWN = 4;
 
 type AskOptions = { signal?: AbortSignal; effort?: Effort; images?: ModelImage[]; onVisionFailed?: () => void };
 
-function askModel(apiKey: string, prompt: string, context: string, harnesses: HarnessId[], modules: DeskModule[], opts: AskOptions = {}): Promise<string> {
+// A busy or briefly failing endpoint (429, 5xx, a dropped connection) is
+// asked again after these pauses before the round is given up.
+const MODEL_RETRY_MS = [1_000, 3_000];
+
+function retryable(status: number): boolean {
+  return status === 429 || status === 408 || status >= 500;
+}
+
+const pause = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+
+async function askModel(apiKey: string, prompt: string, context: string, harnesses: HarnessId[], modules: DeskModule[], opts: AskOptions = {}): Promise<string> {
   const { signal, effort = "low", images = [] } = opts;
-  const slowGuard = AbortSignal.timeout(90_000);
   const input = `${prompt.slice(0, MAX_PROMPT)}\n\n${context}`;
   const content =
     images.length > 0
       ? [{ type: "input_text", text: input }, ...images.map((image) => ({ type: "input_image", image_url: image.dataUrl, detail: "auto" }))]
       : input;
-  return fetch("https://api.x.ai/v1/responses", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    signal: signal ? AbortSignal.any([slowGuard, signal]) : slowGuard,
-    body: JSON.stringify({
-      model: "grok-4.5",
-      reasoning: { effort },
-      max_output_tokens: 6000,
-      instructions: instructionsFor(harnesses, modules),
-      input: [{ role: "user", content }],
-    }),
-  })
-    .then(async (response) => {
+  const body = JSON.stringify({
+    model: "grok-4.5",
+    reasoning: { effort },
+    max_output_tokens: 6000,
+    instructions: instructionsFor(harnesses, modules),
+    input: [{ role: "user", content }],
+  });
+  for (let attempt = 0; ; attempt += 1) {
+    const slowGuard = AbortSignal.timeout(90_000);
+    const again = attempt < MODEL_RETRY_MS.length && !signal?.aborted;
+    try {
+      const response = await fetch("https://api.x.ai/v1/responses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        signal: signal ? AbortSignal.any([slowGuard, signal]) : slowGuard,
+        body,
+      });
+      if (!response.ok && retryable(response.status) && again) {
+        await pause(MODEL_RETRY_MS[attempt] ?? 0, signal);
+        continue;
+      }
       if (!response.ok && images.length > 0 && response.status >= 400 && response.status < 500) {
         // The endpoint would not take the pictures: say so in the next
         // context and ask again with text only, rather than failing the round.
         opts.onVisionFailed?.();
         return askModel(apiKey, prompt, context, harnesses, modules, { ...opts, images: [] });
       }
-      if (!response.ok) return `error\n${block(`模型没有接上（${response.status}）。`)}`;
-      const body = (await response.json()) as ResponseBody;
-      const text = textOf(body);
+      if (!response.ok) return `error\n${block(`模型没有接上（${response.status}${attempt ? `，重试 ${attempt} 次后仍然如此` : ""}）。`)}`;
+      const reply = (await response.json()) as ResponseBody;
+      const text = textOf(reply);
       if (text) return `text\n${block(text)}`;
-      const calls = (body.output ?? []).filter((item) => item.type === "function_call" && item.name);
+      const calls = (reply.output ?? []).filter((item) => item.type === "function_call" && item.name);
       if (calls.length > 0) return `text\n${block("没有按格式输出。只写一个 ocaml 代码块，里面是 module Step。")}`;
       return `text\n${block("没有输出")}`;
-    })
-    .catch((err: unknown) => {
+    } catch (err: unknown) {
       const slow = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+      if (!slow && again) {
+        await pause(MODEL_RETRY_MS[attempt] ?? 0, signal);
+        continue;
+      }
       const message = slow ? "模型太慢，这一步停了。点继续可以接着做。" : err instanceof Error ? err.message : "模型没有回应";
       return `error\n${block(message)}`;
-    });
+    }
+  }
 }
 
 export type RunHooks = {
@@ -467,7 +508,7 @@ const MAX_COMPILE_STALL = 4;
 const MAX_IDLE_STALL = 5;
 const MAX_RUNNER_STALL = 2;
 // Effects that change the desk: a run that did any of these gets a check round.
-const WRITES = new Set(["Files.write_file", "Files.delete_file", "Harness.load", "Harness.install"]);
+const WRITES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Harness.load", "Harness.install"]);
 
 export function runBudgetMs(): number {
   const raw = Number(process.env.OCAGENT_RUN_BUDGET_MS);

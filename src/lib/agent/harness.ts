@@ -91,8 +91,8 @@ export const CATALOG: HarnessSpec[] = [
     id: "net",
     name: "网络",
     moduleName: "Net",
-    summary: "请求一个公网地址。",
-    tools: "http_get · Net.get",
+    summary: "请求公网地址，GET 或 POST；返回的 JSON 可以直接取字段。",
+    tools: "Net.get · Net.post · Json",
     source: NET.trim(),
   },
   {
@@ -136,7 +136,7 @@ export function prelude(enabled: HarnessId[], modules: DeskModule[] = []): strin
 }
 
 const MODULE_NAME = /^[A-Z][A-Za-z0-9_]{0,24}$/;
-const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml", "Step", "Trace", "Clock", "Harness", "Plan", "Memory", "STEP"]);
+const RESERVED = new Set(["Net", "Search", "Files", "Stdlib", "OCaml", "Step", "Trace", "Clock", "Harness", "Plan", "Memory", "Json", "STEP"]);
 const BANNED = /\bObj\.|\bMarshal\.|#\s*(load|use|directory|mod_use)|Sys\.(command|getenv|readdir|chdir|remove|rename|set_signal)\b/;
 
 /** The first forbidden call in a would-be module, for an error message that names it. */

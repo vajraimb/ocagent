@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { SEED, applyFileDelta, applyTool, batchPuts, fileDelta, safePath } from "./workspace.ts";
+import { SEED, applyFileDelta, applyTool, batchPuts, fileDelta, isScratchFile, safePath } from "./workspace.ts";
 
 describe("desk workspace", () => {
   it("starts empty and rejects path escape", () => {
@@ -61,5 +61,14 @@ describe("desk deltas", () => {
     const batches = batchPuts([file("1", 400), file("2", 400), file("3", 400), file("4", 2000), file("5", 10)], 1000);
     assert.deepEqual(batches.map((batch) => batch.map((item) => item.path)), [["1", "2"], ["3"], ["4"], ["5"]]);
     assert.deepEqual(batchPuts([]), []);
+  });
+
+  it("isScratchFile names the bridge's leftover temp files and nothing else", () => {
+    assert.equal(isScratchFile("ocagent1a2b3c.in"), true);
+    assert.equal(isScratchFile("ocagent1a2b3c.in.out"), true);
+    assert.equal(isScratchFile("lib/ocagentff00aa.in"), true);
+    assert.equal(isScratchFile("ocagent.in"), false);
+    assert.equal(isScratchFile("ocagent_notes.md"), false);
+    assert.equal(isScratchFile("notes.in"), false);
   });
 });

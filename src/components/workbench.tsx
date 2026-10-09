@@ -22,7 +22,7 @@ import {
   type RunRecord,
   type RunReply,
 } from "@/lib/agent/run";
-import { MAX_FILES, batchPuts, fileDelta, isImageFile, safePath, type DeskFile } from "@/lib/agent/workspace";
+import { MAX_FILES, batchPuts, fileDelta, isImageFile, isScratchFile, safePath, type DeskFile } from "@/lib/agent/workspace";
 
 // The browser keeps only the desk's key and a cache for the first paint; the
 // desk itself (files, harnesses, modules) and every run live on the server.
@@ -61,7 +61,7 @@ function uid(prefix: string): string {
 
 function keepFile(file: DeskFile): boolean {
   const name = file.path.split("/").pop() ?? "";
-  return !PREFAB.has(file.path) && !name.startsWith("ocagent_");
+  return !PREFAB.has(file.path) && !name.startsWith("ocagent_") && !isScratchFile(file.path);
 }
 
 function isRun(value: unknown): value is RunRecord {
