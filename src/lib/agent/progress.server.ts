@@ -1,9 +1,9 @@
 import { ProgressRegistry } from "./progress.ts";
-import type { DeskResult } from "./run.ts";
+import type { RunReply } from "./run.ts";
 
-// One registry per server process. The dev server and a long-lived Node host
-// share it between the run and the page polling it; a per-request host simply
-// reports the job as not found and the page falls back to the final answer.
-const globalScope = globalThis as typeof globalThis & { __ocagentProgress?: ProgressRegistry<DeskResult> };
+// One registry per server process: the fast path for a page polling the same
+// instance that runs its task. The run's row in the database is the slow path
+// (and the durable record) for every other instance.
+const globalScope = globalThis as typeof globalThis & { __ocagentRuns?: ProgressRegistry<RunReply> };
 
-export const deskProgress: ProgressRegistry<DeskResult> = globalScope.__ocagentProgress ?? (globalScope.__ocagentProgress = new ProgressRegistry<DeskResult>());
+export const runProgress: ProgressRegistry<RunReply> = globalScope.__ocagentRuns ?? (globalScope.__ocagentRuns = new ProgressRegistry<RunReply>());

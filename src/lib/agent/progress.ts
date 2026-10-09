@@ -33,6 +33,7 @@ type Job<Result> = {
   startedAt: number;
   endedAt: number | null;
   abort: (() => void) | null;
+  seqBase: number;
 };
 
 const KEEP_MS = 30 * 60_000;
@@ -60,18 +61,22 @@ export class ProgressRegistry<Result> {
     this.now = now;
   }
 
-  open(id: string): void {
+  // A later segment of the same run opens with the seq its earlier events
+  // reached, so the page's "after" cursor keeps working across segments.
+  open(id: string, seqBase = 0): void {
     this.prune();
-    this.jobs.set(id, { events: [], result: null, done: false, startedAt: this.now(), endedAt: null, abort: null });
+    this.jobs.set(id, { events: [], result: null, done: false, startedAt: this.now(), endedAt: null, abort: null, seqBase });
   }
 
-  emit(id: string, body: AgentEventBody): void {
+  emit(id: string, body: AgentEventBody): AgentEvent | null {
     const job = this.jobs.get(id);
-    if (!job || job.done) return;
+    if (!job || job.done) return null;
     const trimmed = trimBody(body);
-    const seq = job.events.length ? (job.events[job.events.length - 1]?.seq ?? 0) + 1 : 1;
-    job.events.push({ ...trimmed, seq, at: this.now() });
+    const seq = job.events.length ? (job.events[job.events.length - 1]?.seq ?? 0) + 1 : job.seqBase + 1;
+    const event: AgentEvent = { ...trimmed, seq, at: this.now() };
+    job.events.push(event);
     if (job.events.length > MAX_EVENTS) job.events.splice(0, job.events.length - MAX_EVENTS);
+    return event;
   }
 
   attachAbort(id: string, abort: () => void): void {
@@ -135,7 +140,11 @@ function trimBody(body: AgentEventBody): AgentEventBody {
 }
 
 // Reads the "ok\n<kind>\n<text><traces><effects>…" frame a step run returns.
-export function describeStepFrame(raw: string): { kind: "fail"; message: string } | { kind: "ok"; reply: string; text: string; effects: { tool: string; detail: string; output: string }[] } | null {
+export type StepFrame =
+  | { kind: "fail"; message: string }
+  | { kind: "ok"; reply: string; text: string; effects: { tool: string; detail: string; output: string }[]; files: { path: string; bytes: number }[] | null };
+
+export function describeStepFrame(raw: string): StepFrame | null {
   const buf = Buffer.from(raw, "utf8");
   let i = 0;
   const line = (): string | null => {
@@ -161,7 +170,23 @@ export function describeStepFrame(raw: string): { kind: "fail"; message: string 
   const traces = block();
   const effects = block();
   if (reply === null || text === null || traces === null || effects === null) return null;
-  return { kind: "ok", reply, text, effects: parseEffects(effects) };
+  // The workspace as the step left it: paths and sizes, for the next prompt.
+  let files: { path: string; bytes: number }[] | null = null;
+  const countLine = line();
+  const count = countLine === null ? NaN : Number(countLine);
+  if (Number.isInteger(count) && count >= 0) {
+    files = [];
+    for (let k = 0; k < count; k += 1) {
+      const path = line();
+      const content = block();
+      if (path === null || content === null) {
+        files = null;
+        break;
+      }
+      files.push({ path, bytes: Buffer.byteLength(content) });
+    }
+  }
+  return { kind: "ok", reply, text, effects: parseEffects(effects), files };
 }
 
 export function parseEffects(effectText: string): { tool: string; detail: string; output: string }[] {
