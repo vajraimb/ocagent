@@ -42,6 +42,8 @@ export type AgentTurnData = {
   rounds?: number;
   /** The plan as the run left it, for a turn whose timeline is not loaded. */
   plan?: PlanItem[];
+  /** The run ended by asking the user something; the next message answers it. */
+  asked?: boolean;
 };
 
 function useNow(active: boolean): number {
@@ -92,7 +94,7 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
         <span className={`inline-block h-2 w-2 rounded-full ${running ? "animate-pulse bg-accent" : turn.status === "failed" ? "bg-danger" : turn.status === "paused" ? "bg-warn" : "bg-muted"}`} />
         <span className="font-mono tracking-widest text-muted">OCAGENT</span>
         <span className="text-muted">·</span>
-        <span className="text-muted">{statusLine(turn.status, current, elapsed, plan)}</span>
+        <span className={turn.asked ? "text-fg" : "text-muted"}>{turn.asked ? "等你回答" : statusLine(turn.status, current, elapsed, plan)}</span>
       </header>
 
       <div className="mt-2 rounded-2xl border border-border bg-surface">

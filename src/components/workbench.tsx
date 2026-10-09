@@ -191,6 +191,7 @@ function turnOf(run: RunRecord): AgentTurnData {
     touched: run.result?.touched ?? [],
     rounds: run.rounds,
     plan: run.result?.plan?.items,
+    asked: run.result?.asked,
   };
 }
 
@@ -703,6 +704,7 @@ export function Workbench() {
   const showExamples = runs.length === 0;
   const lastRun = runs[runs.length - 1];
   const continueFor = lastRun && !running && unfinished(lastRun) ? lastRun : null;
+  const awaitingReply = Boolean(lastRun && !running && lastRun.status === "done" && lastRun.result?.asked);
   const shareUrl = deskId && typeof window !== "undefined" ? `${window.location.origin}/?desk=${deskId}` : "";
 
   const panel = (onClose?: () => void) => (
@@ -757,7 +759,7 @@ export function Workbench() {
                   onChange={(event) => setTask(event.target.value)}
                   onKeyDown={onKey}
                   rows={Math.min(6, Math.max(2, task.split("\n").length))}
-                  placeholder={running ? "它还在做，做完再说下一件。" : "说一件要做完的事"}
+                  placeholder={running ? "它还在做，做完再说下一件。" : awaitingReply ? "它在等你回答，接着说就行" : runs.length > 0 ? "接着说，或说下一件事" : "说一件要做完的事"}
                   disabled={running}
                   className="block w-full resize-none select-text bg-transparent px-2 py-2 text-[15px] leading-6 text-fg outline-none placeholder:text-muted disabled:opacity-60"
                 />

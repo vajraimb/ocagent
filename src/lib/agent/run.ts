@@ -86,6 +86,10 @@ export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): 
 【图片】
 用户放进工作区的图片会直接随每一轮的提示一起给你看（提示末尾列出它们的路径）。要描述、判断、读取图片里的内容，直接看图后把结论写进 Done；不要 Files.read_file 图片，那只会返回一长串编码。
 
+【对话】
+提示里可能附有【之前的对话】：同一个工作区里用户之前说过的话和你当时的回答。用户这次的话可能是接着说的——追问、补充、改要求、回答你上次的 Ask——按上下文理解，不要当成孤立的新任务。上面已经有的结论直接用，不要重新查一遍；工作区里的文件也还在。
+真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
+
 【你能用什么】
 只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
@@ -217,14 +221,51 @@ export type LastOutcome =
   | { kind: "model_error"; message: string }
   | null;
 
-export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome; plan?: PlanItem[]; check?: string | null; images?: string[]; visionFailed?: boolean };
+export type PromptContext = {
+  round: number;
+  segment: number;
+  remainingMs: number;
+  files: FileEntry[];
+  last: LastOutcome;
+  plan?: PlanItem[];
+  check?: string | null;
+  images?: string[];
+  visionFailed?: boolean;
+  history?: HistoryItem[];
+};
 
 export type FileEntry = { path: string; bytes: number; image?: boolean };
+
+/** An earlier exchange in the same desk: what the user said and how the run ended. */
+export type HistoryItem = { task: string; answer: string; status: RunStatus; asked?: boolean };
 
 const MAX_PROMPT = 24_000;
 const MAX_CONTEXT = 20_000;
 const FILES_LISTED = 60;
 const EFFECTS_LISTED = 14;
+export const HISTORY_SHOWN = 6;
+const HISTORY_TASK_CHARS = 240;
+const HISTORY_ANSWER_CHARS = 400;
+
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+// Earlier turns of the conversation, so a follow-up ("这是哪里", "再加一个",
+// the reply to an Ask) reads against what came before instead of alone.
+export function historyBlock(history: HistoryItem[]): string {
+  const shown = history.slice(-HISTORY_SHOWN);
+  if (shown.length === 0) return "";
+  const lines = shown.map((item) => {
+    const who = item.asked ? "你问" : item.status === "done" ? "你答" : item.status === "failed" ? "你（没做成）" : item.status === "paused" ? "你（没做完就停了）" : "你（被停下）";
+    return `用户：${clip(oneLine(item.task), HISTORY_TASK_CHARS)}\n${who}：${clip(oneLine(item.answer), HISTORY_ANSWER_CHARS) || "（没有回答）"}`;
+  });
+  const last = shown[shown.length - 1];
+  const tail = last?.asked
+    ? `上一次你在等用户回答「${clip(oneLine(last.answer), 200)}」。用户这次说的话就是回答：接着把那件事做完，不要再问一遍。`
+    : "用户这次说的话可能接着上面：「这个」「它」「刚才那个」「再」指的是上面的内容或工作区里的文件。上面已有的结论直接用。";
+  return `【之前的对话】（同一个工作区，最新在最后）\n${lines.join("\n")}\n${tail}`;
+}
 
 function kb(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -241,6 +282,8 @@ function effectLine(effect: { tool: string; detail: string; output: string }): s
 
 export function promptContext(ctx: PromptContext): string {
   const parts: string[] = [];
+  const history = ctx.history ? historyBlock(ctx.history) : "";
+  if (history) parts.push(history);
   const shown = ctx.files.slice(0, FILES_LISTED).map((file) => `- ${file.path}（${file.image ? "图片，" : ""}${kb(file.bytes)}）`);
   const more = ctx.files.length > FILES_LISTED ? `\n…共 ${ctx.files.length} 个文件` : "";
   parts.push(`【工作区现在有】\n${shown.length ? shown.join("\n") + more : "（空，还没有文件）"}`);
@@ -430,6 +473,8 @@ export type LoopDeps = {
   segment?: number;
   /** The plan and check state earlier segments left; a fresh run starts empty. */
   plan?: PlanState;
+  /** Earlier exchanges in this desk, oldest first, for follow-ups to read against. */
+  history?: HistoryItem[];
 };
 
 export async function runDeskLoop(
@@ -520,6 +565,7 @@ export async function runDeskLoop(
             check: plan.pending,
             images: shownImages.map((image) => image.path),
             visionFailed,
+            history: deps.history,
           });
           plan.pending = null;
           // A failed compile deserves a more careful second look.
@@ -816,6 +862,23 @@ function statusFor(result: DeskResult, events: AgentEvent[]): Exclude<RunStatus,
   return rounds && !stepped ? "failed" : "done";
 }
 
+// A run whose last completed step returned Ask is waiting on the user.
+function endedWithAsk(events: AgentEvent[]): boolean {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event?.kind === "step") return event.reply === "ask";
+  }
+  return false;
+}
+
+/** Earlier runs of the desk as conversation, oldest first; the current run and anything still running are left out. */
+export function historyFor(runs: RunRecord[], currentId: string): HistoryItem[] {
+  return runs
+    .filter((run) => run.id !== currentId && run.status !== "running" && run.result)
+    .slice(-HISTORY_SHOWN)
+    .map((run) => ({ task: run.task, answer: run.result?.answer ?? "", status: run.status, asked: run.result?.asked }));
+}
+
 async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
   const store = await import("./store.server.ts");
   const { runProgress } = await import("./progress.server.ts");
@@ -827,6 +890,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     const rounds = events.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds);
     const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
     const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched, plan: result.plan };
+    if (status === "done" && endedWithAsk(events)) outcome.asked = true;
     const saved = await store.writeDesk(desk.id, state);
     await store.finishRun(run.id, status, rounds, outcome);
     const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
@@ -853,6 +917,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     // step fail; leave it out of this run and say so, instead of spinning.
     const checked = desk.modules.length ? await verifyModuleSet(desk.modules) : { kept: desk.modules, dropped: [] };
     const budgetMs = Math.max(15_000, runBudgetMs() - (Date.now() - started));
+    const history = historyFor(await store.listRuns(desk.id), run.id);
     const result = await runDeskLoop(apiKey, run.task, desk.files, desk.harnesses, checked.kept, desk.journal, desk.memory, {
       runCore,
       runPayload,
@@ -863,6 +928,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
       roundBase: run.rounds,
       segment: run.segment,
       plan: run.result?.plan,
+      history,
     });
     await alive.stop();
     const events = runProgress.read(run.id).events;
@@ -898,7 +964,9 @@ export const startRun = createServerFn({ method: "POST" })
     const live = await store.activeRun(data.deskId);
     if (live?.status === "running") throw new Error("它还在做上一件事，做完再说下一件。");
     const run = await store.createRun(data.deskId, data.runId, data.task);
-    return runSegment(run, desk);
+    // The loop's journal and memory are one task's notes and resume point; a
+    // new task starts them clean and reads earlier tasks from the history instead.
+    return runSegment(run, { ...desk, journal: [], memory: "" });
   });
 
 export const continueRun = createServerFn({ method: "POST" })

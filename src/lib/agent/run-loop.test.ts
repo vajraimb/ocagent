@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { MAX_FILE_BYTES, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import type { AgentEventBody } from "./progress.ts";
 
@@ -449,4 +449,50 @@ test("after a vision refusal the next round tells the model it cannot see the pi
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test("earlier exchanges in the desk are shown to the model, and a pending Ask is marked as answered", async () => {
+  const texts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body)) as { input: { content: string }[] };
+    texts.push(body.input[0]!.content);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const frames = [okFrame("done", "好的，叫 notes.md")];
+  let i = 0;
+  try {
+    await runDeskLoop("key", "就叫 notes 吧", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: () => {},
+      budgetMs: 60_000,
+      history: [
+        { task: "查一下东京天气", answer: "东京今天大约 18–24°C，多云。", status: "done" },
+        { task: "把结果写成文件", answer: "文件叫什么名字？", status: "done", asked: true },
+      ],
+    });
+    const prompt = texts[0] ?? "";
+    assert.match(prompt, /【之前的对话】/);
+    assert.match(prompt, /用户：查一下东京天气\n你答：东京今天大约 18–24°C，多云。/);
+    assert.match(prompt, /你问：文件叫什么名字？/);
+    assert.match(prompt, /用户这次说的话就是回答/);
+    // The conversation comes before the workspace listing, as it reads in order.
+    assert.ok(prompt.indexOf("【之前的对话】") < prompt.indexOf("【工作区现在有】"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("historyFor leaves out the current run, running runs and runs without a result; keeps the newest", () => {
+  const run = (id: string, status: "done" | "running" | "failed", answer: string | null): RunRecord =>
+    ({ id, deskId: "desk-x", task: `t-${id}`, status, segment: 1, rounds: 1, events: [], result: answer === null ? null : { ok: true, answer, steps: [], touched: [] }, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null }) as RunRecord;
+  const runs = [run("a", "done", "A"), run("b", "failed", "B"), run("c", "done", null), run("d", "running", "D"), run("me", "done", "ME")];
+  const history = historyFor(runs, "me");
+  assert.deepEqual(history.map((item) => item.task), ["t-a", "t-b"]);
+  assert.equal(history[1]?.status, "failed");
+  const many = Array.from({ length: 10 }, (_, n) => run(`r${n}`, "done", `${n}`));
+  assert.equal(historyFor(many, "none").length, HISTORY_SHOWN);
+  assert.equal(historyFor(many, "none")[0]?.task, "t-r4");
+  assert.equal(historyBlock([]), "");
 });

@@ -12,7 +12,7 @@ export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: 
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
 
 // What a finished (or paused) run leaves behind besides its timeline.
-export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[]; plan?: PlanState };
+export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[]; plan?: PlanState; asked?: boolean };
 
 /** True when rows outlive this server instance (Neon), false on the embedded fallback. */
 export function isDurable(): boolean {
@@ -110,6 +110,7 @@ function outcomeOf(raw: unknown): RunOutcome | null {
   const outcome: RunOutcome = { ok: item.ok, answer: item.answer, steps: Array.isArray(item.steps) ? item.steps : [], touched: Array.isArray(item.touched) ? item.touched : [] };
   const plan = planOf(item.plan);
   if (plan) outcome.plan = plan;
+  if (item.asked === true) outcome.asked = true;
   return outcome;
 }
 
