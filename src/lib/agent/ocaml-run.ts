@@ -137,7 +137,18 @@ export type RunHooks = {
   modules?: () => DeskModule[];
   onModule?: (mod: DeskModule) => void;
   onUnload?: (name: string) => void;
+  // Files as they were when the task began, for the ones it has changed so
+  // far (null: did not exist). A step can Files.restore any of them, and
+  // onOrigin records the pre-step content of a file the step changed first.
+  origin?: () => OriginMap;
+  onOrigin?: (path: string, content: string | null) => void;
 };
+
+/** Task-start content by path for files the task changed; null when the file did not exist. */
+export type OriginMap = Record<string, string | null>;
+
+// Tools that change a file in the workspace, as logged in a step's effects.
+export const FILE_CHANGES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Files.restore"]);
 
 export function renderModules(mods: DeskModule[]): string {
   return mods.map((mod) => `module ${mod.name} = struct\n${mod.body}\nend\n`).join("\n");
@@ -155,7 +166,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -1043,6 +1054,56 @@ module Files = struct
     in
     log_effect "Files.append" path (match result with Ok () -> "Ok" | Error e -> "Error " ^ e);
     result
+
+  (* Files as they were when this task began sit under ocagent_origin/ (only
+     those the task has changed so far); a path listed in ocagent_origin_absent
+     did not exist then. *)
+  let restore path =
+    let result =
+      if not files_on then Error "文件没开"
+      else if not (safe_rel path) then Error "路径不行"
+      else
+        let src = Filename.concat "ocagent_origin" path in
+        let absent =
+          match (try Some (slurp "ocagent_origin_absent") with Sys_error _ -> None) with
+          | None -> false
+          | Some listed -> List.mem path (String.split_on_char '\\n' listed)
+        in
+        if Sys.file_exists src then (
+          mkdir_p (Filename.dirname path);
+          let oc = open_out path in
+          Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc (slurp src));
+          Ok "已退回任务开始时的版本")
+        else if absent then (
+          (try Sys.remove path with Sys_error _ -> ());
+          Ok "任务开始时没有这个文件，已删掉")
+        else if Sys.file_exists path then Ok "这次任务没改过它，现在就是开始时的版本"
+        else Error "没有这个文件，任务开始时也没有"
+    in
+    log_effect "Files.restore" path (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
+end
+
+(* Assertions: each one is written to the timeline as 通过 / 没通过, so a
+   Done backed by passing checks needs no extra check round, and a Done with a
+   failing one is sent back. *)
+module Check = struct
+  let that cond desc =
+    log_effect "Check.that" desc (if cond then "通过" else "没通过");
+    cond
+
+  let equal expected actual desc =
+    let ok = expected = actual in
+    log_effect "Check.equal" desc (if ok then "通过" else "没通过：期望 " ^ clip_ends (one_line expected) 120 ^ "，实际 " ^ clip_ends (one_line actual) 120);
+    ok
+
+  let contains path needle =
+    let ok =
+      files_on && safe_rel path && needle <> ""
+      && (match (try Some (slurp path) with Sys_error _ -> None) with Some text -> count_sub text needle > 0 | None -> false)
+    in
+    log_effect "Check.contains" (path ^ " 含 " ^ clip_ends (one_line needle) 80) (if ok then "通过" else if not (Sys.file_exists path) then "没通过：没有这个文件" else "没通过：文件里没有这段");
+    ok
 end
 
 module Json = struct
@@ -1403,6 +1464,20 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       await mkdir(path.dirname(target), { recursive: true });
       await writeFile(target, file.content, "utf8");
     }
+    const origin = hooks?.origin?.() ?? {};
+    const absent: string[] = [];
+    for (const [rel, content] of Object.entries(origin)) {
+      if (!safePath(rel)) continue;
+      if (content === null) {
+        absent.push(rel);
+        continue;
+      }
+      const target = path.resolve(dir, "ocagent_origin", rel);
+      if (!target.startsWith(path.join(dir, "ocagent_origin") + path.sep)) continue;
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, "utf8");
+    }
+    if (absent.length) await writeFile(path.join(dir, "ocagent_origin_absent"), absent.join("\n"), "utf8");
     const loaded = hooks?.modules?.() ?? [];
     await writeFile(
       path.join(dir, "ocagent_api.ml"),
@@ -1450,6 +1525,18 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
       .map((line) => line.split("\t")[2] ?? "")
       .filter(Boolean)
       .join("\n");
+    // The first change to a file in this task: remember what it was before,
+    // so a later step can step back to it.
+    if (hooks?.onOrigin) {
+      const before = new Map(files.map((file) => [file.path, file.content]));
+      for (const line of effectText.split("\n")) {
+        const [tool = "", detail = "", ...rest] = line.split("\t");
+        if (!FILE_CHANGES.has(tool) || tool === "Files.restore" || !rest.join("\t").startsWith("Ok")) continue;
+        if (detail in origin) continue;
+        origin[detail] = before.get(detail) ?? null;
+        hooks.onOrigin(detail, origin[detail]);
+      }
+    }
     const written = await collectFiles(dir);
     let body = `ok\n${kind}\n${encodeBlock(text)}${encodeBlock(traces)}${encodeBlock(effectText.trim())}${written.length}\n`;
     for (const file of written) body += `${file.path}\n${encodeBlock(file.content)}`;

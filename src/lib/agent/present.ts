@@ -158,6 +158,14 @@ export function holdDone(raw: string): string | null {
   return writeFrame({ ...frame, kind: "continue" });
 }
 
+// Rewrites a step frame's reply kind and/or text, keeping its effects and the
+// workspace it carries; null when the frame cannot be read.
+export function patchFrame(raw: string, patch: { kind?: string; text?: string }): string | null {
+  const frame = readFrame(raw);
+  if (!frame) return null;
+  return writeFrame({ ...frame, kind: patch.kind ?? frame.kind, text: patch.text ?? frame.text });
+}
+
 export function rewriteStep(raw: string, task: string, redirects: number): { raw: string; usedRedirect: boolean } {
   const frame = readFrame(raw);
   if (!frame) return { raw, usedRedirect: false };

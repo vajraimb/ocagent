@@ -7,6 +7,7 @@ import type { AgentEvent } from "@/lib/agent/progress";
 import {
   MAX_FILE_BYTES,
   MAX_WORKSPACE_BYTES,
+  carriesOn,
   clearDesk,
   continueRun,
   getRun,
@@ -34,8 +35,9 @@ const DESK_KEY = "ocagent-desk-id";
 const CACHE_KEY = "ocagent-desk-v8";
 const LEGACY_KEYS = ["ocagent-desk-v7", "ocagent-desk-v6", "ocagent-desk-v5"];
 const PREFAB = new Set(["README.md", "src/math.ml", "src/greet.ml", "notes/todo.md"]);
-const MAX_SEGMENTS = 6;
 const RECOVER_MS = 120_000;
+// How long the page waits for the server to continue a paused run on its own.
+const CARRY_GRACE_MS = 8_000;
 const RUNS_CACHED = 12;
 const EVENTS_CACHED = 80;
 
@@ -196,24 +198,6 @@ function turnOf(run: RunRecord): AgentTurnData {
   };
 }
 
-// Whether the latest segment got somewhere: a segment that spent its whole
-// budget without one completed step would just spin again.
-function segmentProgressed(run: RunRecord): boolean {
-  const events = run.events;
-  let start = 0;
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    if (events[i]?.kind === "start") {
-      start = i;
-      break;
-    }
-  }
-  return events.slice(start).some((event) => event.kind === "step" || event.kind === "effect");
-}
-
-function shouldCarryOn(run: RunRecord): boolean {
-  return run.status === "paused" && run.segment < MAX_SEGMENTS && segmentProgressed(run);
-}
-
 // The newest run that stopped short of an answer gets a one-tap follow-up.
 function unfinished(run: RunRecord): boolean {
   if (run.status === "stopped" || run.status === "failed" || run.status === "paused") return true;
@@ -281,9 +265,14 @@ export function Workbench() {
   // Runs whose request died mid-flight; polling keeps looking for them on the
   // server until the deadline, then they are marked failed with this message.
   const recovering = useRef(new Map<string, { until: number; message: string }>());
+  // Runs that paused for time: the server continues them by itself, and the
+  // page watches; if the next segment has not shown up after a grace period,
+  // the page asks for it (whoever asks first gets it, so this is safe).
+  const awaiting = useRef(new Map<string, { segment: number; since: number }>());
   const input = useRef<HTMLTextAreaElement>(null);
   // drive (send a segment) and absorb (take its reply) call each other — a
-  // paused segment starts the next one — so each is reached through a ref.
+  // paused segment the server did not pick up starts the next one — so each
+  // is reached through a ref.
   const absorbRef = useRef<(reply: RunReply) => void>(() => {});
   const driveRef = useRef<(runId: string, call: () => Promise<RunReply>) => Promise<void>>(async () => {});
   const live = runs.find((run) => run.status === "running") ?? null;
@@ -406,7 +395,10 @@ export function Workbench() {
         setRuns(loaded.runs);
         const open = loaded.runs.find((run) => run.status === "running" || run.status === "paused");
         if (open?.status === "running") setDriving(open.id);
-        else if (open && shouldCarryOn(open)) void driveRef.current(open.id, () => continueRun({ data: { runId: open.id, after: 0 } }));
+        else if (open && carriesOn(open)) {
+          awaiting.current.set(open.id, { segment: open.segment, since: Date.now() });
+          setDriving(open.id);
+        }
       } catch (caught) {
         if (!cancelled) setNotice(`读取工作区失败：${caught instanceof Error ? caught.message : "连不上服务器"}`);
       }
@@ -494,7 +486,7 @@ export function Workbench() {
       recovering.current.delete(reply.run.id);
       // A segment that only paused is followed by the next one right away, so
       // the page keeps showing the run as live rather than flashing "没做完".
-      const carryOn = shouldCarryOn(reply.run);
+      const carryOn = carriesOn(reply.run);
       setRuns((current) => {
         const known = current.find((run) => run.id === reply.run.id);
         const events = known && known.events.length > reply.run.events.length ? known.events : reply.run.events;
@@ -506,9 +498,10 @@ export function Workbench() {
       else setSelected((current) => (reply.desk.files.some((item) => item.path === current) ? current : ""));
       if (reply.run.status === "running") return;
       if (carryOn) {
-        void driveRef.current(reply.run.id, () => continueRun({ data: { runId: reply.run.id, after: 0 } }));
+        awaiting.current.set(reply.run.id, { segment: reply.run.segment, since: Date.now() });
         return;
       }
+      awaiting.current.delete(reply.run.id);
       setDriving((current) => (current === reply.run.id ? null : current));
     },
     [absorbDesk],
@@ -542,7 +535,21 @@ export function Workbench() {
           const fresh = snapshot.events;
           patchRun(runId, (run) => ({ ...run, events: mergeEvents(run.events, fresh) }));
         }
-        if (snapshot.done && snapshot.reply) absorbRef.current(snapshot.reply);
+        if (!snapshot.done) {
+          awaiting.current.delete(runId);
+          return;
+        }
+        if (!snapshot.reply) return;
+        const waiting = awaiting.current.get(runId);
+        if (waiting && snapshot.reply.run.status === "paused" && snapshot.reply.run.segment === waiting.segment) {
+          // Still paused where we left it: give the server its grace, then ask.
+          if (Date.now() - waiting.since >= CARRY_GRACE_MS) {
+            awaiting.current.delete(runId);
+            void driveRef.current(runId, () => continueRun({ data: { runId, after: 0 } }));
+          }
+          return;
+        }
+        absorbRef.current(snapshot.reply);
       } catch {
         /* a missed poll only delays the timeline; the run itself continues */
       }
@@ -588,6 +595,7 @@ export function Workbench() {
 
   function resumeRun(runId: string) {
     if (running) return;
+    awaiting.current.delete(runId);
     void drive(runId, () => continueRun({ data: { runId, after: 0 } }));
   }
 

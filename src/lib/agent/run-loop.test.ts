@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, readBackInStep, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, MAX_SEGMENTS, assertedInStep, carriesOn, historyBlock, historyFor, mergeModules, missingInput, parseDeskState, promptContext, readBackInStep, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
-import type { AgentEventBody } from "./progress.ts";
+import { boundOrigin, type AgentEvent, type AgentEventBody } from "./progress.ts";
 
 const block = (text: string) => `${Buffer.byteLength(text)}\n${text}\n`;
 const okFrame = (reply: string, text: string, effects = "") => `ok\n${reply}\n${block(text)}${block("")}${block(effects)}0\n`;
@@ -502,7 +502,7 @@ test("a continued segment inherits the plan and does not check twice", async () 
     budgetMs: 60_000,
     roundBase: 3,
     segment: 2,
-    plan: { items: [{ text: "写 a.ml", done: true, note: "" }, { text: "写 b.ml", done: false, note: "" }], checks: 1, wrote: true, pending: null },
+    plan: { items: [{ text: "写 a.ml", done: true, note: "" }, { text: "写 b.ml", done: false, note: "" }], checks: 1, wrote: true, pending: null, failed: [], written: [], origin: {} },
   });
   assert.equal(result.ok, true);
   assert.equal(i, 1, "the Done went straight through");
@@ -661,4 +661,223 @@ test("Memory.remember adds to the desk's notes: shown to the model next round, i
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// A frame whose step wrote files, with their contents, so the run can look at them.
+const okFrameWithFiles = (reply: string, text: string, effects: string, files: { path: string; content: string }[]) =>
+  `ok\n${reply}\n${block(text)}${block("")}${block(effects)}${files.length}\n${files.map((file) => `${file.path}\n${block(file.content)}`).join("")}`;
+
+function capturing(contexts: string[]) {
+  return (async (_url: unknown, init?: RequestInit) => {
+    contexts.push(JSON.parse(String(init?.body)).input[0].content as string);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+}
+
+test("a Done backed by passing assertions goes straight through; the check prompt asks for assertions and names the files written", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  try {
+    // Assertions in the Done step itself: no check round.
+    const asserted = [okFrame("done", "写好了", "Files.write_file\ta.ml\tOk\nCheck.contains\ta.ml 含 let x\t通过\nCheck.that\t有两行\t通过")];
+    let i = 0;
+    const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(asserted),
+      runPayload: async () => asserted[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(i, 1);
+    assert.ok(!events.some((event) => event.kind === "check"));
+    assert.ok(assertedInStep([{ tool: "Check.that", detail: "d", output: "通过" }]));
+    assert.ok(!assertedInStep([{ tool: "Check.that", detail: "d", output: "通过" }, { tool: "Check.equal", detail: "e", output: "没通过：期望 1，实际 2" }]));
+    assert.ok(!assertedInStep([{ tool: "Files.read_file", detail: "a", output: "Ok" }]));
+    // No assertion and no read-back: held, and the check prompt lists what to assert about.
+    contexts.length = 0;
+    const plain = [okFrame("done", "写好了 b.ml", "Files.write_file\tb.ml\tOk"), okFrame("done", "核对过", "Check.contains\tb.ml 含 let y\t通过")];
+    let j = 0;
+    const held = await runDeskLoop("key", "task", [], ["ocaml", "files"], [{ name: "Fib", body: "let fib n = n" }], [], "", {
+      runCore: replyAwareCore(plain),
+      runPayload: async () => plain[j++] ?? okFrame("done", "x"),
+      emit: () => {},
+      budgetMs: 60_000,
+    });
+    assert.equal(held.ok, true);
+    assert.equal(j, 2);
+    assert.match(contexts[1] ?? "", /【收尾前核对】[\s\S]*Check\.contains[\s\S]*这次任务写过的文件：b\.ml[\s\S]*装着的 module：Fib/);
+    assert.deepEqual(held.plan.written, ["b.ml"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a Done with a failing assertion is sent back to fix it, at most twice; after that the answer says what failed", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  const failing = "Files.write_file\tc.md\tOk\nCheck.contains\tc.md 含 第二节\t没通过：文件里没有这段";
+  const frames = [okFrame("done", "写好了 c.md", failing), okFrame("done", "还是写好了", failing), okFrame("done", "我说写好了", failing)];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    assert.equal(i, 3, "held twice, the third Done went through");
+    const checks = events.filter((event) => event.kind === "check");
+    assert.equal(checks.length, 2);
+    assert.deepEqual(checks[0]?.kind === "check" ? checks[0].failed : [], ["c.md 含 第二节"]);
+    assert.match(contexts[1] ?? "", /【核对没通过，不能这样结束】[\s\S]*「c\.md 含 第二节」[\s\S]*Files\.restore/);
+    assert.match(contexts[2] ?? "", /【核对没通过，不能这样结束】/);
+    const steps = events.filter((event) => event.kind === "step");
+    assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["continue", "continue", "done"]);
+    const last = steps[steps.length - 1];
+    assert.match(last?.kind === "step" ? last.text : "", /我说写好了\n\n（有 1 条核对没通过：c\.md 含 第二节）/);
+    assert.equal(result.plan.checks, 2);
+    // A failing assertion in a Continue step gets a retreat hint next round.
+    contexts.length = 0;
+    const retreat = [okFrame("continue", "改了一半", "Files.replace\td.md\tOk 替换了 1 处\nCheck.contains\td.md 含 标题\t没通过：文件里没有这段"), okFrame("done", "好", "Check.contains\td.md 含 标题\t通过")];
+    let j = 0;
+    await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(retreat),
+      runPayload: async () => retreat[j++] ?? okFrame("done", "x"),
+      emit: () => {},
+      budgetMs: 60_000,
+    });
+    assert.match(contexts[1] ?? "", /有 1 条断言没通过[\s\S]*Files\.restore 退回那个文件重做/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("the origin of a changed file is kept for Files.restore, bounded, and carried across segments", async () => {
+  const frames = [okFrameWithFiles("done", "改好了", "Files.replace\tnotes.md\tOk 替换了 1 处\nCheck.contains\tnotes.md 含 新\t通过", [{ path: "notes.md", content: "新" }])];
+  let i = 0;
+  const result = await runDeskLoop("key", "task", [{ path: "notes.md", content: "旧" }], ["ocaml", "files"], [], [], "", {
+    runCore: replyAwareCore(frames),
+    runPayload: async (_payload, _harnesses, _key, hooks) => {
+      // What the runner does: the first change to a file records its pre-step content.
+      assert.deepEqual(hooks?.origin?.(), {});
+      hooks?.onOrigin?.("notes.md", "旧");
+      hooks?.onOrigin?.("new.md", null);
+      hooks?.onOrigin?.("notes.md", "不该覆盖");
+      return frames[i++] ?? okFrame("done", "x");
+    },
+    emit: () => {},
+    budgetMs: 60_000,
+  });
+  assert.deepEqual(result.plan.origin, { "notes.md": "旧", "new.md": null });
+  const big = "x".repeat(200 * 1024);
+  const bounded = boundOrigin({ "a.txt": big, "b.txt": big, "c.txt": "small", "d.txt": null });
+  const kept = Object.keys(bounded).sort();
+  assert.equal(kept.length, 3, "one of the two big files had to go");
+  assert.ok(kept.includes("c.txt") && kept.includes("d.txt"));
+});
+
+test("the real runner: Check.* verdicts land in the effects, and Files.restore steps a file back to how the task found it", async () => {
+  const { runStep } = await import("./ocaml-run.ts");
+  const files = [{ path: "notes.md", content: "第一节\n改坏了\n" }, { path: "extra.md", content: "多出来的" }];
+  const source = `module Step : STEP = struct
+  let run () =
+    let a = Check.contains "notes.md" "第一节" in
+    let b = Check.contains "notes.md" "第二节" in
+    let c = Check.that (1 + 1 = 2) "一加一等于二" in
+    let d = Check.equal "a" "b" "字母相同" in
+    match Files.restore "notes.md", Files.restore "extra.md", Files.restore "untouched.md" with
+    | Ok _, Ok _, Error _ ->
+        let back = Check.contains "notes.md" "原来的" in
+        let gone = match Files.read_file "extra.md" with Error _ -> true | Ok _ -> false in
+        Continue (Printf.sprintf "%b %b %b %b %b %b" a b c d back gone)
+    | _ -> Partial "restore 不对"
+end`;
+  const payload = `${block(source)}${files.length}\n${files.map((file) => `${file.path}\n${block(file.content)}`).join("")}`;
+  const origin = { "notes.md": "第一节\n原来的\n", "extra.md": null };
+  const recorded: [string, string | null][] = [];
+  const raw = await runStep(payload, ["ocaml", "files"], undefined, { origin: () => ({ ...origin }), onOrigin: (path, content) => recorded.push([path, content]) });
+  const { describeStepFrame } = await import("./progress.ts");
+  const frame = describeStepFrame(raw);
+  assert.ok(frame && frame.kind === "ok", raw.slice(0, 400));
+  if (!frame || frame.kind !== "ok") return;
+  assert.equal(frame.text, "true false true false true true");
+  const verdicts = frame.effects.filter((effect) => effect.tool.startsWith("Check.")).map((effect) => [effect.tool, effect.detail, effect.output.startsWith("通过")]);
+  assert.deepEqual(verdicts, [
+    ["Check.contains", "notes.md 含 第一节", true],
+    ["Check.contains", "notes.md 含 第二节", false],
+    ["Check.that", "一加一等于二", true],
+    ["Check.equal", "字母相同", false],
+    ["Check.contains", "notes.md 含 原来的", true],
+  ]);
+  const restored = frame.effects.filter((effect) => effect.tool === "Files.restore").map((effect) => effect.output);
+  assert.match(restored[0] ?? "", /^Ok 已退回任务开始时的版本/);
+  assert.match(restored[1] ?? "", /^Ok 任务开始时没有这个文件，已删掉/);
+  assert.match(restored[2] ?? "", /^Error 没有这个文件/);
+  assert.deepEqual(frame.files?.map((file) => [file.path, file.content]), [["notes.md", "第一节\n原来的\n"]]);
+  // Restoring is not a first change, so nothing new is recorded as origin.
+  assert.deepEqual(recorded, []);
+  // A first write to a file the task had not touched records what it was.
+  const first = `module Step : STEP = struct let run () = (match Files.write_file "fresh.md" "新" with Ok () -> () | Error _ -> ()); (match Files.append "notes.md" "尾巴" with Ok () -> () | Error _ -> ()); Continue "w" end`;
+  const payload2 = `${block(first)}${files.length}\n${files.map((file) => `${file.path}\n${block(file.content)}`).join("")}`;
+  const seen: [string, string | null][] = [];
+  await runStep(payload2, ["ocaml", "files"], undefined, { origin: () => ({}), onOrigin: (path, content) => seen.push([path, content]) });
+  assert.deepEqual(seen, [["fresh.md", null], ["notes.md", "第一节\n改坏了\n"]]);
+});
+
+test("a task about 我的… answered with a placeholder becomes an Ask, unless the desk already knows the fact", async () => {
+  const written = [{ path: "README.md", content: "# <名字> 的主页\n" }];
+  const placeholder = okFrameWithFiles("done", "已写下 README.md，标题处留了名字的位置", "Files.write_file\tREADME.md\tOk\nCheck.contains\tREADME.md 含 主页\t通过", written);
+  const events: AgentEventBody[] = [];
+  let i = 0;
+  const asked = await runDeskLoop("key", "把我的名字写进 README.md 的标题", [], ["ocaml", "files"], [], [], "", {
+    runCore: replyAwareCore([placeholder]),
+    runPayload: async () => (i++ === 0 ? placeholder : okFrame("done", "x")),
+    emit: (event) => events.push(event),
+    budgetMs: 60_000,
+  });
+  assert.equal(asked.ok, true);
+  assert.equal(i, 1);
+  const need = events.find((event) => event.kind === "need_input");
+  assert.ok(need && need.kind === "need_input");
+  assert.deepEqual(need.topics, ["名字"]);
+  const step = events.find((event) => event.kind === "step");
+  assert.equal(step?.kind === "step" ? step.reply : "", "ask");
+  assert.match(step?.kind === "step" ? step.text : "", /还差一样只有你知道的：你的名字/);
+  // The frame handed back to the loop is an Ask too, so the run ends waiting on the user.
+  assert.match(asked.answer, /^ok\nask\n/);
+  // Known from the conversation: no question.
+  events.length = 0;
+  i = 0;
+  const known = await runDeskLoop("key", "把我的名字写进 README.md 的标题", [], ["ocaml", "files"], [], [], "", {
+    runCore: replyAwareCore([placeholder]),
+    runPayload: async () => (i++ === 0 ? placeholder : okFrame("done", "x")),
+    emit: (event) => events.push(event),
+    budgetMs: 60_000,
+    history: [{ task: "我叫小王", answer: "记住了", status: "done" }],
+  });
+  assert.equal(known.ok, true);
+  assert.ok(!events.some((event) => event.kind === "need_input"));
+  // The pure check: topics, placeholders, what counts as known.
+  assert.equal(missingInput("查一下东京天气", "18°C", [], ""), null);
+  assert.equal(missingInput("把我的城市写进简介", "已写入：你住在东京", [], ""), null, "no placeholder: nothing to ask");
+  assert.deepEqual(missingInput("把我的城市和我的名字写进简介", "写好了", [{ path: "bio.md", content: "我是 [名字]，住在 your_city" }], "")?.topics, ["城市", "名字"]);
+  assert.deepEqual(missingInput("把我的城市和我的名字写进简介", "写好了", [{ path: "bio.md", content: "我是 [名字]，住在 your_city" }], "用户在东京")?.topics, ["名字"]);
+  assert.equal(missingInput("把我的名字写进去", "写好了，名字做成了参数 name", [], "我叫小王"), null);
+});
+
+test("carriesOn: a paused run continues by itself while it makes progress and has segments left", () => {
+  const base: RunRecord = { id: "run-aaaaaaaaaa", deskId: "desk-aaaaaaaaaa", task: "t", status: "paused", segment: 1, rounds: 3, events: [], result: null, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null };
+  const progressed: AgentEvent[] = [
+    { kind: "start", task: "t", seq: 1, at: 0 },
+    { kind: "step", round: 1, reply: "continue", text: "", seq: 2, at: 0 },
+  ];
+  assert.equal(carriesOn({ ...base, events: progressed }), true);
+  assert.equal(carriesOn({ ...base, events: [{ kind: "start", task: "t", seq: 1, at: 0 }, { kind: "think", round: 1, seq: 2, at: 0 }] }), false, "a segment that did nothing would just spin");
+  assert.equal(carriesOn({ ...base, events: progressed, segment: MAX_SEGMENTS }), false);
+  assert.equal(carriesOn({ ...base, events: progressed, status: "done" }), false);
+  assert.equal(MAX_SEGMENTS, 10);
 });

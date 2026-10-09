@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
-import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
-import { applyMemoryEffects, applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isMemoryEffect, isPlanEffect, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
+import { holdDone, patchFrame, presentAnswer, rewriteStep } from "./present.ts";
+import { applyMemoryEffects, applyPlanEffects, boundOrigin, checkVerdicts, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isCheckEffect, isMemoryEffect, isPlanEffect, MAX_WRITTEN_LISTED, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
@@ -92,7 +92,7 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 任务里出现"我的名字""我的城市""我的……"这类只有用户知道、结果里又必须用到的内容，而【记住的】和【之前的对话】里都没有时，就 Ask 一句问清楚，不要用占位符、示例值或改成参数来绕过——那样做出来的不是用户要的。
 
 【你能用什么】
-只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
@@ -102,7 +102,8 @@ Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执�
 - 一步做不完的任务，第 1 轮先 Plan.set ["第一件事"; "第二件事"; …]（2–6 条，每条一句话），并在同一步做第一件事。一步能做完的任务不用计划。
 - 做完一项就 Plan.tick n "结果里的关键值"（n 从 1 数起）。计划会原样附在每一轮的提示里，带上勾选状态，不必再用 Trace.note 重复。
 - 计划要改就再 Plan.set 一次：文字没变的项保留勾选。
-- Done 之前先核对：读一遍写出的文件，或用装好的 module 算一个已知值，确认任务要的都在了，再 Done。写过文件的任务，第一次 Done 会被拦下来再给一轮核对；核对过了就正常 Done，不会再拦。
+- Done 之前先核对，用断言写：Check.contains "path" "必须出现的内容"、Check.that (条件) "一句话说明"、Check.equal 期望 实际 "说明"，每条都返回 bool 并记进时间线（通过 / 没通过）。Done 的那一步里有断言且全部通过，就直接结束；写过文件却一条断言都没有（也没读回来看），第一次 Done 会被拦下来再给一轮核对；有断言没通过的 Done 也会被拦回去先修。
+- 改坏了、方向错了，用 Files.restore "path" 把那个文件退回任务开始时的版本再来，不要在坏掉的内容上继续补。
 - 每一轮的提示末尾会附上：工作区现在的文件列表、上一步每次调用的返回值、计划、还剩多少时间。更早几轮的返回只留在 note 和计划的 tick 里。
 
 【harness：把代码装成可复用的 module】
@@ -127,6 +128,13 @@ module Files : sig
   val replace : string -> string -> string -> int res
   val append : string -> string -> unit res
   val delete_file : string -> unit res
+  val restore : string -> string res
+end
+
+module Check : sig
+  val that : bool -> string -> bool
+  val equal : string -> string -> string -> bool
+  val contains : string -> string -> bool
 end
 
 module Json : sig
@@ -207,7 +215,17 @@ let ring name = Printf.sprintf "%s: ring!" name
 |} in
     match Files.write_file "alarm.ml" body with
     | Error e -> Partial ("写入失败：" ^ e)
-    | Ok () -> Done "已写下 alarm.ml，里面有 ring。"
+    | Ok () ->
+        if Check.contains "alarm.ml" "let ring" then Done "已写下 alarm.ml，里面有 ring。"
+        else Partial "alarm.ml 写了，但里面没有 ring，没做成。"
+end
+
+【示例：改坏了就退回去】
+module Step : STEP = struct
+  let run () =
+    match Files.restore "notes.md" with
+    | Error e -> Partial ("退不回去：" ^ e)
+    | Ok _ -> Continue "notes.md 已退回开始时的版本，下一步只改第 2 节"
 end
 
 【示例：写一个 module 并装成 harness】
@@ -249,6 +267,11 @@ export type PromptContext = {
   last: LastOutcome;
   plan?: PlanItem[];
   check?: string | null;
+  /** Assertions that failed in the held Done. */
+  checkFailed?: string[];
+  /** Files the task has written so far, and the modules loaded, for the check prompt. */
+  written?: string[];
+  modules?: string[];
   images?: string[];
   visionFailed?: boolean;
   history?: HistoryItem[];
@@ -317,7 +340,9 @@ export function promptContext(ctx: PromptContext): string {
   } else if (last?.kind === "ran") {
     const lines = last.effects.slice(0, EFFECTS_LISTED).map(effectLine);
     const extra = last.effects.length > EFFECTS_LISTED ? `\n…还有 ${last.effects.length - EFFECTS_LISTED} 次调用` : "";
-    parts.push(`【上一步（第 ${last.round} 轮）执行了，返回 ${last.reply}${last.text.trim() ? `：${clip(last.text.trim(), 300)}` : ""}】\n${lines.length ? lines.join("\n") + extra : "（没有任何调用）"}`);
+    const failedNow = last.effects.filter((effect) => isCheckEffect(effect.tool) && !effect.output.startsWith("通过"));
+    const retreat = failedNow.length && last.reply === "continue" ? `\n有 ${failedNow.length} 条断言没通过。先想清楚是改错了还是没改到：改错了就 Files.restore 退回那个文件重做，别在错的基础上继续堆。` : "";
+    parts.push(`【上一步（第 ${last.round} 轮）执行了，返回 ${last.reply}${last.text.trim() ? `：${clip(last.text.trim(), 300)}` : ""}】\n${lines.length ? lines.join("\n") + extra : "（没有任何调用）"}${retreat}`);
   } else if (last?.kind === "runner_failed") {
     parts.push(`【上一步没有跑起来】\n${clip(last.message, 600)}`);
   } else if (last?.kind === "model_error") {
@@ -337,9 +362,18 @@ export function promptContext(ctx: PromptContext): string {
   }
   if (ctx.check) {
     const open = ctx.plan?.flatMap((item, index) => (item.done ? [] : [`${index + 1}. ${item.text}`])) ?? [];
-    parts.push(
-      `【收尾前核对】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」。上一步的修改都已经生效（结果在【上一步】里），不要再做一遍——再 replace 同一段旧文本会因为已经改过而找不到。这一步只核对：读一遍写出的文件、或用装好的 module 算一个已知的值，确认任务要的都在、内容没错。${open.length ? `计划里还有没打勾的：${open.join("；")}——做完或说明为什么不用做。` : ""}核对没问题，就在核对的同一步 Done，答案可以修正；发现遗漏就补上再 Done。这次不会再被拦。`,
-    );
+    const failed = ctx.checkFailed ?? [];
+    const written = (ctx.written ?? []).slice(-MAX_WRITTEN_LISTED);
+    const targets = [written.length ? `这次任务写过的文件：${written.join("、")}` : "", ctx.modules?.length ? `装着的 module：${ctx.modules.join("、")}` : ""].filter(Boolean).join("；");
+    if (failed.length) {
+      parts.push(
+        `【核对没通过，不能这样结束】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」，但这些断言没通过：${failed.map((item) => `「${clip(item, 160)}」`).join("、")}。这一步先修：改坏了就 Files.restore "path" 退回任务开始时的版本重做，缺内容就补上；然后把同样的断言再写一遍，全部通过才 Done。真做不成，就用 Partial 说清楚哪一条做不到，不要把没通过的当做完。`,
+      );
+    } else {
+      parts.push(
+        `【收尾前核对】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」。上一步的修改都已经生效（结果在【上一步】里），不要再做一遍——再 replace 同一段旧文本会因为已经改过而找不到。这一步用断言核对：对任务要求的每一点写一条 Check.contains "path" "必须出现的内容"（文件）、Check.that (条件) "说明" 或 Check.equal 期望 实际 "说明"（装好的 module 算一个已知值），每条的通过 / 没通过都会记进时间线。${targets ? `${targets}。` : ""}${open.length ? `计划里还有没打勾的：${open.join("；")}——做完或说明为什么不用做。` : ""}断言全部通过，就在同一步 Done，答案可以修正；有没通过的，就在同一步修好再 Done，或 Partial 说明。`,
+      );
+    }
   }
   const seconds = Math.max(0, Math.round(ctx.remainingMs / 1000));
   const segment = ctx.segment > 1 ? `这是接着上一段继续的第 ${ctx.segment} 段。` : "";
@@ -484,6 +518,8 @@ export type RunHooks = {
   modules?: () => DeskModule[];
   onModule?: (mod: DeskModule) => void;
   onUnload?: (name: string) => void;
+  origin?: () => Record<string, string | null>;
+  onOrigin?: (path: string, content: string | null) => void;
 };
 
 // Verified loads win over the loop's own bookkeeping for the same name, and
@@ -505,8 +541,69 @@ const MAX_COMPILE_STALL = 4;
 const MAX_IDLE_STALL = 5;
 const MAX_RUNNER_STALL = 2;
 // Effects that change the desk: a run that did any of these gets a check round.
-const WRITES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Harness.load", "Harness.install"]);
-const FILE_WRITES = new Set(["Files.write_file", "Files.replace", "Files.append"]);
+const WRITES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.delete_file", "Files.restore", "Harness.load", "Harness.install"]);
+const FILE_WRITES = new Set(["Files.write_file", "Files.replace", "Files.append", "Files.restore"]);
+
+// A Done can be held for a check at most this many times in a run: once for
+// having no check at all, once more for a check that failed.
+const MAX_CHECK_HOLDS = 2;
+
+// True when the step asserted something about its work (Check.*) and every
+// assertion passed: the model checked itself, so no check round is needed.
+export function assertedInStep(effects: { tool: string; detail: string; output: string }[]): boolean {
+  const verdicts = checkVerdicts(effects);
+  return verdicts.length > 0 && verdicts.every((item) => item.ok);
+}
+
+// ---------------------------------------------------------------------------
+// Placeholder detection. A task about "我的名字 / 我的城市 …" needs a fact only
+// the user has. When the answer or a written file carries a stand-in instead
+// (your_name, <名字>, 某某, a parameter to fill in later) and nothing the desk
+// remembers or the conversation said supplies it, the Done becomes an Ask.
+
+const TOPICS = "名字|姓名|城市|生日|地址|公司|邮箱|电话|手机号|年龄|家乡|学校|职业|微信|网站|昵称|公众号|博客|团队|产品|项目名";
+const PERSONAL = new RegExp(`我的\\s*(${TOPICS})`, "g");
+// Mentions of the topic that do not supply it: the ask itself, and our own question.
+const TOPIC_MENTION = new RegExp(`(我的|你的|您的)\\s*(${TOPICS})|还差一样只有你知道的[^\\n]*`, "g");
+// Words that would supply the fact when they appear in notes or the conversation.
+const SUPPLIED: Record<string, RegExp> = {
+  名字: /叫|名字|姓名|我是/,
+  姓名: /叫|名字|姓名|我是/,
+  昵称: /叫|昵称|名字/,
+  城市: /城市|在\S{1,6}(市|区|县)|住在|我在|来自|家在|定居|搬到|北京|上海|深圳|广州|杭州|成都|武汉|南京|西安|重庆|苏州|香港|台北|东京|大阪|首尔|新加坡|纽约|伦敦|巴黎|柏林|悉尼|多伦多|洛杉矶|旧金山|西雅图/,
+  家乡: /家乡|老家|来自|出生/,
+  生日: /生日|出生|\d{1,2}\s*月\s*\d{1,2}/,
+  地址: /地址|住在|路|街|号/,
+  公司: /公司|就职|上班|在\S{1,10}工作/,
+  邮箱: /邮箱|@/,
+  电话: /电话|手机|\d{7,}/,
+  手机号: /手机|电话|\d{7,}/,
+  年龄: /年龄|\d{1,2}\s*岁|出生/,
+  学校: /学校|大学|学院|就读/,
+  职业: /职业|工作|做.{0,4}的|工程师|设计师|老师|学生/,
+  微信: /微信/,
+  网站: /网站|https?:\/\//,
+  公众号: /公众号/,
+  博客: /博客|https?:\/\//,
+  团队: /团队/,
+  产品: /产品/,
+  项目名: /项目/,
+};
+const PLACEHOLDER = /your[_ ]?(name|city|email|phone|address|company|birthday|age)|<[^>\n]{1,12}>|\[[^\]\n]{1,12}\]|【[^】\n]{1,12}】|\{\{[^}\n]{1,24}\}\}|某某|[xX]{3,}|_{3,}|示例|样例|你的(名字|姓名|城市|生日|地址|公司|邮箱|电话|年龄|家乡|学校|职业)|用户名|占位|placeholder|待填|请填|填写|填入|TODO|FIXME|改成参数|作为参数|传入|参数化|user_?name|john|jane|张三|李四|小明/i;
+
+export type MissingInput = { topics: string[]; question: string };
+
+export function missingInput(task: string, answer: string, written: { path: string; content: string }[], known: string): MissingInput | null {
+  const topics = [...new Set([...task.matchAll(PERSONAL)].map((match) => match[1] ?? "").filter(Boolean))];
+  if (topics.length === 0) return null;
+  const supplied = known.replace(TOPIC_MENTION, "");
+  const unknown = topics.filter((topic) => !(SUPPLIED[topic] ?? /$^/).test(supplied));
+  if (unknown.length === 0) return null;
+  const haystack = [answer, ...written.map((file) => file.content)].join("\n");
+  if (!PLACEHOLDER.test(haystack)) return null;
+  const list = unknown.map((topic) => `你的${topic}`).join("、");
+  return { topics: unknown, question: `还差一样只有你知道的：${list}。现在写的是占位，告诉我之后我会直接填进去。` };
+}
 
 // True when the step read back what the run wrote: every file this step
 // changed is read (successfully) after its last change, and at least one file
@@ -595,8 +692,11 @@ export async function runDeskLoop(
   const plan: PlanState = deps.plan ? { ...deps.plan, items: deps.plan.items.map((item) => ({ ...item })) } : emptyPlan();
   // Long-lived notes about the desk; steps add to them with Memory.remember.
   const notes: string[] = [...(deps.notes ?? [])];
-  // Files this segment wrote, so a later step's read-back counts as its check.
-  const written = new Set<string>();
+  // Files this task wrote, so a later step's read-back counts as its check and
+  // the check prompt can name them.
+  const written = new Set<string>(plan.written);
+  // What the user has already told the desk, for the placeholder check.
+  const known = [task, ...notes, ...(deps.history ?? []).flatMap((item) => [item.task, item.answer])].join("\n");
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -640,12 +740,16 @@ export async function runDeskLoop(
             last,
             plan: plan.items,
             check: plan.pending,
+            checkFailed: plan.failed,
+            written: [...written],
+            modules: loaded.map((mod) => mod.name),
             images: shownImages.map((image) => image.path),
             visionFailed,
             history: deps.history,
             notes,
           });
           plan.pending = null;
+          plan.failed = [];
           // A failed compile deserves a more careful second look.
           const effort: Effort = last?.kind === "compile_failed" ? "medium" : "low";
           const raw = await askModel(apiKey, prompt, context, harnesses, loaded, {
@@ -677,6 +781,10 @@ export async function runDeskLoop(
               modules: () => loaded,
               onModule: addModule,
               onUnload: dropModule,
+              origin: () => ({ ...plan.origin }),
+              onOrigin: (path, content) => {
+                if (!(path in plan.origin)) plan.origin = boundOrigin({ ...plan.origin, [path]: content });
+              },
             });
           } catch (err) {
             // The runner, not the step's code, failed: another model round
@@ -706,21 +814,49 @@ export async function runDeskLoop(
               for (const effect of effects) emit({ kind: "effect", round, ...effect });
               if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
               for (const effect of effects) if (FILE_WRITES.has(effect.tool) && effect.output.startsWith("Ok")) written.add(effect.detail);
+              plan.written = [...written].slice(-MAX_WRITTEN_LISTED);
               let reply = frame.reply;
+              let text = frame.text;
               let raw = next.raw;
-              const unchecked = plan.wrote && !readBackInStep(effects, written);
-              if (reply === "done" && plan.checks === 0 && (unchecked || plan.items.some((item) => !item.done))) {
-                const held = holdDone(raw);
+              if (reply === "done") {
+                // A fact only the user has, stood in for by a placeholder: ask
+                // for it instead of handing over a result that is not theirs.
+                const wroteNow = (frame.files ?? []).filter((file) => written.has(file.path) && file.content);
+                const missing = missingInput(task, frame.text, wroteNow, known);
+                const asked = missing ? patchFrame(raw, { kind: "ask", text: missing.question }) : null;
+                if (missing && asked) {
+                  raw = asked;
+                  reply = "ask";
+                  text = missing.question;
+                  emit({ kind: "need_input", round, topics: missing.topics, question: missing.question });
+                }
+              }
+              if (reply === "done" && plan.checks < MAX_CHECK_HOLDS) {
+                // Held once when nothing was checked, and (once more) when an
+                // assertion failed: a Done has to be backed by passing checks.
+                const failed = checkVerdicts(effects).filter((item) => !item.ok).map((item) => item.desc);
+                const unchecked = plan.checks === 0 && plan.wrote && !readBackInStep(effects, written) && !assertedInStep(effects);
+                const open = plan.checks === 0 && plan.items.some((item) => !item.done);
+                const held = failed.length > 0 || unchecked || open ? holdDone(raw) : null;
                 if (held) {
                   plan.checks += 1;
                   plan.pending = frame.text;
+                  plan.failed = failed;
                   raw = held;
                   reply = "continue";
-                  emit({ kind: "check", round, answer: frame.text });
+                  emit({ kind: "check", round, answer: frame.text, failed });
+                }
+              } else if (reply === "done") {
+                // Out of holds: a Done that still has failing assertions says so.
+                const failed = checkVerdicts(effects).filter((item) => !item.ok).map((item) => item.desc);
+                const marked = failed.length ? patchFrame(raw, { text: `${frame.text.trim()}\n\n（有 ${failed.length} 条核对没通过：${failed.map((item) => clip(item, 80)).join("；")}）` }) : null;
+                if (marked) {
+                  raw = marked;
+                  text = `${frame.text.trim()}\n\n（有 ${failed.length} 条核对没通过：${failed.map((item) => clip(item, 80)).join("；")}）`;
                 }
               }
-              emit({ kind: "step", round, reply, text: frame.text });
-              last = { kind: "ran", round, reply, text: frame.text, effects };
+              emit({ kind: "step", round, reply, text });
+              last = { kind: "ran", round, reply, text, effects };
               if (frame.files) fileIndex = frame.files.map((file) => (images.some((image) => image.path === file.path) ? { ...file, image: true } : file));
               compileStall = 0;
               idleStall = reply === "continue" && effects.length === 0 && !plan.pending ? idleStall + 1 : 0;
@@ -965,6 +1101,72 @@ function endedWithAsk(events: AgentEvent[]): boolean {
   return false;
 }
 
+// A run goes on by itself after a budget pause, up to this many segments, as
+// long as the segment that paused got somewhere.
+export const MAX_SEGMENTS = 10;
+
+// Whether the latest segment got somewhere: a segment that spent its whole
+// budget without one completed step would just spin again.
+export function segmentProgressed(run: RunRecord): boolean {
+  const events = run.events;
+  let start = 0;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (events[i]?.kind === "start") {
+      start = i;
+      break;
+    }
+  }
+  return events.slice(start).some((event) => event.kind === "step" || event.kind === "effect");
+}
+
+/** True when a paused run should be continued without the user asking. */
+export function carriesOn(run: RunRecord): boolean {
+  return run.status === "paused" && run.segment < MAX_SEGMENTS && segmentProgressed(run);
+}
+
+// After a pause, the server asks itself for the next segment, so the run goes
+// on even when no page is watching. The request is made through the app's own
+// public address; on Vercel, waitUntil keeps this function alive until the
+// next one has answered. Local servers have no such context, and the fetch
+// simply runs in the background.
+async function selfContinue(run: RunRecord, origin: string | null): Promise<void> {
+  if (!origin) return;
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  if (bypass) headers["x-vercel-protection-bypass"] = bypass;
+  const request = fetch(`${origin}/api/agent/continue`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ runId: run.id, segment: run.segment }),
+  })
+    .then(() => undefined)
+    .catch(() => undefined);
+  try {
+    const { waitUntil } = await import("@vercel/functions");
+    waitUntil(request);
+  } catch {
+    /* no platform context: the request just runs in this process */
+  }
+}
+
+async function selfOrigin(): Promise<string | null> {
+  const configured = process.env.OCAGENT_SELF_URL?.trim();
+  if (configured) return configured.replace(/\/$/, "");
+  try {
+    // The address the page used, which is also the one that reaches this app.
+    const { getRequestHeader } = await import("@tanstack/react-start/server");
+    const host = getRequestHeader("x-forwarded-host") ?? getRequestHeader("host");
+    if (host) {
+      const proto = getRequestHeader("x-forwarded-proto") ?? (host.startsWith("127.0.0.1") || host.startsWith("localhost") ? "http" : "https");
+      return `${proto.split(",")[0]?.trim() || "https"}://${host.split(",")[0]?.trim()}`;
+    }
+  } catch {
+    /* not inside a request */
+  }
+  const vercel = process.env.VERCEL_URL;
+  return vercel ? `https://${vercel}` : null;
+}
+
 /** Earlier runs of the desk as conversation, oldest first; the current run and anything still running are left out. */
 export function historyFor(runs: RunRecord[], currentId: string): HistoryItem[] {
   return runs
@@ -973,11 +1175,12 @@ export function historyFor(runs: RunRecord[], currentId: string): HistoryItem[] 
     .map((run) => ({ task: run.task, answer: run.result?.answer ?? "", status: run.status, asked: run.result?.asked }));
 }
 
-async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
+async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | null): Promise<RunReply> {
   const store = await import("./store.server.ts");
   const { runProgress } = await import("./progress.server.ts");
   const apiKey = process.env.XAI_API_KEY;
   const seqBase = run.events.length ? (run.events[run.events.length - 1]?.seq ?? 0) : 0;
+  const self = origin === undefined ? await selfOrigin() : origin;
   runProgress.open(run.id, seqBase);
   const finish = async (status: Exclude<RunStatus, "running">, result: DeskResult, state: DeskState): Promise<RunReply> => {
     const events = runProgress.read(run.id).events;
@@ -991,6 +1194,8 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
     const reply: RunReply = { run: fresh, desk: publicDesk(saved) };
     runProgress.close(run.id, reply, outcome.ok);
+    // Paused for time only: the server carries on by itself.
+    if (status === "paused" && carriesOn(fresh)) await selfContinue(fresh, self);
     return reply;
   };
   const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory, notes: desk.notes };
@@ -1066,30 +1271,47 @@ export const startRun = createServerFn({ method: "POST" })
     return runSegment(run, { ...desk, journal: [], memory: "" });
   });
 
+/**
+ * Runs the next segment of a paused run, if this caller is the one to claim
+ * it. The page (one tap on 接着做, or its own fallback) and the server's
+ * self-continuation both come through here; the claim is one row update, so
+ * exactly one of them runs the segment and the other sees it running.
+ * `expected` pins the segment the caller saw paused, so a late request for a
+ * segment that has already moved on is a no-op.
+ */
+export async function driveNextSegment(runId: string, expected: number | null, origin?: string | null): Promise<RunReply> {
+  const store = await import("./store.server.ts");
+  const run = await store.getRun(runId);
+  if (!run) throw new Error("服务器上没有这次运行。");
+  const desk = await store.readDesk(run.deskId);
+  if (!desk) throw new Error("这次运行的工作区不见了。");
+  if (run.status !== "paused" || (expected !== null && run.segment !== expected)) return { run, desk: publicDesk(desk) };
+  const claimed = await store.claimSegment(run.id, run.segment);
+  if (!claimed) {
+    const fresh = (await store.getRun(run.id)) ?? run;
+    return { run: fresh, desk: publicDesk(desk) };
+  }
+  return runSegment({ ...claimed, events: run.events }, desk, origin);
+}
+
 export const continueRun = createServerFn({ method: "POST" })
   .validator(readRunId)
-  .handler(async ({ data }): Promise<RunReply> => {
-    const store = await import("./store.server.ts");
-    const run = await store.getRun(data.runId);
-    if (!run) throw new Error("服务器上没有这次运行。");
-    const desk = await store.readDesk(run.deskId);
-    if (!desk) throw new Error("这次运行的工作区不见了。");
-    if (run.status !== "paused") return { run, desk: publicDesk(desk) };
-    const segment = run.segment + 1;
-    await store.beginSegment(run.id, segment);
-    return runSegment({ ...run, status: "running", segment }, desk);
-  });
+  .handler(async ({ data }): Promise<RunReply> => driveNextSegment(data.runId, null));
 
 export const pollRun = createServerFn({ method: "POST" })
   .validator(readRunId)
   .handler(async ({ data }): Promise<RunSnapshot> => {
     const { runProgress } = await import("./progress.server.ts");
     const live = runProgress.read(data.runId, data.after);
-    if (live.found) return { found: true, done: live.done, events: live.events, reply: live.done ? live.result : null };
-    // Another instance has (or had) this run: read what it wrote.
+    if (live.found && !live.done) return { found: true, done: false, events: live.events, reply: null };
+    // The segment this instance ran is over, or another instance has the run:
+    // the row says whether a later segment is going on somewhere.
     const store = await import("./store.server.ts");
     const run = await store.getRun(data.runId);
-    if (!run) return { found: false, done: false, events: [], reply: null };
+    if (!run) {
+      if (live.found) return { found: true, done: true, events: live.events, reply: live.result };
+      return { found: false, done: false, events: [], reply: null };
+    }
     const done = run.status !== "running";
     const desk = done ? await store.readDesk(run.deskId) : null;
     return {

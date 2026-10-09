@@ -16,7 +16,8 @@ export type AgentEventBody =
   | { kind: "module"; round: number; name: string; exports: string[] }
   | { kind: "module_dropped"; name: string; reason: string }
   | { kind: "todo"; round: number; items: PlanItem[] }
-  | { kind: "check"; round: number; answer: string }
+  | { kind: "check"; round: number; answer: string; failed: string[] }
+  | { kind: "need_input"; round: number; topics: string[]; question: string }
   | { kind: "remember"; round: number; text: string; forgot: boolean }
   | { kind: "finish"; ok: boolean };
 
@@ -30,10 +31,46 @@ export type PlanItem = { text: string; done: boolean; note: string };
  * loop has held a Done for a check, whether anything was written (what makes
  * a check worth a round), and the answer being held while the check runs.
  */
-export type PlanState = { items: PlanItem[]; checks: number; wrote: boolean; pending: string | null };
+export type PlanState = {
+  items: PlanItem[];
+  checks: number;
+  wrote: boolean;
+  pending: string | null;
+  /** Assertions that failed in the held Done, shown in the check prompt. */
+  failed: string[];
+  /** Files the task has written so far, for the check prompt. */
+  written: string[];
+  /** Task-start content of the files the task changed (null: did not exist), for Files.restore. */
+  origin: Record<string, string | null>;
+};
 
 export function emptyPlan(): PlanState {
-  return { items: [], checks: 0, wrote: false, pending: null };
+  return { items: [], checks: 0, wrote: false, pending: null, failed: [], written: [], origin: {} };
+}
+
+/** Keeps the origin snapshot within what a run row can carry; the biggest files drop out first. */
+export const MAX_ORIGIN_BYTES = 256 * 1024;
+export const MAX_WRITTEN_LISTED = 20;
+
+export function boundOrigin(origin: Record<string, string | null>): Record<string, string | null> {
+  const entries = Object.entries(origin);
+  let total = entries.reduce((sum, [, content]) => sum + (content ? Buffer.byteLength(content) : 0), 0);
+  const kept = new Map(entries);
+  for (const [path, content] of [...entries].sort((a, b) => (b[1]?.length ?? 0) - (a[1]?.length ?? 0))) {
+    if (total <= MAX_ORIGIN_BYTES) break;
+    kept.delete(path);
+    total -= content ? Buffer.byteLength(content) : 0;
+  }
+  return Object.fromEntries(kept);
+}
+
+// A Check.* effect's verdict: true when it passed, false when it failed.
+export function isCheckEffect(tool: string): boolean {
+  return tool.startsWith("Check.");
+}
+
+export function checkVerdicts(effects: { tool: string; detail: string; output: string }[]): { desc: string; ok: boolean }[] {
+  return effects.filter((effect) => isCheckEffect(effect.tool)).map((effect) => ({ desc: effect.detail || effect.tool, ok: effect.output.startsWith("通过") }));
 }
 
 const PLAN_SEP = "\u001f";
@@ -248,7 +285,11 @@ function trimBody(body: AgentEventBody): AgentEventBody {
 // Reads the "ok\n<kind>\n<text><traces><effects>…" frame a step run returns.
 export type StepFrame =
   | { kind: "fail"; message: string }
-  | { kind: "ok"; reply: string; text: string; effects: { tool: string; detail: string; output: string }[]; files: { path: string; bytes: number }[] | null };
+  | { kind: "ok"; reply: string; text: string; effects: { tool: string; detail: string; output: string }[]; files: { path: string; bytes: number; content: string }[] | null };
+
+// Text files up to this size ride along in the frame description, so the
+// run can look at what a step wrote; bigger ones (and pictures) are listed by size only.
+const FRAME_CONTENT_BYTES = 64 * 1024;
 
 export function describeStepFrame(raw: string): StepFrame | null {
   const buf = Buffer.from(raw, "utf8");
@@ -277,7 +318,7 @@ export function describeStepFrame(raw: string): StepFrame | null {
   const effects = block();
   if (reply === null || text === null || traces === null || effects === null) return null;
   // The workspace as the step left it: paths and sizes, for the next prompt.
-  let files: { path: string; bytes: number }[] | null = null;
+  let files: { path: string; bytes: number; content: string }[] | null = null;
   const countLine = line();
   const count = countLine === null ? NaN : Number(countLine);
   if (Number.isInteger(count) && count >= 0) {
@@ -289,7 +330,8 @@ export function describeStepFrame(raw: string): StepFrame | null {
         files = null;
         break;
       }
-      files.push({ path, bytes: Buffer.byteLength(content) });
+      const bytes = Buffer.byteLength(content);
+      files.push({ path, bytes, content: bytes <= FRAME_CONTENT_BYTES && !content.startsWith("data:") ? content : "" });
     }
   }
   return { kind: "ok", reply, text, effects: parseEffects(effects), files };
@@ -344,6 +386,10 @@ export type Round = {
   reply: { kind: string; text: string } | null;
   /** The answer the model wanted to end with, when the loop held it for a check. */
   check: string;
+  /** Assertions that failed when the Done was held. */
+  checkFailed: string[];
+  /** The run turned this round's Done into a question: what it needs from the user. */
+  needInput: { topics: string[]; question: string } | null;
   /** Notes remembered or forgotten in this round. */
   remembered: NoteChange[];
 };
@@ -353,7 +399,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", remembered: [] };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], needInput: null, remembered: [] };
       rounds.set(round, found);
     }
     return found;
@@ -406,8 +452,14 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         round.reply = { kind: event.reply, text: event.text };
         break;
       }
-      case "check":
-        at(event.round).check = event.answer;
+      case "check": {
+        const round = at(event.round);
+        round.check = event.answer;
+        round.checkFailed = event.failed;
+        break;
+      }
+      case "need_input":
+        at(event.round).needInput = { topics: event.topics, question: event.question };
         break;
       case "remember":
         at(event.round).remembered.push({ text: event.text, forgot: event.forgot });

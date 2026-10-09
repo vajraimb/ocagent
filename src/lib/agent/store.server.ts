@@ -148,11 +148,19 @@ function planOf(raw: unknown): PlanState | null {
     const it = item as Partial<PlanItem>;
     items.push({ text: it.text ?? "", done: Boolean(it.done), note: typeof it.note === "string" ? it.note : "" });
   }
+  const strings = (list: unknown): string[] => (Array.isArray(list) ? list.filter((item): item is string => typeof item === "string") : []);
+  const origin: Record<string, string | null> = {};
+  if (value.origin && typeof value.origin === "object") {
+    for (const [path, content] of Object.entries(value.origin)) if (content === null || typeof content === "string") origin[path] = content;
+  }
   return {
     items,
     checks: Number.isInteger(value.checks) ? (value.checks as number) : 0,
     wrote: Boolean(value.wrote),
     pending: typeof value.pending === "string" ? value.pending : null,
+    failed: strings(value.failed),
+    written: strings(value.written),
+    origin,
   };
 }
 
@@ -273,9 +281,15 @@ export async function appendRunEvents(id: string, events: AgentEvent[], rounds: 
   await sql`update runs set events = events || ${JSON.stringify(events)}::jsonb, rounds = greatest(rounds, ${rounds}), updated_at = ${now} where id = ${id}`;
 }
 
-export async function beginSegment(id: string, segment: number): Promise<void> {
+// Takes a paused run's next segment, if nobody else has: the page and the
+// server both try after a pause, and exactly one of them gets to run it.
+export async function claimSegment(id: string, fromSegment: number): Promise<RunRecord | null> {
   const sql = await getSql();
-  await sql`update runs set status = 'running', segment = ${segment}, stop_requested = false, updated_at = ${Date.now()}, ended_at = null where id = ${id}`;
+  const rows = await sql<RunRow>`
+    update runs set status = 'running', segment = ${fromSegment + 1}, stop_requested = false, updated_at = ${Date.now()}, ended_at = null
+    where id = ${id} and status = 'paused' and segment = ${fromSegment}
+    returning *`;
+  return rows[0] ? runOf(rows[0]) : null;
 }
 
 export async function finishRun(id: string, status: Exclude<RunStatus, "running">, rounds: number, result: RunOutcome): Promise<void> {

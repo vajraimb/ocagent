@@ -15,10 +15,14 @@ import {
   Hammer,
   ListChecks,
   LoaderCircle,
+  MessageCircleQuestion,
   PackagePlus,
   RotateCcw,
   Search,
+  ShieldAlert,
+  ShieldCheck,
   StickyNote,
+  Undo2,
   Trash2,
   TriangleAlert,
 } from "lucide-react";
@@ -278,7 +282,11 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         {round.remembered.map((change, index) => (
           <Row key={`${change.text}-${index}`} icon={<Brain className="h-3.5 w-3.5" aria-hidden />} label={change.forgot ? "忘掉了" : "记住了"} detail={change.text} tone={change.forgot ? "muted" : "accent"} />
         ))}
-        {round.check ? <Row icon={<ListChecks className="h-3.5 w-3.5" aria-hidden />} label="想收尾了，先核对一遍再说" detail={round.check} tone="accent" /> : null}
+        {round.check && round.checkFailed.length === 0 ? <Row icon={<ListChecks className="h-3.5 w-3.5" aria-hidden />} label="想收尾了，先核对一遍再说" detail={round.check} tone="accent" /> : null}
+        {round.check && round.checkFailed.length > 0 ? (
+          <Row icon={<ShieldAlert className="h-3.5 w-3.5" aria-hidden />} label={`想收尾，但有 ${round.checkFailed.length} 条核对没通过，退回去先修`} detail={round.checkFailed.join("；")} tone="warn" />
+        ) : null}
+        {round.needInput ? <Row icon={<MessageCircleQuestion className="h-3.5 w-3.5" aria-hidden />} label={`结果里用了占位，缺${round.needInput.topics.map((topic) => `你的${topic}`).join("、")}，改成问你`} tone="fg" /> : null}
         {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
       </div>
     </li>
@@ -341,14 +349,15 @@ function Row({ icon, label, detail, output, tone }: { icon: ReactNode; label: st
 
 function EffectRow({ tool, detail, output }: { tool: string; detail: string; output: string }) {
   const [full, setFull] = useState(false);
-  const failed = output.startsWith("Error");
-  const shown = output.replace(/^(Ok|Error)\s?/, "");
-  const icon = iconFor(tool);
+  const isCheck = tool.startsWith("Check.");
+  const failed = output.startsWith("Error") || (isCheck && !output.startsWith("通过"));
+  const shown = isCheck ? output.replace(/^(通过|没通过)[：:]?\s?/, "") : output.replace(/^(Ok|Error)\s?/, "");
+  const icon = isCheck ? (failed ? <ShieldAlert className="h-3.5 w-3.5" aria-hidden /> : <ShieldCheck className="h-3.5 w-3.5" aria-hidden />) : iconFor(tool);
   const isNote = tool === "Trace.note";
   return (
     <div className="min-w-0 text-sm">
       <p className={`flex min-w-0 items-start gap-1.5 ${failed ? "text-danger" : "text-fg"}`}>
-        <span className="mt-1 shrink-0 text-muted">{icon}</span>
+        <span className={`mt-1 shrink-0 ${isCheck ? (failed ? "text-danger" : "text-accent") : "text-muted"}`}>{icon}</span>
         <span className="min-w-0">
           <span>{toolLabel(tool)}</span>
           {isNote ? <span className="ml-1.5 whitespace-pre-wrap break-words text-muted">{shown}</span> : detail ? <span className="ml-1.5 break-all font-mono text-xs text-muted">{detail}</span> : null}
@@ -401,6 +410,8 @@ function iconFor(tool: string): ReactNode {
     case "Files.delete_file":
     case "delete_file":
       return <Trash2 className={cls} aria-hidden />;
+    case "Files.restore":
+      return <Undo2 className={cls} aria-hidden />;
     case "Trace.note":
       return <StickyNote className={cls} aria-hidden />;
     case "Clock.now":
@@ -426,6 +437,10 @@ function toolLabel(tool: string): string {
     "Files.replace": "改文件",
     "Files.append": "追加",
     "Files.delete_file": "删除",
+    "Files.restore": "退回开始时的版本",
+    "Check.that": "核对",
+    "Check.equal": "核对相等",
+    "Check.contains": "核对文件里有",
     "Search.query": "搜索",
     "Net.get": "请求",
     "Net.post": "发送",
