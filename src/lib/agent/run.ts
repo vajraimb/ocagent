@@ -1152,7 +1152,7 @@ export function pauseNote(segmentAnswer: string, segment: number, rounds: number
   const base = segmentAnswer.trim();
   if (carryingOn) return `${base}马上自动接着做（第 ${segment + 1}/${MAX_SEGMENTS} 段）。`;
   if (segment >= MAX_SEGMENTS) {
-    return `${base}已经自动连做了 ${segment} 段（共 ${rounds} 轮），到了一次任务的上限，先停在这里。做到哪、还差什么记在它的笔记和计划里；点「接着做」再续一段，或者把剩下的事作为一句新任务发给它。`;
+    return `${base}已经自动连做了 ${segment} 段（共 ${rounds} 轮），到了一次任务的上限，先停在这里。点「接着做」再续一段，或者把剩下的事作为一句新任务发给它——它会从工作区、计划和笔记接着做。`;
   }
   return `${base}这一段没有做出任何一步有效果的事，所以没有自动继续。点「接着做」再试一段，或者换个说法、把任务拆小。`;
 }
