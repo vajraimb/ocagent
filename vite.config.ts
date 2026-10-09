@@ -176,6 +176,12 @@ export default defineConfig(({ command, isPreview }) => ({
             // false, so removing this silently unwires /?install=1 on deploys.
             serverDir: "./server",
             serverAssets: [{ baseName: "ocaml", dir: "./assets/ocaml" }],
+            // PGLite loads pglite.wasm / pglite.data next to its own module at
+            // runtime; bundling it into _libs/ drops those files and the server
+            // dies at import whenever DATABASE_URL is absent (built-output
+            // preview, or a deploy without Neon). Tracing keeps it a real
+            // package in the output. It is never loaded on the Neon path.
+            traceDeps: ["@electric-sql/pglite"],
           }),
         ]
       : []),
