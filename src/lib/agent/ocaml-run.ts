@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bannedCall, MAX_MODULES, moduleFromFile, type DeskModule, type HarnessId } from "./harness.ts";
-import { settle } from "./budget.ts";
 import { fetchPublic, fetchSource, postPublic } from "./net.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
@@ -678,14 +677,7 @@ export async function runCore(job: CoreJob, handlers: CoreHandlers, hooks?: RunH
         if (ran.aborted) return { ...decoded, status: "stopped", answer: stoppedAnswer(decoded.steps) };
         if (decoded.status === "error") return { ...decoded, answer: decoded.answer || "循环没有跑起来。" };
         if (decoded.status === "done" && decoded.answer.trim()) return decoded;
-        const answer =
-          decoded.answer.trim() ||
-          settle({
-            answer: "",
-            note: ran.timedOut ? "这一步到时限了。" : "循环停在半路。",
-            steps: decoded.steps,
-            timedOut: true,
-          });
+        const answer = decoded.answer.trim() || (ran.timedOut ? "这一步到时限了，上面是已经做出的部分。" : "循环停在半路，上面是已经做出的部分。");
         return { ...decoded, status: "done", answer };
       } catch {
         /* the checkpoint was only half written */
