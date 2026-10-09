@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { ArrowUp, Blocks, CalendarClock, FilePen, Globe, PackagePlus, PanelRight, Play, Search, Square } from "lucide-react";
+import { ArrowUp, Bell, Blocks, CalendarClock, FilePen, Globe, PackagePlus, PanelRight, Play, Search, Square, X } from "lucide-react";
 import { AgentTurn, type AgentTurnData } from "@/components/agent-turn";
 import { SidePanel } from "@/components/side-panel";
 import { CATALOG, DEFAULT_HARNESSES, MAX_MODULES, checkModule, isHarnessId, moduleNameFor, type DeskModule, type HarnessId } from "@/lib/agent/harness";
@@ -17,9 +17,12 @@ import {
   pollRun,
   removeSchedule,
   saveDesk,
+  setNotify,
   startRun,
   stopRun,
+  tryNotify,
   type InstallVerdict,
+  type NotifyInfo,
   type PublicDesk,
   type RunRecord,
   type RunReply,
@@ -35,6 +38,8 @@ type Cache = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; module
 type LegacySaved = { files?: DeskFile[]; harnesses?: string[]; modules?: DeskModule[] };
 
 const DESK_KEY = "ocagent-desk-id";
+// When this browser last looked at the desk's scheduled results (per desk).
+const SEEN_KEY = "ocagent-seen";
 const CACHE_KEY = "ocagent-desk-v8";
 const LEGACY_KEYS = ["ocagent-desk-v7", "ocagent-desk-v6", "ocagent-desk-v5"];
 const PREFAB = new Set(["README.md", "src/math.ml", "src/greet.ml", "notes/todo.md"]);
@@ -209,6 +214,20 @@ function scheduleLabel(run: RunRecord, schedules: ScheduleRecord[]): string {
   return from ? `定时任务 · ${describeWhen(from.time, from.tz)}` : "定时任务 · 到点自动开始";
 }
 
+function seenKey(deskId: string): string {
+  return `${SEEN_KEY}:${deskId}`;
+}
+
+function readSeen(deskId: string): number {
+  const raw = Number(localStorage.getItem(seenKey(deskId)));
+  return Number.isFinite(raw) ? raw : 0;
+}
+
+/** Scheduled runs that finished since this browser last looked, newest first. */
+function unseenScheduled(runs: RunRecord[], seen: number): RunRecord[] {
+  return runs.filter((run) => run.trigger === "schedule" && run.status !== "running" && (run.endedAt ?? run.updatedAt) > seen).reverse();
+}
+
 function unfinished(run: RunRecord): boolean {
   if (run.status === "stopped" || run.status === "failed" || run.status === "paused") return true;
   const last = [...run.events].reverse().find((event) => event.kind === "step");
@@ -257,6 +276,9 @@ export function Workbench() {
   const [notes, setNotes] = useState<string[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [schedules, setSchedules] = useState<ScheduleRecord[]>([]);
+  const [notify, setNotifyInfo] = useState<NotifyInfo | null>(null);
+  // Scheduled results this browser has not looked at yet (a timestamp per desk).
+  const [seen, setSeen] = useState(Number.MAX_SAFE_INTEGER);
   const [selected, setSelected] = useState("");
   const [ready, setReady] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -307,6 +329,7 @@ export function Workbench() {
     setHarnesses(desk.harnesses.length ? desk.harnesses : DEFAULT_HARNESSES);
     setModules(desk.modules);
     setNotes(desk.notes ?? []);
+    setNotifyInfo(desk.notify ?? null);
     stored.current = { files: new Map(kept.map((file) => [file.path, file.content])), modules: desk.modules };
     synced.current = true;
     dirty.current = false;
@@ -371,6 +394,7 @@ export function Workbench() {
   useEffect(() => {
     const id = chooseDeskId();
     setDeskId(id);
+    setSeen(readSeen(id));
     const cache = readCache(localStorage.getItem(CACHE_KEY));
     const legacy = cache ? null : readLegacy();
     if (cache && cache.deskId === id) {
@@ -627,6 +651,7 @@ export function Workbench() {
       const now = Date.now();
       setRuns((current) => [...current, { id: runId, deskId, task: text, trigger: "user", status: "running", segment: 1, rounds: 0, events: [], result: null, stopRequested: false, createdAt: now, updatedAt: now, endedAt: null }]);
       setTask("");
+      if (unseen.length) markSeen();
       await drive(runId, () => startRun({ data: { deskId, runId, task: text } }));
     } finally {
       setStarting(false);
@@ -806,6 +831,42 @@ export function Workbench() {
     setPanelOpen(false);
   }
 
+  function markSeen() {
+    if (!deskId) return;
+    const now = Date.now();
+    localStorage.setItem(seenKey(deskId), String(now));
+    setSeen(now);
+  }
+
+  function showUnseen() {
+    const [newest] = unseenScheduled(runs, seen);
+    markSeen();
+    if (newest) document.getElementById(`run-${newest.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function changeNotify(url: string): Promise<string | null> {
+    if (!deskId) return "工作区还没准备好。";
+    try {
+      const saved = await setNotify({ data: { deskId, url } });
+      if (!saved.ok) return saved.error;
+      setNotifyInfo(saved.notify);
+      synced.current = true;
+      return null;
+    } catch (caught) {
+      return `没存上：${caught instanceof Error ? caught.message : "连不上服务器"}`;
+    }
+  }
+
+  async function testNotify(): Promise<string> {
+    if (!deskId) return "工作区还没准备好。";
+    try {
+      const tried = await tryNotify({ data: { deskId } });
+      return tried.ok ? `发出去了，去${tried.where}看一眼。` : tried.error;
+    } catch (caught) {
+      return `没发成：${caught instanceof Error ? caught.message : "连不上服务器"}`;
+    }
+  }
+
   async function unschedule(scheduleId: string) {
     if (!deskId) return;
     try {
@@ -835,6 +896,7 @@ export function Workbench() {
   const continueFor = lastRun && !running && unfinished(lastRun) ? lastRun : null;
   const awaitingReply = Boolean(lastRun && !running && lastRun.status === "done" && lastRun.result?.asked);
   const shareUrl = deskId && typeof window !== "undefined" ? `${window.location.origin}/?desk=${deskId}` : "";
+  const unseen = unseenScheduled(runs, seen);
 
   const panel = (onClose?: () => void) => (
     <SidePanel
@@ -858,6 +920,9 @@ export function Workbench() {
       onForget={forgetNote}
       schedules={schedules}
       onUnschedule={(id) => void unschedule(id)}
+      notify={notify}
+      onSetNotify={changeNotify}
+      onTryNotify={testNotify}
       busy={running}
     />
   );
@@ -925,6 +990,21 @@ export function Workbench() {
               ) : null}
             </div>
             {notice ? <p className="mt-1.5 px-1 text-xs leading-5 text-warn">{notice}</p> : null}
+            {unseen.length > 0 ? (
+              <div className="mt-2 flex items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-3 py-2 text-xs leading-5 text-fg">
+                <Bell className="h-3.5 w-3.5 shrink-0 text-accent" aria-hidden />
+                <span className="min-w-0 flex-1">
+                  有 {unseen.length} 个定时结果你还没看过
+                  {unseen.length === 1 && unseen[0] ? `：${scheduleLabel(unseen[0], schedules).replace(/^定时任务 · /, "")}` : ""}
+                </span>
+                <button type="button" onClick={showUnseen} className="shrink-0 rounded-md bg-accent px-2 py-0.5 text-xs font-medium text-bg">
+                  去看看
+                </button>
+                <button type="button" onClick={markSeen} aria-label="知道了" className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted hover:text-fg">
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </div>
+            ) : null}
             {runs.length > 0 && examplesOpen ? (
               <div className="mt-3 flex max-h-[40vh] flex-col gap-3 overflow-y-auto pb-1">
                 <ul className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -994,12 +1074,13 @@ export function Workbench() {
           ) : null}
 
           {[...runs].reverse().map((run) => (
-            <div key={run.id} className="flex flex-col gap-5">
+            <div key={run.id} id={`run-${run.id}`} className="flex scroll-mt-40 flex-col gap-5">
               <article className="ml-10 select-text self-end rounded-2xl bg-raised px-4 py-3">
                 {run.trigger === "schedule" ? (
                   <p className="mb-1 flex items-center gap-1.5 font-mono text-[11px] tracking-wide text-muted">
                     <CalendarClock className="h-3.5 w-3.5" aria-hidden />
                     {scheduleLabel(run, schedules)}
+                    {unseen.some((item) => item.id === run.id) ? <span className="rounded bg-accent/15 px-1 text-accent">新</span> : null}
                   </p>
                 ) : null}
                 <p className="whitespace-pre-wrap text-[15px] leading-7 text-fg">{run.task}</p>

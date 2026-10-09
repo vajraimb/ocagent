@@ -8,7 +8,7 @@ import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep
 import type { LastOutcome } from "./run.ts";
 
 export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[] };
-export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: number };
+export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: number; notifyUrl: string };
 
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
 
@@ -51,7 +51,7 @@ const MAX_EVENTS_STORED = 400;
 const RUNS_LISTED = 24;
 const RUNS_WITH_EVENTS = 6;
 
-type DeskRow = { id: string; files: unknown; harnesses: unknown; modules: unknown; journal: unknown; memory: string; notes: unknown; revision: number; updated_at: number };
+type DeskRow = { id: string; files: unknown; harnesses: unknown; modules: unknown; journal: unknown; memory: string; notes: unknown; notify_url: string | null; revision: number; updated_at: number };
 type RunRow = {
   id: string;
   desk_id: string;
@@ -182,6 +182,7 @@ function deskOf(row: DeskRow): DeskRecord {
     journal: journalOf(row.journal),
     memory: typeof row.memory === "string" ? row.memory : "",
     notes: normalizeNotes(parsed(row.notes)),
+    notifyUrl: typeof row.notify_url === "string" ? row.notify_url : "",
     revision: Number(row.revision) || 0,
     updatedAt: Number(row.updated_at) || 0,
   };
@@ -235,6 +236,13 @@ export async function writeDeskSettings(id: string, patch: Partial<Pick<DeskStat
   const current = await readDesk(id);
   if (!current) return null;
   return writeDesk(id, { ...current, ...patch });
+}
+
+// The desk's notify address, set from the panel; blank means none.
+export async function writeDeskNotify(id: string, notifyUrl: string): Promise<DeskRecord | null> {
+  const sql = await getSql();
+  const rows = await sql<DeskRow>`update desks set notify_url = ${notifyUrl}, updated_at = ${Date.now()} where id = ${id} returning *`;
+  return rows[0] ? deskOf(rows[0]) : null;
 }
 
 export async function createRun(deskId: string, id: string, task: string, trigger: RunTrigger = "user"): Promise<RunRecord> {

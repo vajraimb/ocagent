@@ -22,6 +22,7 @@ export type AgentEventBody =
   | { kind: "remember"; round: number; text: string; forgot: boolean }
   | { kind: "schedule"; round: number; time: string; tz: string; task: string }
   | { kind: "unschedule"; round: number; n: number; time: string; tz: string; task: string }
+  | { kind: "notify"; round: number; ok: boolean; where: string; error?: string; auto?: boolean }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };
@@ -406,6 +407,8 @@ export type Round = {
   remembered: NoteChange[];
   /** Daily schedules registered (Schedule.daily) or cancelled (n) in this round. */
   scheduled: { kind: "daily" | "cancel"; time: string; tz: string; task: string }[];
+  /** Messages sent to the desk's notify address this round (by a step, or the run's own summary). */
+  notified: { ok: boolean; where: string; error: string; auto: boolean }[];
 };
 
 export function foldRounds(events: AgentEvent[]): Round[] {
@@ -413,7 +416,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", budgetCut: false, startedAt: 0, endedAt: 0, running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [], scheduled: [] };
+      found = { round, thinking: false, code: "", modelError: "", budgetCut: false, startedAt: 0, endedAt: 0, running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [], scheduled: [], notified: [] };
       rounds.set(round, found);
     }
     return found;
@@ -493,6 +496,9 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         break;
       case "remember":
         at(event.round).remembered.push({ text: event.text, forgot: event.forgot });
+        break;
+      case "notify":
+        at(event.round).notified.push({ ok: event.ok, where: event.where, error: event.error ?? "", auto: event.auto === true });
         break;
       default:
         break;

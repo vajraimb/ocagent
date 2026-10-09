@@ -1,9 +1,9 @@
 import { useRef, useState } from "react";
-import { Blocks, Brain, CalendarClock, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Bell, Blocks, Brain, CalendarClock, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
 import { describeWhen, stampIn } from "@/lib/agent/schedule";
-import type { ScheduleRecord } from "@/lib/agent/run";
+import type { NotifyInfo, ScheduleRecord } from "@/lib/agent/run";
 
 const FIXED: HarnessId[] = ["ocaml"];
 
@@ -31,6 +31,9 @@ export function SidePanel({
   onForget,
   schedules,
   onUnschedule,
+  notify,
+  onSetNotify,
+  onTryNotify,
 }: {
   harnesses: HarnessId[];
   setHarnesses: (next: HarnessId[]) => void;
@@ -55,6 +58,12 @@ export function SidePanel({
   /** Daily tasks the server runs for this desk. */
   schedules: ScheduleRecord[];
   onUnschedule: (id: string) => void;
+  /** Where this desk's messages go (scheduled results, Notify.send); null when unset. */
+  notify: NotifyInfo | null;
+  /** Stores a new address (blank clears); resolves to an error message or null. */
+  onSetNotify: (url: string) => Promise<string | null>;
+  /** Sends a test line to the stored address; resolves to a verdict line. */
+  onTryNotify: () => Promise<string>;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -67,6 +76,37 @@ export function SidePanel({
   const [verdicts, setVerdicts] = useState<Verdict[]>([]);
   const [copied, setCopied] = useState(false);
   const importInput = useRef<HTMLInputElement>(null);
+  const [notifyOpen, setNotifyOpen] = useState(false);
+  const [notifyText, setNotifyText] = useState("");
+  const [notifyBusy, setNotifyBusy] = useState(false);
+  const [notifyVerdict, setNotifyVerdict] = useState<{ ok: boolean; text: string } | null>(null);
+
+  async function saveNotify(url: string) {
+    setNotifyBusy(true);
+    setNotifyVerdict(null);
+    try {
+      const error = await onSetNotify(url);
+      if (error) setNotifyVerdict({ ok: false, text: error });
+      else {
+        setNotifyOpen(false);
+        setNotifyText("");
+        setNotifyVerdict(url.trim() ? { ok: true, text: "存好了。点「发一条试试」确认能收到。" } : null);
+      }
+    } finally {
+      setNotifyBusy(false);
+    }
+  }
+
+  async function tryNotify() {
+    setNotifyBusy(true);
+    setNotifyVerdict(null);
+    try {
+      const text = await onTryNotify();
+      setNotifyVerdict({ ok: !/没收到|失败|不对|没填/.test(text), text });
+    } finally {
+      setNotifyBusy(false);
+    }
+  }
   const candidate = file ? moduleNameFor(file.path) : null;
   const alreadyLoaded = candidate ? modules.some((mod) => mod.name === candidate) : false;
 
@@ -321,7 +361,7 @@ export function SidePanel({
             定时任务
             <span className="font-mono text-xs text-muted">{schedules.length}</span>
           </h2>
-          <p className="mt-1 text-xs leading-5 text-muted">到点服务器自动做，结果出现在这里的对话里；准点程度看服务器，可能晚一会儿。</p>
+          <p className="mt-1 text-xs leading-5 text-muted">到点服务器自动做，结果出现在对话里{notify ? `，摘要发到${notify.where}` : ""}。每天北京时间 8 点前后那一次最准；定在别的时间点，要有人打开这个工作区才会开始，最晚第二天早上 8 点补做。</p>
           <ul className="mt-2 flex flex-col gap-1">
             {schedules.map((item) => (
               <li key={item.id} className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs leading-5 text-fg">
@@ -341,6 +381,70 @@ export function SidePanel({
           </ul>
         </section>
       ) : null}
+
+      <section className="px-4 pb-4">
+        <h2 className="flex items-center gap-1.5 text-sm font-medium text-fg">
+          <Bell className="h-4 w-4 text-muted" aria-hidden />
+          通知
+        </h2>
+        {notify && !notifyOpen ? (
+          <>
+            <p className="mt-1 text-xs leading-5 text-muted">定时任务做完、或你让它「发给我」时，发到这里。</p>
+            <div className="mt-2 flex min-w-0 items-center gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs leading-5">
+              <span className="shrink-0 font-medium text-fg">{notify.where}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-muted" title={notify.masked}>
+                {notify.masked}
+              </span>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <button type="button" disabled={notifyBusy} onClick={() => void tryNotify()} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
+                {notifyBusy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Bell className="h-3.5 w-3.5" aria-hidden />}
+                发一条试试
+              </button>
+              <button type="button" disabled={notifyBusy} onClick={() => setNotifyOpen(true)} className="inline-flex min-h-8 items-center rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
+                换一个
+              </button>
+              <button type="button" disabled={notifyBusy || busy} onClick={() => void saveNotify("")} className="inline-flex min-h-8 items-center rounded-md px-2 text-xs text-muted hover:text-danger disabled:opacity-50">
+                不要了
+              </button>
+            </div>
+          </>
+        ) : null}
+        {!notify && !notifyOpen ? (
+          <>
+            <p className="mt-1 text-xs leading-5 text-muted">填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，定时任务做完会把结果发过去；对它说「发给我」也能发。</p>
+            <button type="button" disabled={busy} onClick={() => setNotifyOpen(true)} className="mt-2 inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
+              <Bell className="h-3.5 w-3.5" aria-hidden />
+              填通知地址
+            </button>
+          </>
+        ) : null}
+        {notifyOpen ? (
+          <div className="mt-2 flex flex-col gap-2">
+            <label className="block">
+              <span className="sr-only">通知地址</span>
+              <textarea
+                value={notifyText}
+                onChange={(event) => setNotifyText(event.target.value)}
+                rows={3}
+                disabled={notifyBusy}
+                placeholder={"机器人的 webhook 地址，例如\nhttps://open.feishu.cn/open-apis/bot/v2/hook/…\n钉钉机器人要在安全设置里加关键词「定时任务」或改成 IP/签名以外的方式。"}
+                className="block w-full resize-none rounded-lg border border-border bg-bg px-2.5 py-2 font-mono text-[11px] leading-5 text-fg outline-none placeholder:text-muted focus:border-primary"
+              />
+            </label>
+            <div className="flex gap-1.5">
+              <button type="button" disabled={notifyBusy || !notifyText.trim()} onClick={() => void saveNotify(notifyText)} className="inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 text-xs text-primary-fg disabled:opacity-40">
+                {notifyBusy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Check className="h-3.5 w-3.5" aria-hidden />}
+                存下
+              </button>
+              <button type="button" disabled={notifyBusy} onClick={() => { setNotifyOpen(false); setNotifyText(""); setNotifyVerdict(null); }} className="inline-flex min-h-9 items-center rounded-lg border border-border px-3 text-xs text-fg disabled:opacity-50">
+                算了
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {notifyVerdict ? <p className={`mt-2 text-xs leading-5 ${notifyVerdict.ok ? "text-accent" : "text-danger"}`}>{notifyVerdict.text}</p> : null}
+      </section>
 
       <section
         className={`flex min-h-0 flex-1 flex-col px-4 pb-4 ${dragging ? "rounded-xl outline-2 outline-dashed outline-accent/60" : ""}`}

@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bannedCall, MAX_MODULES, moduleFromFile, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic, fetchSource, postPublic } from "./net.ts";
+import type { NotifySent } from "./notify.ts";
 import { STDLIB_FILES } from "./ocaml-stdlib.ts";
 import { searchWeb } from "./search.ts";
 import { isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
@@ -141,6 +142,8 @@ export type RunHooks = {
   // onOrigin records the pre-step content of a file the step changed first.
   origin?: () => OriginMap;
   onOrigin?: (path: string, content: string | null) => void;
+  // Sends a line to the desk's notify address (Notify.send); absent when the desk has none.
+  notify?: (text: string) => Promise<NotifySent>;
 };
 
 /** Task-start content by path for files the task changed; null when the file did not exist. */
@@ -165,7 +168,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -339,6 +342,19 @@ function startBridge(apiKey: string | undefined, harnesses: HarnessId[], hooks?:
         res.writeHead(500);
         res.end(err instanceof Error ? err.message : "失败");
       }
+      return;
+    }
+    if (op === "notify") {
+      const text = (body.payload ?? "").slice(0, 1_600);
+      hooks?.onCall?.("Notify.send", "");
+      if (!hooks?.notify) {
+        res.writeHead(409, { "content-type": "text/plain; charset=utf-8" });
+        res.end("这个工作区还没填通知地址；用户要在面板「通知」里填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook，之后才能发。现在把要说的话写进 Done 里即可。");
+        return;
+      }
+      const sent = await hooks.notify(text);
+      res.writeHead(sent.ok ? 200 : 502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(sent.ok ? `已发到${sent.where}` : `没发出去（${sent.where}）：${sent.error}`);
       return;
     }
     const payload = (body.payload ?? "").slice(0, op === "net_post" ? MAX_POST_PAYLOAD : 4000);
@@ -777,7 +793,7 @@ function shortenDiagnostic(raw: string, source = ""): string {
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
   } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
     lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
@@ -1373,6 +1389,18 @@ module Schedule = struct
     result
 
   let cancel n = log_effect "Schedule.cancel" (string_of_int n) ""
+end
+
+module Notify = struct
+  let send text =
+    let text = String.trim text in
+    let result =
+      if text = "" then Error "要发的内容是空的"
+      else if String.length text > 1500 then Error "一条消息最多 1500 字"
+      else bridge "notify" text
+    in
+    log_effect "Notify.send" "" (match result with Ok s -> "Ok " ^ s | Error e -> "Error " ^ e);
+    result
 end
 
 module Harness = struct

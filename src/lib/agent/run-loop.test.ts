@@ -61,7 +61,7 @@ test("the loop pauses, resumably, when the request's time budget runs out", asyn
   const kinds: string[] = [];
   const started = Date.now();
   // 23.5 s budget minus the 20 s a round needs: the cut comes after ~3.5 s.
-  const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", deps({ runCore: fakeCore(200), budgetMs: 23_500 }, kinds));
+  const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", deps({ runCore: fakeCore(200), budgetMs: 23_500, minRoundMs: 20_000 }, kinds));
   assert.equal(result.ok, true);
   assert.equal(result.paused, true);
   assert.ok(Date.now() - started < 8_000, "cut well before the budget itself");
@@ -871,7 +871,13 @@ test("a Done on a task that asks for a schedule without registering one, or need
   assert.equal(beyondReach("每天帮我查一次汇率", "done", true), null, "registered: nothing is beyond reach");
   assert.equal(beyondReach("过十分钟提醒我开会", "done")?.what, "过一会儿提醒");
   assert.equal(beyondReach("后台一直盯着这个页面有没有更新", "done")?.what, "后台一直运行");
-  assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发邮件、短信或消息");
+  assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发邮件或短信");
+  assert.equal(beyondReach("把结果发邮件给我", "done", { notify: "sent" })?.what, "发邮件或短信", "a notify address is not email");
+  assert.equal(beyondReach("查完汇率发消息通知我", "done")?.what, "发消息");
+  assert.equal(beyondReach("查完汇率发消息通知我", "done", { notify: "unused" })?.what, "发消息（没有用 Notify.send 发出去）");
+  assert.match(beyondReach("查完汇率发消息通知我", "done", { notify: "none" })?.note ?? "", /面板「通知」/);
+  assert.equal(beyondReach("查完汇率发消息通知我", "done", { notify: "sent" }), null, "sent through the desk's address: the Done stands");
+  assert.equal(beyondReach("每天早上提醒我喝水", "done", { scheduled: true }), null, "a registered daily schedule is the reminder");
   assert.equal(beyondReach("写一首关于每天早起的诗", "done"), null, "no schedule asked for");
   assert.equal(beyondReach("每天的天气都不一样，查一下今天的", "done"), null);
   assert.equal(beyondReach("定时北京时间每天早上8点汇总", "partial"), null, "a Partial already says it is not done");
@@ -1134,4 +1140,58 @@ test("carriesOn: a paused run continues by itself while it makes progress and ha
   assert.equal(carriesOn({ ...base, events: progressed, segment: MAX_SEGMENTS }), false);
   assert.equal(carriesOn({ ...base, events: progressed, status: "done" }), false);
   assert.equal(MAX_SEGMENTS, 10);
+});
+
+test("Notify.send goes through the desk's address: a notify event (not an effect line), the prompt says it is connected, and a 发消息 Done stands only when one went through", async () => {
+  const sent: string[] = [];
+  const fakeSend = async (url: string, text: string) => {
+    sent.push(`${url} ${text}`);
+    return { ok: true as const, where: "飞书" };
+  };
+  const run = async (useIt: boolean) => {
+    const events: AgentEventBody[] = [];
+    const contexts: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = capturing(contexts);
+    const frames = [
+      okFrame("continue", "查到了", "Net.get\thttps://api.example/rate\tOk HTTP 200 api.example {\"usd\":7.1}"),
+      okFrame("done", "美元 7.1，已发到飞书。", useIt ? "Notify.send\t\tOk 已发到飞书" : ""),
+    ];
+    let i = 0;
+    try {
+      const result = await runDeskLoop("key", "查一下美元汇率，然后发消息通知我", [], ["ocaml", "net"], [], [], "", {
+        runCore: replyAwareCore(frames),
+        runPayload: async (_payload, _harnesses, _key, hooks) => {
+          const frame = frames[i++] ?? okFrame("done", "x");
+          if (i === 2 && useIt) {
+            assert.ok(hooks?.notify, "the step can reach the desk's address");
+            const outcome = await hooks.notify("美元 7.1");
+            assert.ok(outcome.ok);
+          }
+          return frame;
+        },
+        emit: (event) => events.push(event),
+        budgetMs: 60_000,
+        notifyUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/abc",
+        sendNotify: fakeSend,
+      });
+      return { events, contexts, result };
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+  const used = await run(true);
+  assert.deepEqual(sent, ["https://open.feishu.cn/open-apis/bot/v2/hook/abc 美元 7.1"]);
+  const notify = used.events.find((event) => event.kind === "notify");
+  assert.ok(notify && notify.kind === "notify" && notify.ok && notify.where === "飞书" && !notify.auto);
+  assert.ok(!used.events.some((event) => event.kind === "effect" && event.tool === "Notify.send"), "the delivery is its own event");
+  assert.ok(!used.events.some((event) => event.kind === "limit"), "sent: the Done stands");
+  assert.match(used.contexts[0] ?? "", /【通知已接通】这个工作区填了飞书的通知地址/);
+  assert.ok(used.result.ok);
+
+  const unused = await run(false);
+  const limit = unused.events.find((event) => event.kind === "limit");
+  assert.ok(limit && limit.kind === "limit" && limit.what === "发消息（没有用 Notify.send 发出去）");
+  const steps = unused.events.filter((event) => event.kind === "step");
+  assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["continue", "partial"]);
 });

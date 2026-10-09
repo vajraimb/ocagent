@@ -3,6 +3,7 @@ import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, norm
 import { holdDone, patchFrame, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, boundOrigin, checkVerdicts, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isCheckEffect, isMemoryEffect, isPlanEffect, MAX_WRITTEN_LISTED, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { asksForSchedule, describeWhen, isScheduleEffect, MAX_SCHEDULES, nextOccurrence, scheduleChanges, type ScheduleSpec } from "./schedule.ts";
+import { checkNotifyUrl, notifyKind, notifyName, scheduleSummary, sendNotify, type NotifySent } from "./notify.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus, ScheduleRecord } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
@@ -14,7 +15,10 @@ type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
 /** The desk as the page sees it: the loop's journal and memory stay on the server. */
-export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number };
+/** The desk's notify address as the page sees it: which service, and enough of the address to recognise it. */
+export type NotifyInfo = { where: string; masked: string };
+
+export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number; notify: NotifyInfo | null };
 
 /** One request's worth of a run, plus the desk as it left it (and its schedules, when the segment ended). */
 export type RunReply = { run: RunRecord; desk: PublicDesk; schedules?: ScheduleRecord[] };
@@ -97,11 +101,14 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 做法：同一次任务里，先把现在这一次做出来（比如今天的汇总），再 Schedule.daily 登记，Done 里说明「已登记每天 08:00 ……」。提示里的【定时任务】列出已登记的，重复的不用再登记；要取消用 Schedule.cancel n。不要写"调度脚本"放进工作区——没有任何东西会执行它；只有 Schedule.daily 登记的才会真的到点跑，任务要定时却没登记的 Done 会被改成 Partial。
 准点程度：服务器每天北京时间 8 点前后检查一次，其他时间点要靠有人打开工作台或外部定时触发，可能晚一些；登记时如实告诉用户。
 
+【通知：把一句话发到用户的飞书 / 钉钉 / 企业微信 / Slack】
+提示里有【通知已接通】时，Notify.send "一句话" 会立刻发到用户在面板里填的那个地址（返回 Ok "已发到飞书" 这样的结果）。用户要「发给我 / 通知我 / 推送给我」时就用它：先把内容做出来，再 Notify.send 发摘要（1500 字以内），Done 里说明已发到哪里。没接通时 Notify.send 返回 Error；这时不要硬发，把要说的话写进 Done，并告诉用户可以在面板「通知」里填一个机器人 webhook 地址。定时任务做完服务器会自动发一条摘要过去，定时任务里不必再自己发。
+
 【能力边界：做不到的事要直说】
-你只在被叫到时跑一次，步骤结束进程就没了。除了上面的每日定时，你做不到：过一会儿提醒、后台一直运行或盯着什么、发邮件 / 短信 / 微信 / 推送通知、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完，用 Partial 结束并写明用户可以怎么拿到结果（比如「到时候对我说一句」）。不要写一个"提醒脚本""发送脚本"放进工作区当作完成——那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
+你只在被叫到时跑一次，步骤结束进程就没了。除了上面的每日定时和通知地址，你做不到：过一会儿提醒（非每天定时的）、后台一直运行或盯着什么、发邮件 / 短信 / 微信私聊、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完，用 Partial 结束并写明用户可以怎么拿到结果（比如「到时候对我说一句」，或「填个通知地址，每天到点我发给你」）。不要写一个"提醒脚本""发送脚本"放进工作区当作完成——那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
 
 【你能用什么】
-只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
@@ -189,6 +196,10 @@ end
 module Schedule : sig
   val daily : string -> string -> unit res
   val cancel : int -> unit
+end
+
+module Notify : sig
+  val send : string -> string res
 end
 
 type reply =
@@ -303,6 +314,8 @@ export type PromptContext = {
   schedules?: ScheduleSpec[];
   /** This run was started by a schedule, not by the user typing. */
   scheduled?: boolean;
+  /** The desk has a notify address (Notify.send works); named by service. */
+  notify?: string;
 };
 
 export type FileEntry = { path: string; bytes: number; image?: boolean };
@@ -355,6 +368,9 @@ export function promptContext(ctx: PromptContext): string {
   const parts: string[] = [];
   if (ctx.scheduled) {
     parts.push("【这是定时任务】这一次不是用户刚刚说的，是之前登记的每日定时到点了，服务器自动把登记的那句话交给你。按那句话把事做完、写进文件、Done 里说清结果；不要再登记一遍，也不要问用户问题（没有人在等着回答）。");
+  }
+  if (ctx.notify) {
+    parts.push(`【通知已接通】这个工作区填了${ctx.notify}的通知地址：Notify.send "一句话" 会立刻发过去。用户要你发给他、通知他时用它；${ctx.scheduled ? "这次定时任务做完服务器会自动发一条摘要，不必自己再发。" : "没要求发的不用发。"}`);
   }
   if (ctx.schedules && ctx.schedules.length > 0) {
     parts.push(`【定时任务】（已登记，到点服务器会自动跑；重复的不用再登记，Schedule.cancel n 取消第 n 条）\n${ctx.schedules.map((item, index) => `${index + 1}. ${describeWhen(item.time, item.tz)}：${clip(oneLine(item.task), 200)}`).join("\n")}`);
@@ -557,6 +573,8 @@ export type RunHooks = {
   onUnload?: (name: string) => void;
   origin?: () => Record<string, string | null>;
   onOrigin?: (path: string, content: string | null) => void;
+  /** Sends a line to the desk's notify address; absent when the desk has none. */
+  notify?: (text: string) => Promise<NotifySent>;
 };
 
 // Verified loads win over the loop's own bookkeeping for the same name, and
@@ -667,25 +685,33 @@ export function missingInput(task: string, answer: string, written: { path: stri
 // an outbound message is a claim nothing will honour, so it becomes a Partial
 // that says what is missing.
 
-const BEYOND: { pattern: RegExp; what: string }[] = [
-  { pattern: /提醒我|过\s*\S{1,6}\s*(提醒|叫我|通知我)|闹钟/, what: "过一会儿提醒" },
+// `reminder` and `message` are within reach once the desk has a schedule or
+// a notify address respectively; the others never are.
+const BEYOND: { pattern: RegExp; what: string; via?: "schedule" | "notify" }[] = [
+  { pattern: /提醒我|过\s*\S{1,6}\s*(提醒|叫我|通知我)|闹钟/, what: "过一会儿提醒", via: "schedule" },
   { pattern: /后台(一直|持续|常驻)|一直(跑|运行|盯着|监控)|持续(监控|运行)|常驻/, what: "后台一直运行" },
-  { pattern: /发\s*(邮件|短信|微信|消息|通知)|推送(到|给)|邮件(发|通知)|email/i, what: "发邮件、短信或消息" },
+  { pattern: /发\s*(邮件|短信)|邮件(发|通知)|email|短信/i, what: "发邮件或短信" },
+  { pattern: /发\s*(微信|消息|通知)|推送(到|给)|通知我/, what: "发消息", via: "notify" },
 ];
 const BEYOND_NOTE = "我没有这个能力";
 const UNSCHEDULED_NOTE = "这不能算做成";
 const UNSCHEDULED_WHAT = "定时（没有用 Schedule.daily 登记）";
+const UNSENT_WHAT = "发消息（没有用 Notify.send 发出去）";
 const alreadyTold = (text: string) => text.includes(BEYOND_NOTE) || text.includes(UNSCHEDULED_NOTE);
 
 export type BeyondReach = { what: string; note: string };
 
+/** What this run can lean on: did it register a schedule; does the desk have a notify address, and was it used. */
+export type Reach = { scheduled?: boolean; notify?: "none" | "unused" | "sent" };
+
 /**
  * Why a Done cannot stand: the task asked for something no run can do, or
- * asked for a schedule and none was registered (a "schedule script" in the
- * workspace is not one). `scheduled` is whether this run registered one.
+ * asked for a schedule / a message and none was registered / sent (a script
+ * in the workspace is neither).
  */
-export function beyondReach(task: string, reply: string, scheduled = false): BeyondReach | null {
+export function beyondReach(task: string, reply: string, reach: Reach | boolean = {}): BeyondReach | null {
   if (reply !== "done") return null;
+  const { scheduled = false, notify = "none" } = typeof reach === "boolean" ? { scheduled: reach } : reach;
   if (asksForSchedule(task) && !scheduled) {
     return {
       what: UNSCHEDULED_WHAT,
@@ -694,9 +720,17 @@ export function beyondReach(task: string, reply: string, scheduled = false): Bey
   }
   const hit = BEYOND.find((item) => item.pattern.test(task));
   if (!hit) return null;
+  if (hit.via === "schedule" && scheduled) return null;
+  if (hit.via === "notify") {
+    if (notify === "sent") return null;
+    if (notify === "unused") {
+      return { what: UNSENT_WHAT, note: `（${UNSCHEDULED_NOTE}：任务要发消息，这个工作区接着通知地址，但这次没有用 Notify.send 发出去。上面是做到的部分；要发，再对我说一句。）` };
+    }
+    return { what: hit.what, note: `（${BEYOND_NOTE}：${hit.what}。这个工作区还没有通知地址，我发不出消息。上面是现在能做到的部分；在面板「通知」里填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，之后对我说一句就能发到那里。）` };
+  }
   return {
     what: hit.what,
-    note: `（${BEYOND_NOTE}：${hit.what}。我只在被叫到时跑一次，发不出消息，也不会一直等着。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
+    note: `（${BEYOND_NOTE}：${hit.what}。我只在被叫到时跑一次，发不出邮件和短信，也不会一直等着。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
   };
 }
 
@@ -750,6 +784,12 @@ export type LoopDeps = {
   scheduledBefore?: boolean;
   /** This run was started by a schedule, not the user. */
   scheduled?: boolean;
+  /** The desk's notify address, when it has one: Notify.send goes here. */
+  notifyUrl?: string;
+  /** Whether an earlier segment of this run already sent a message. */
+  notifiedBefore?: boolean;
+  /** Delivery, replaceable in tests. */
+  sendNotify?: (url: string, text: string) => Promise<NotifySent>;
 };
 
 export async function runDeskLoop(
@@ -805,6 +845,10 @@ export async function runDeskLoop(
   // Daily schedules as the model sees them (numbered), and whether this run registered one.
   const schedules: ScheduleSpec[] = [...(deps.schedules ?? [])];
   let scheduled = deps.scheduledBefore ?? false;
+  // Whether a Notify.send of this run went through (for "send me" tasks).
+  const notifyUrl = deps.notifyUrl?.trim() ?? "";
+  const notifyVia = notifyUrl ? notifyName(notifyKind(notifyUrl)) : "";
+  let notified = deps.notifiedBefore ?? false;
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -869,6 +913,7 @@ export async function runDeskLoop(
             notes,
             schedules,
             scheduled: deps.scheduled,
+            notify: notifyVia || undefined,
           });
           plan.pending = null;
           plan.failed = [];
@@ -905,6 +950,14 @@ export async function runDeskLoop(
             raw = await deps.runPayload(payload, harnesses, apiKey, {
               signal,
               onCall: (tool, detail) => emit({ kind: "call", round, tool, detail }),
+              notify: notifyUrl
+                ? async (text) => {
+                    const sent = await (deps.sendNotify ?? sendNotify)(notifyUrl, text);
+                    if (sent.ok) notified = true;
+                    emit(sent.ok ? { kind: "notify", round, ok: true, where: sent.where } : { kind: "notify", round, ok: false, where: sent.where, error: sent.error });
+                    return sent;
+                  }
+                : undefined,
               modules: () => loaded,
               onModule: addModule,
               onUnload: dropModule,
@@ -947,7 +1000,7 @@ export async function runDeskLoop(
                   if (gone) emit({ kind: "unschedule", round, n: change.n, ...gone });
                 }
               }
-              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool) && !(isScheduleEffect(effect.tool) && effect.output.startsWith("Ok")) && effect.tool !== "Schedule.cancel");
+              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool) && !(isScheduleEffect(effect.tool) && effect.output.startsWith("Ok")) && effect.tool !== "Schedule.cancel" && effect.tool !== "Notify.send");
               for (const effect of effects) emit({ kind: "effect", round, ...effect });
               if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
               for (const effect of effects) if (FILE_WRITES.has(effect.tool) && effect.output.startsWith("Ok")) written.add(effect.detail);
@@ -1008,7 +1061,7 @@ export async function runDeskLoop(
               if (reply === "done") {
                 // A Done on a task that needs a schedule, a reminder or an
                 // outbound message claims something no one will carry out.
-                const beyond = deps.scheduled ? null : beyondReach(task, reply, scheduled);
+                const beyond = deps.scheduled ? null : beyondReach(task, reply, { scheduled, notify: !notifyUrl ? "none" : notified ? "sent" : "unused" });
                 const told = alreadyTold(text) ? text : `${text.trim()}\n\n${beyond?.note ?? ""}`;
                 const limited = beyond ? patchFrame(raw, { kind: "partial", text: told }) : null;
                 if (beyond && limited) {
@@ -1124,8 +1177,21 @@ export function isRunId(value: unknown): value is string {
   return typeof value === "string" && RUN_ID.test(value);
 }
 
+export function notifyInfo(url: string): NotifyInfo | null {
+  if (!url) return null;
+  let masked = url;
+  try {
+    const parsed = new URL(url);
+    const tail = (parsed.pathname + parsed.search).replace(/[/?]+$/, "");
+    masked = `${parsed.hostname}/…${tail.slice(-6)}`;
+  } catch {
+    masked = `${url.slice(0, 24)}…`;
+  }
+  return { where: notifyName(notifyKind(url)), masked };
+}
+
 function publicDesk(desk: DeskRecord): PublicDesk {
-  return { id: desk.id, files: desk.files, harnesses: desk.harnesses, modules: desk.modules, notes: desk.notes, revision: desk.revision };
+  return { id: desk.id, files: desk.files, harnesses: desk.harnesses, modules: desk.modules, notes: desk.notes, revision: desk.revision, notify: notifyInfo(desk.notifyUrl) };
 }
 
 function readDeskId(input: unknown): { deskId: string } {
@@ -1159,6 +1225,43 @@ export const loadDesk = createServerFn({ method: "POST" })
     const drive = await import("./drive.server.ts");
     await drive.kickSchedules(drive.selfOrigin());
     return { found: true, durable, desk: publicDesk(desk), runs, schedules };
+  });
+
+function readNotify(input: unknown): { deskId: string; url: string } {
+  const { deskId } = readDeskId(input);
+  const url = input && typeof input === "object" && "url" in input ? input.url : "";
+  if (typeof url !== "string" || url.length > 2_000) throw new Error("地址不对。");
+  return { deskId, url };
+}
+
+export type NotifySaved = { ok: true; notify: NotifyInfo | null } | { ok: false; error: string };
+
+// The panel's notify address: checked, stored, and (when asked) tried once.
+export const setNotify = createServerFn({ method: "POST" })
+  .validator(readNotify)
+  .handler(async ({ data }): Promise<NotifySaved> => {
+    const checked = checkNotifyUrl(data.url);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    const store = await import("./store.server.ts");
+    const current = await store.readDesk(data.deskId);
+    if (!current) await store.writeDesk(data.deskId, { files: [], harnesses: normalizeHarnesses(undefined), modules: [], journal: [], memory: "", notes: [] });
+    const desk = await store.writeDeskNotify(data.deskId, checked.url);
+    if (!desk) return { ok: false, error: "没有这个工作区。" };
+    return { ok: true, notify: notifyInfo(desk.notifyUrl) };
+  });
+
+export type NotifyTried = { ok: true; where: string } | { ok: false; error: string };
+
+export const tryNotify = createServerFn({ method: "POST" })
+  .validator(readDeskId)
+  .handler(async ({ data }): Promise<NotifyTried> => {
+    const store = await import("./store.server.ts");
+    const desk = await store.readDesk(data.deskId);
+    if (!desk?.notifyUrl) return { ok: false, error: "还没填通知地址。" };
+    const drive = await import("./drive.server.ts");
+    const origin = drive.selfOrigin();
+    const sent = await sendNotify(desk.notifyUrl, `【测试】这个工作区的通知已接通。定时任务做完、或你让它发消息时，会发到这里。${origin ? `\n工作区：${origin}/?desk=${desk.id}` : ""}`);
+    return sent.ok ? { ok: true, where: sent.where } : { ok: false, error: `${sent.where}没收到：${sent.error}` };
   });
 
 function readScheduleRemove(input: unknown): { deskId: string; scheduleId: string } {
@@ -1374,8 +1477,20 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
   const self = origin === undefined ? drive.selfOrigin() : origin;
   runProgress.open(run.id, seqBase);
   const finish = async (status: Exclude<RunStatus, "running">, result: DeskResult, state: DeskState): Promise<RunReply> => {
+    const soFar = runProgress.read(run.id).events;
+    const rounds = soFar.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds);
+    // A scheduled run nobody is watching: its summary goes to the desk's
+    // notify address (once, when the run is over for good).
+    const carryingOn = status === "paused" && carriesOn({ ...run, status, events: [...run.events, ...soFar] });
+    if (run.trigger === "schedule" && desk.notifyUrl && !carryingOn) {
+      const when = (await store.listSchedules(desk.id)).find((item) => item.lastRunId === run.id);
+      const text = scheduleSummary({ when: when ? describeWhen(when.time, when.tz) : "每天", task: run.task, status, answer: result.ok ? result.answer : result.error, link: self ? `${self}/?desk=${desk.id}` : "" });
+      const sent = await sendNotify(desk.notifyUrl, text);
+      const event = runProgress.emit(run.id, sent.ok ? { kind: "notify", round: rounds, ok: true, where: sent.where, auto: true } : { kind: "notify", round: rounds, ok: false, where: sent.where, error: sent.error, auto: true });
+      // The flusher has stopped by now; this one is written by hand.
+      if (event) await store.appendRunEvents(run.id, [event], rounds);
+    }
     const events = runProgress.read(run.id).events;
-    const rounds = events.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds);
     const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
     const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched, plan: result.plan };
     if (status === "done" && endedWithAsk(events)) outcome.asked = true;
@@ -1427,6 +1542,8 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
       schedules: schedules.map((item) => ({ time: item.time, tz: item.tz, task: item.task })),
       scheduledBefore: run.events.some((event) => event.kind === "schedule"),
       scheduled: run.trigger === "schedule",
+      notifyUrl: desk.notifyUrl,
+      notifiedBefore: run.events.some((event) => event.kind === "notify" && event.ok && !event.auto),
     });
     await alive.stop();
     const events = runProgress.read(run.id).events;

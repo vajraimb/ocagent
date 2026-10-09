@@ -20,6 +20,7 @@ import {
   PackagePlus,
   RotateCcw,
   Search,
+  Send,
   ShieldAlert,
   ShieldCheck,
   StickyNote,
@@ -81,6 +82,9 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
   const rounds = foldRounds(turn.events);
   const calls = rounds.reduce((sum, round) => sum + round.effects.length, 0);
   const loaded = rounds.flatMap((round) => round.modules.map((mod) => mod.name));
+  // Messages this run sent (or failed to) to the desk's notify address, shown even when the timeline is folded.
+  const sent = rounds.flatMap((round) => round.notified);
+  const lastSent = sent[sent.length - 1] ?? null;
   // An older run's timeline is fetched when it is first opened.
   const unfetched = rounds.length === 0 && (turn.rounds ?? 0) > 0;
   const hasProcess = rounds.length > 0 || turn.steps.length > 0 || unfetched;
@@ -167,6 +171,12 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
                 {name}
               </span>
             ))}
+            {lastSent ? (
+              <span className={`inline-flex min-h-8 items-center gap-1 rounded-md border bg-bg px-2 text-[11px] ${lastSent.ok ? "border-accent/40 text-accent" : "border-warn/40 text-warn"}`} title={lastSent.ok ? undefined : lastSent.error}>
+                {lastSent.ok ? <Send className="h-3 w-3" aria-hidden /> : <TriangleAlert className="h-3 w-3" aria-hidden />}
+                {lastSent.ok ? `已发到${lastSent.where}` : `没发到${lastSent.where}`}
+              </span>
+            ) : null}
             {onContinue ? (
               <button type="button" onClick={onContinue} className="ml-auto inline-flex min-h-8 items-center gap-1 rounded-md border border-border px-2 text-xs text-fg hover:border-primary">
                 <RotateCcw className="h-3 w-3" aria-hidden />
@@ -305,7 +315,13 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
             tone="accent"
           />
         ))}
+        {round.notified.filter((item) => !item.auto).map((item, index) => (
+          <Row key={`sent-${index}`} icon={item.ok ? <Send className="h-3.5 w-3.5" aria-hidden /> : <TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label={item.ok ? `发到了${item.where}` : `没发到${item.where}`} detail={item.ok ? undefined : item.error} tone={item.ok ? "accent" : "warn"} />
+        ))}
         {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} span={spanOf(round)} /> : null}
+        {round.notified.filter((item) => item.auto).map((item, index) => (
+          <Row key={`auto-${index}`} icon={item.ok ? <Send className="h-3.5 w-3.5" aria-hidden /> : <TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label={item.ok ? `结果摘要已发到${item.where}` : `结果摘要没发到${item.where}`} detail={item.ok ? undefined : item.error} tone={item.ok ? "accent" : "warn"} />
+        ))}
       </div>
     </li>
   );
@@ -449,6 +465,8 @@ function iconFor(tool: string): ReactNode {
       return <Blocks className={cls} aria-hidden />;
     case "Harness.install":
       return <PackagePlus className={cls} aria-hidden />;
+    case "Notify.send":
+      return <Send className={cls} aria-hidden />;
     case "compile":
       return <Hammer className={cls} aria-hidden />;
     default:
@@ -479,6 +497,7 @@ function toolLabel(tool: string): string {
     "Clock.now": "计时",
     "Harness.load": "装为 harness",
     "Harness.install": "安装库",
+    "Notify.send": "发通知",
     compile: "编译未通过",
     list_files: "列出文件",
     read_file: "读文件",
