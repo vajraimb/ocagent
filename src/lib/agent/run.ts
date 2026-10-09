@@ -759,7 +759,7 @@ export async function runDeskLoop(
     }
     if (haltReason) return { ok: false, error: stallAnswer(haltReason, haltDetail), ...carried };
     if (result.status === "stopped") return { ok: true, answer: result.answer, stopped: true, ...carried };
-    return { ok: true, answer: presentAnswer(task, result.answer), ...carried };
+    return { ok: true, answer: presentAnswer(task, dropBinaryNote(result.answer)), ...carried };
   } catch (err) {
     return {
       ok: false,
@@ -780,6 +780,21 @@ export async function runDeskLoop(
 // The loop binary's own early finish after a step wrote a .ml file.
 export function binaryCut(answer: string): boolean {
   return /^已写下 /.test(answer.trim());
+}
+
+// The loop binary still has its own, older idea of loading a harness (picking a
+// .ml by name from the task). Installing now happens through Harness.install on
+// this side, so when a task merely mentions "harness" or "加载" the binary tacks
+// "没有加载成 harness。" onto an answer that is otherwise right. Drop that note;
+// the module row and the effect log already say what was installed.
+const BINARY_LOAD_NOTE = "没有加载成 harness。";
+
+export function dropBinaryNote(answer: string): string {
+  const lines = answer.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1].trim() === BINARY_LOAD_NOTE) lines.pop();
+  const kept = lines.join("\n").trim();
+  if (kept) return kept;
+  return answer.trim() === BINARY_LOAD_NOTE ? "同一步重复了，没有写出文件。" : answer;
 }
 
 // A last outcome small enough to store with a paused run.

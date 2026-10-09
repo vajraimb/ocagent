@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
-import { HISTORY_SHOWN, MAX_FILE_BYTES, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
+import { HISTORY_SHOWN, MAX_FILE_BYTES, dropBinaryNote, historyBlock, historyFor, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps, type RunRecord } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
 import type { AgentEventBody } from "./progress.ts";
 
@@ -225,6 +225,32 @@ test("the binary's own finish after writing a .ml becomes a pause, with the chec
   const text = promptContext({ round: 2, segment: 2, remainingMs: 60_000, files: [{ path: "greet.ml", bytes: 15 }], last: result.last ?? null, plan: result.plan.items, check: result.plan.pending ?? undefined });
   assert.match(text, /【收尾前核对】[\s\S]*已写 greet\.ml/);
   assert.match(text, /Files\.write_file greet\.ml → Ok/);
+});
+
+test("the binary's stale '没有加载成 harness' note is dropped from an answer that installed through Harness.install", async () => {
+  const result = await runDeskLoop(
+    "key",
+    "把它装成 harness，然后调用一次给我看",
+    [],
+    ["ocaml", "files"],
+    [],
+    [],
+    "",
+    deps({
+      runCore: async (job, handlers) => {
+        await handlers.model("prompt");
+        await handlers.ocaml(`step\n${block("code")}0\n`);
+        // The binary's own loader found nothing to pick, so it tacks its note onto the model's answer.
+        return { status: "done", answer: "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!\n没有加载成 harness。", files: [], modules: [{ name: "Greet", body: "let hello n = n", source: "greet.ml" }], steps: [], journal: [], memory: "" };
+      },
+      runPayload: async () => okFrame("done", "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!", "Harness.install\tgreet.ml\tOk"),
+    }, []),
+  );
+  assert.equal(result.ok, true);
+  assert.equal(result.answer, "已装成 harness 并调用 Greet.hello()：打印 Hello, Michael!");
+  assert.deepEqual(dropBinaryNote("没有加载成 harness。"), "同一步重复了，没有写出文件。");
+  assert.deepEqual(dropBinaryNote("好了。\n没有加载成 harness。\n没有加载成 harness。"), "好了。");
+  assert.deepEqual(dropBinaryNote("好了。"), "好了。");
 });
 
 test("a busy model endpoint is asked again before the round is given up", async () => {
