@@ -5,7 +5,7 @@ import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isMemoryEffect, isPlanEffect, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
-import { imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
+import { applyFileDelta, imageBytes, isImageFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
@@ -803,38 +803,53 @@ export const loadDesk = createServerFn({ method: "POST" })
     return { found: true, durable, desk: publicDesk(desk), runs };
   });
 
-export type DeskSaved = { ok: true; desk: PublicDesk } | { ok: false; error: string };
+export type DeskSaved = { ok: true; revision: number; files: number } | { ok: false; error: string };
+export type DeskCleared = { ok: true; desk: PublicDesk } | { ok: false; error: string };
 
-type SaveInput = { deskId: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[] };
+type SaveInput = { deskId: string; harnesses: HarnessId[]; notes: string[]; modules: DeskModule[] | null; put: DeskFile[]; remove: string[] };
 
-// The page's settings and files: everything but the loop's own journal/memory,
-// which only a run may change. Creating a desk is the same call.
+function readSave(input: unknown): SaveInput {
+  const { deskId } = readDeskId(input);
+  const body = input as Record<string, unknown>;
+  // Each put is checked as a file; the merged desk is checked against the caps below.
+  const puts = parseDeskState({ files: Array.isArray(body.put) ? body.put : [], journal: [], memory: "" });
+  if ("error" in puts) throw new Error(puts.error);
+  const remove = Array.isArray(body.remove) ? body.remove.filter((path): path is string => typeof path === "string" && safePath(path)).slice(0, MAX_FILES) : [];
+  const modules = Array.isArray(body.modules) ? normalizeModules(body.modules) : null;
+  return { deskId, harnesses: normalizeHarnesses(body.harnesses), notes: normalizeNotes(body.notes), modules, put: puts.files, remove };
+}
+
+// The page's settings and files, sent as changes: files that are new or
+// edited (`put`), paths dropped (`remove`), modules only when they changed.
+// The server merges them into the desk it has, so a desk full of pictures is
+// not re-uploaded on every change and two devices do not overwrite each other
+// wholesale. The loop's own journal/memory are left alone. Creating a desk is
+// the same call.
 export const saveDesk = createServerFn({ method: "POST" })
-  .validator((input: unknown): SaveInput => {
-    const { deskId } = readDeskId(input);
-    const parsed = parseDeskState({ ...(input as object), journal: [], memory: "" });
-    if ("error" in parsed) throw new Error(parsed.error);
-    return { deskId, files: parsed.files, harnesses: parsed.harnesses, modules: parsed.modules, notes: parsed.notes };
-  })
+  .validator(readSave)
   .handler(async ({ data }): Promise<DeskSaved> => {
     const store = await import("./store.server.ts");
     const live = await store.activeRun(data.deskId);
     if (live?.status === "running") return { ok: false, error: "它还在做上一件事，做完再改工作区。" };
     const current = await store.readDesk(data.deskId);
+    const files = applyFileDelta(current?.files ?? [], { put: data.put, remove: data.remove });
+    const modules = data.modules ?? current?.modules ?? [];
+    const merged = parseDeskState({ files, harnesses: data.harnesses, modules, notes: data.notes, journal: [], memory: "" });
+    if ("error" in merged) return { ok: false, error: merged.error };
     const saved = await store.writeDesk(data.deskId, {
-      files: data.files,
-      harnesses: data.harnesses,
-      modules: data.modules,
+      files: merged.files,
+      harnesses: merged.harnesses,
+      modules: merged.modules,
       journal: current?.journal ?? [],
       memory: current?.memory ?? "",
-      notes: data.notes,
+      notes: merged.notes,
     });
-    return { ok: true, desk: publicDesk(saved) };
+    return { ok: true, revision: saved.revision, files: saved.files.length };
   });
 
 export const clearDesk = createServerFn({ method: "POST" })
   .validator(readDeskId)
-  .handler(async ({ data }): Promise<DeskSaved> => {
+  .handler(async ({ data }): Promise<DeskCleared> => {
     const store = await import("./store.server.ts");
     const live = await store.activeRun(data.deskId);
     if (live?.status === "running") return { ok: false, error: "它还在做上一件事，做完再清空。" };

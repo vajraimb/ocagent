@@ -11,6 +11,53 @@ export function imageBytes(file: Pick<DeskFile, "content">): number {
   return comma < 0 ? 0 : Math.floor(((file.content.length - comma - 1) * 3) / 4);
 }
 
+// The page stores the desk as changes, not as a whole: only files that are new
+// or edited go up, and removals go up by path. A desk full of pictures would
+// otherwise be re-uploaded on every settings change, which on a phone is what
+// fails ("Load failed") and what blocks every save after it.
+export type FileDelta = { put: DeskFile[]; remove: string[] };
+
+export function fileDelta(synced: ReadonlyMap<string, string>, files: DeskFile[]): FileDelta {
+  const put = files.filter((file) => synced.get(file.path) !== file.content);
+  const present = new Set(files.map((file) => file.path));
+  const remove = [...synced.keys()].filter((path) => !present.has(path));
+  return { put, remove };
+}
+
+/** The server side of a delta: removals first, then puts replace or append, keeping the existing order. */
+export function applyFileDelta(current: DeskFile[], delta: FileDelta): DeskFile[] {
+  const gone = new Set(delta.remove);
+  const next = current.filter((file) => !gone.has(file.path));
+  for (const file of delta.put) {
+    const at = next.findIndex((item) => item.path === file.path);
+    if (at >= 0) next[at] = file;
+    else next.push(file);
+  }
+  return next;
+}
+
+// One save request stays well under what mobile networks and the deployment's
+// request limit take comfortably; a single bigger file still goes alone.
+export const SAVE_BATCH_CHARS = 900_000;
+
+export function batchPuts(put: DeskFile[], limit = SAVE_BATCH_CHARS): DeskFile[][] {
+  const batches: DeskFile[][] = [];
+  let batch: DeskFile[] = [];
+  let size = 0;
+  for (const file of put) {
+    const chars = file.content.length + file.path.length;
+    if (batch.length > 0 && size + chars > limit) {
+      batches.push(batch);
+      batch = [];
+      size = 0;
+    }
+    batch.push(file);
+    size += chars;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
 export type ToolStep = {
   tool: string;
   detail: string;

@@ -22,7 +22,7 @@ import {
   type RunRecord,
   type RunReply,
 } from "@/lib/agent/run";
-import { MAX_FILES, isImageFile, safePath, type DeskFile } from "@/lib/agent/workspace";
+import { MAX_FILES, batchPuts, fileDelta, isImageFile, safePath, type DeskFile } from "@/lib/agent/workspace";
 
 // The browser keeps only the desk's key and a cache for the first paint; the
 // desk itself (files, harnesses, modules) and every run live on the server.
@@ -136,8 +136,8 @@ function isPicture(item: File): boolean {
 
 // The longest edge a picture is shrunk to, and the biggest encoded size that
 // fits a file slot (base64 grows it by a third) and a model call.
-const PICTURE_EDGE = 1280;
-const PICTURE_MAX_CHARS = 480_000;
+const PICTURE_EDGE = 1024;
+const PICTURE_MAX_CHARS = 360_000;
 
 // Re-encodes a picture as a JPEG data URL small enough for the workspace.
 async function shrinkPicture(item: File): Promise<string | null> {
@@ -293,28 +293,52 @@ export function Workbench() {
     setRuns((current) => current.map((run) => (run.id === runId ? patch(run) : run)));
   }, []);
 
+  // What the server is known to hold, so a save sends only the difference.
+  const stored = useRef<{ files: Map<string, string>; modules: DeskModule[] | null }>({ files: new Map(), modules: null });
+  // Saves that failed on the connection are retried with growing pauses.
+  const saveAttempts = useRef(0);
+  const [retryTick, setRetryTick] = useState(0);
+
   const absorbDesk = useCallback((desk: PublicDesk) => {
-    setFiles(desk.files.filter(keepFile));
+    const kept = desk.files.filter(keepFile);
+    setFiles(kept);
     setHarnesses(desk.harnesses.length ? desk.harnesses : DEFAULT_HARNESSES);
     setModules(desk.modules);
     setNotes(desk.notes ?? []);
+    stored.current = { files: new Map(kept.map((file) => [file.path, file.content])), modules: desk.modules };
     synced.current = true;
     dirty.current = false;
   }, []);
 
-  // Stores the page's settings on the server; creates the desk the first time.
+  // Stores the page's settings on the server as changes (new or edited files,
+  // removed paths, modules when they changed); creates the desk the first time.
   const saveFailed = useRef(false);
   const sync = useCallback(async (): Promise<boolean> => {
     if (!deskId) return false;
     const snapshot = latest.current;
+    const delta = fileDelta(stored.current.files, snapshot.files);
+    const modulesChanged = stored.current.modules !== snapshot.modules;
+    const batches = batchPuts(delta.put);
+    const requests = batches.length ? batches : [[]];
     try {
-      const saved = await saveDesk({ data: { deskId, files: snapshot.files, harnesses: snapshot.harnesses, modules: snapshot.modules, notes: snapshot.notes } });
-      if (!saved.ok) {
-        saveFailed.current = true;
-        setNotice(saved.error);
-        return false;
+      for (const [index, put] of requests.entries()) {
+        const last = index === requests.length - 1;
+        const saved = await saveDesk({
+          data: { deskId, harnesses: snapshot.harnesses, notes: snapshot.notes, modules: modulesChanged ? snapshot.modules : undefined, put, remove: last ? delta.remove : [] },
+        });
+        if (!saved.ok) {
+          saveFailed.current = true;
+          setNotice(saved.error);
+          return false;
+        }
+        for (const file of put) stored.current.files.set(file.path, file.content);
+        if (last) {
+          for (const path of delta.remove) stored.current.files.delete(path);
+          if (modulesChanged) stored.current.modules = snapshot.modules;
+        }
       }
       synced.current = true;
+      saveAttempts.current = 0;
       if (latest.current === snapshot) dirty.current = false;
       // Only a save error of our own is cleared here; other notices stay.
       if (saveFailed.current) {
@@ -324,7 +348,16 @@ export function Workbench() {
       return true;
     } catch (caught) {
       saveFailed.current = true;
-      setNotice(`工作区没有存上：${caught instanceof Error ? caught.message : "连不上服务器"}`);
+      if (isConnectionLoss(caught)) {
+        // The connection dropped (phone locked, network changed): what went up
+        // in earlier batches is kept; the rest goes again after a pause.
+        saveAttempts.current += 1;
+        const wait = Math.min(20_000, 2_000 * 2 ** (saveAttempts.current - 1));
+        setNotice(`工作区还没存上：网络断了一下，${Math.round(wait / 1000)} 秒后再试。`);
+        window.setTimeout(() => setRetryTick((tick) => tick + 1), wait);
+      } else {
+        setNotice(`工作区没有存上：${caught instanceof Error ? caught.message : "连不上服务器"}`);
+      }
       return false;
     }
   }, [deskId]);
@@ -400,12 +433,26 @@ export function Workbench() {
     }
   }, [ready, deskId, files, harnesses, modules, notes, runs]);
 
-  // Settings edited between runs are stored shortly after.
+  // Settings edited between runs are stored shortly after; a save that lost
+  // its connection is tried again (retryTick), and when the page comes back
+  // to the foreground or the network returns.
   useEffect(() => {
     if (!ready || !deskId || running || !dirty.current) return;
     const timer = window.setTimeout(() => void sync(), 600);
     return () => window.clearTimeout(timer);
-  }, [ready, deskId, running, files, harnesses, modules, notes, sync]);
+  }, [ready, deskId, running, files, harnesses, modules, notes, retryTick, sync]);
+
+  useEffect(() => {
+    const again = () => {
+      if (dirty.current && document.visibilityState === "visible") setRetryTick((tick) => tick + 1);
+    };
+    document.addEventListener("visibilitychange", again);
+    window.addEventListener("online", again);
+    return () => {
+      document.removeEventListener("visibilitychange", again);
+      window.removeEventListener("online", again);
+    };
+  }, []);
 
   const settle = useCallback(
     (runId: string, patch: (run: RunRecord) => RunRecord) => {
