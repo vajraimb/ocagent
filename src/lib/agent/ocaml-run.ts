@@ -210,7 +210,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Trace、Clock、Harness、Plan、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -1053,6 +1053,14 @@ module Clock = struct
     let t = Sys.time () in
     log_effect "Clock.now" "" (string_of_float t);
     t
+end
+
+module Plan = struct
+  let set items =
+    log_effect "Plan.set" "" (String.concat "\\031" (List.map String.trim items))
+
+  let tick n note =
+    log_effect "Plan.tick" (string_of_int n) note
 end
 
 module Harness = struct

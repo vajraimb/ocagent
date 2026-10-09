@@ -150,6 +150,14 @@ function withNote(effects: string, note: string): string {
   return `${base}${base ? "\n" : ""}Trace.note\t\t${flat}`;
 }
 
+// Turns a step's Done into a Continue so the loop asks for one more round (the
+// pre-finish check); null when the frame is not a Done.
+export function holdDone(raw: string): string | null {
+  const frame = readFrame(raw);
+  if (!frame || frame.kind !== "done") return null;
+  return writeFrame({ ...frame, kind: "continue" });
+}
+
 export function rewriteStep(raw: string, task: string, redirects: number): { raw: string; usedRedirect: boolean } {
   const frame = readFrame(raw);
   if (!frame) return { raw, usedRedirect: false };

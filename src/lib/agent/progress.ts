@@ -15,9 +15,70 @@ export type AgentEventBody =
   | { kind: "step"; round: number; reply: string; text: string }
   | { kind: "module"; round: number; name: string; exports: string[] }
   | { kind: "module_dropped"; name: string; reason: string }
+  | { kind: "todo"; round: number; items: PlanItem[] }
+  | { kind: "check"; round: number; answer: string }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };
+
+/** One item of the plan the model keeps with Plan.set / Plan.tick. */
+export type PlanItem = { text: string; done: boolean; note: string };
+
+/**
+ * The plan across a whole run, plus the pre-finish check: how many times the
+ * loop has held a Done for a check, whether anything was written (what makes
+ * a check worth a round), and the answer being held while the check runs.
+ */
+export type PlanState = { items: PlanItem[]; checks: number; wrote: boolean; pending: string | null };
+
+export function emptyPlan(): PlanState {
+  return { items: [], checks: 0, wrote: false, pending: null };
+}
+
+const PLAN_SEP = "\u001f";
+const MAX_PLAN_ITEMS = 12;
+
+/** Applies one step's Plan.* effects to the plan; true when it changed. */
+export function applyPlanEffects(plan: PlanState, effects: { tool: string; detail: string; output: string }[]): boolean {
+  let changed = false;
+  for (const effect of effects) {
+    if (effect.tool === "Plan.set") {
+      const items = effect.output
+        .split(PLAN_SEP)
+        .map((text) => text.trim())
+        .filter(Boolean)
+        .slice(0, MAX_PLAN_ITEMS);
+      if (items.length === 0) continue;
+      // Re-planning keeps the ticks of items that kept their text.
+      plan.items = items.map((text) => {
+        const before = plan.items.find((item) => item.text === text);
+        return { text: clip(text, 200), done: before?.done ?? false, note: before?.note ?? "" };
+      });
+      changed = true;
+    } else if (effect.tool === "Plan.tick") {
+      const index = Number(effect.detail.trim()) - 1;
+      const item = plan.items[index];
+      if (!item) continue;
+      item.done = true;
+      item.note = clip(effect.output.trim(), 300);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+export function isPlanEffect(tool: string): boolean {
+  return tool === "Plan.set" || tool === "Plan.tick";
+}
+
+/** The plan as the timeline last saw it, or null when the run never set one. */
+export function latestPlan(events: AgentEvent[]): PlanItem[] | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event?.kind === "todo") return event.items;
+  }
+  return null;
+}
 
 export type JobSnapshot<Result> = {
   found: boolean;
@@ -236,6 +297,8 @@ export type Round = {
   effects: { tool: string; detail: string; output: string }[];
   modules: { name: string; exports: string[] }[];
   reply: { kind: string; text: string } | null;
+  /** The answer the model wanted to end with, when the loop held it for a check. */
+  check: string;
 };
 
 export function foldRounds(events: AgentEvent[]): Round[] {
@@ -243,7 +306,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "" };
       rounds.set(round, found);
     }
     return found;
@@ -296,6 +359,9 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         round.reply = { kind: event.reply, text: event.text };
         break;
       }
+      case "check":
+        at(event.round).check = event.answer;
+        break;
       default:
         break;
     }

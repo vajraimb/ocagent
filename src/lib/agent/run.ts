@@ -1,8 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
 import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { fetchPublic } from "./net.ts";
-import { presentAnswer, rewriteStep } from "./present.ts";
-import { clip, describeModelReply, describeStepFrame, extractCode, type AgentEvent, type AgentEventBody } from "./progress.ts";
+import { holdDone, presentAnswer, rewriteStep } from "./present.ts";
+import { applyPlanEffects, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isPlanEffect, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { searchWeb } from "./search.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
@@ -10,7 +10,7 @@ import { safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } f
 export type { JournalItem };
 export type { RunOutcome, RunRecord, RunStatus };
 
-type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
+type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[] };
 
 export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: false; error: string } & DeskCarried);
 
@@ -84,17 +84,18 @@ export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): 
 代码块之外不要写任何文字。想解释思路，写成 OCaml 注释 (* ... *)。
 
 【你能用什么】
-只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Search、Net、Trace、Clock、Harness、Plan，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
 这次开着的能力：${opened.length ? opened.join("、") : "没有"}。没开的调用会得到 Error。
 
 【节奏：先计划，再做，最后核对】
-- 第 1 轮：用 Trace.note 写下 2–5 条的计划（一行一条），并在同一步做第一件事。
-- 之后每轮做计划里的下一项；做完一项就 Trace.note 记一笔，写清结果里的关键值。
-- Done 之前先核对：读一遍写出的文件，或看一眼上一步的返回，确认任务要的都在了，再在下一轮 Done。
-- 每一轮的提示末尾会附上：工作区现在的文件列表、上一步每次调用的返回值、还剩多少时间。不必为了看见它们而专门 Trace.note，但更早几轮的返回只留在 note 里。
+- 一步做不完的任务，第 1 轮先 Plan.set ["第一件事"; "第二件事"; …]（2–6 条，每条一句话），并在同一步做第一件事。一步能做完的任务不用计划。
+- 做完一项就 Plan.tick n "结果里的关键值"（n 从 1 数起）。计划会原样附在每一轮的提示里，带上勾选状态，不必再用 Trace.note 重复。
+- 计划要改就再 Plan.set 一次：文字没变的项保留勾选。
+- Done 之前先核对：读一遍写出的文件，或用装好的 module 算一个已知值，确认任务要的都在了，再 Done。写过文件的任务，第一次 Done 会被拦下来再给一轮核对；核对过了就正常 Done，不会再拦。
+- 每一轮的提示末尾会附上：工作区现在的文件列表、上一步每次调用的返回值、计划、还剩多少时间。更早几轮的返回只留在 note 和计划的 tick 里。
 
 【harness：把代码装成可复用的 module】
 - Harness.load "Name" "path/file.ml"：把工作区里的一个 .ml 装成 module Name。装上后，从下一步起可以直接写 Name.func …，不用再读文件。
@@ -139,6 +140,11 @@ module Harness : sig
   val load : string -> string -> string res
   val install : string -> string -> string res
   val unload : string -> string res
+end
+
+module Plan : sig
+  val set : string list -> unit
+  val tick : int -> string -> unit
 end
 
 type reply =
@@ -210,7 +216,7 @@ export type LastOutcome =
   | { kind: "model_error"; message: string }
   | null;
 
-export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome };
+export type PromptContext = { round: number; segment: number; remainingMs: number; files: FileEntry[]; last: LastOutcome; plan?: PlanItem[]; check?: string | null };
 
 const MAX_PROMPT = 24_000;
 const MAX_CONTEXT = 20_000;
@@ -245,6 +251,17 @@ export function promptContext(ctx: PromptContext): string {
     parts.push(`【上一步没有跑起来】\n${clip(last.message, 600)}`);
   } else if (last?.kind === "model_error") {
     parts.push(`【上一轮模型没有回应】\n${clip(last.message, 400)}`);
+  }
+  if (ctx.plan && ctx.plan.length > 0) {
+    const done = ctx.plan.filter((item) => item.done).length;
+    const lines = ctx.plan.map((item, index) => `${item.done ? "[x]" : "[ ]"} ${index + 1}. ${item.text}${item.done && item.note ? ` — ${clip(item.note, 160)}` : ""}`);
+    parts.push(`【计划 ${done}/${ctx.plan.length}】\n${lines.join("\n")}${done < ctx.plan.length ? "\n接着做第一条没打勾的；做完用 Plan.tick 打勾。" : "\n都打勾了。核对一下就可以 Done。"}`);
+  }
+  if (ctx.check) {
+    const open = ctx.plan?.flatMap((item, index) => (item.done ? [] : [`${index + 1}. ${item.text}`])) ?? [];
+    parts.push(
+      `【收尾前核对】你上一步想用这个答案结束：「${clip(ctx.check, 500)}」。先核对一次再 Done：读一遍写出的文件、或用装好的 module 算一个已知的值，确认任务要的都在、内容没错。${open.length ? `计划里还有没打勾的：${open.join("；")}——做完或说明为什么不用做。` : ""}核对没问题，就在核对的同一步（或下一轮）Done，答案可以修正；发现遗漏就补上再 Done。这次不会再被拦。`,
+    );
   }
   const seconds = Math.max(0, Math.round(ctx.remainingMs / 1000));
   const segment = ctx.segment > 1 ? `这是接着上一段继续的第 ${ctx.segment} 段。` : "";
@@ -361,6 +378,8 @@ const MIN_ROUND_MS = 12_000;
 const MAX_COMPILE_STALL = 4;
 const MAX_IDLE_STALL = 5;
 const MAX_RUNNER_STALL = 2;
+// Effects that change the desk: a run that did any of these gets a check round.
+const WRITES = new Set(["Files.write_file", "Files.delete_file", "Harness.load", "Harness.install"]);
 
 export function runBudgetMs(): number {
   const raw = Number(process.env.OCAGENT_RUN_BUDGET_MS);
@@ -380,6 +399,8 @@ export type LoopDeps = {
   roundBase?: number;
   /** Which segment of the run this is (1 for a fresh run). */
   segment?: number;
+  /** The plan and check state earlier segments left; a fresh run starts empty. */
+  plan?: PlanState;
 };
 
 export async function runDeskLoop(
@@ -417,6 +438,10 @@ export async function runDeskLoop(
   let fileIndex: FileEntry[] = files.map((file) => ({ path: file.path, bytes: Buffer.byteLength(file.content) }));
   let lastCode = "";
   let last: LastOutcome = null;
+  // The plan the model keeps with Plan.set / Plan.tick, and the pre-finish
+  // check: the first Done of a run that wrote anything is held for one more
+  // round so the model verifies its work before the answer goes out.
+  const plan: PlanState = deps.plan ? { ...deps.plan, items: deps.plan.items.map((item) => ({ ...item })) } : emptyPlan();
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -451,7 +476,8 @@ export async function runDeskLoop(
           }
           round += 1;
           emit({ kind: "think", round });
-          const context = promptContext({ round, segment, remainingMs: deadline - Date.now(), files: fileIndex, last });
+          const context = promptContext({ round, segment, remainingMs: deadline - Date.now(), files: fileIndex, last, plan: plan.items, check: plan.pending });
+          plan.pending = null;
           // A failed compile deserves a more careful second look.
           const effort: Effort = last?.kind === "compile_failed" ? "medium" : "low";
           const raw = await askModel(apiKey, prompt, context, harnesses, loaded, signal, effort);
@@ -511,13 +537,29 @@ export async function runDeskLoop(
               idleStall = 0;
               if (compileStall >= MAX_COMPILE_STALL) cut("compile_stall", frame.message);
             } else if (frame?.kind === "ok") {
-              for (const effect of frame.effects) emit({ kind: "effect", round, ...effect });
-              emit({ kind: "step", round, reply: frame.reply, text: frame.text });
-              last = { kind: "ran", round, reply: frame.reply, text: frame.text, effects: frame.effects };
+              if (applyPlanEffects(plan, frame.effects)) emit({ kind: "todo", round, items: plan.items.map((item) => ({ ...item })) });
+              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool));
+              for (const effect of effects) emit({ kind: "effect", round, ...effect });
+              if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
+              let reply = frame.reply;
+              let raw = next.raw;
+              if (reply === "done" && plan.checks === 0 && (plan.wrote || plan.items.some((item) => !item.done))) {
+                const held = holdDone(raw);
+                if (held) {
+                  plan.checks += 1;
+                  plan.pending = frame.text;
+                  raw = held;
+                  reply = "continue";
+                  emit({ kind: "check", round, answer: frame.text });
+                }
+              }
+              emit({ kind: "step", round, reply, text: frame.text });
+              last = { kind: "ran", round, reply, text: frame.text, effects };
               if (frame.files) fileIndex = frame.files;
               compileStall = 0;
-              idleStall = frame.reply === "continue" && frame.effects.length === 0 ? idleStall + 1 : 0;
+              idleStall = reply === "continue" && effects.length === 0 && !plan.pending ? idleStall + 1 : 0;
               if (idleStall >= MAX_IDLE_STALL) cut("idle_stall", frame.text);
+              return raw;
             }
           }
           return next.raw;
@@ -531,6 +573,7 @@ export async function runDeskLoop(
       modules: mergeModules(Array.isArray(result?.modules) ? result.modules : modules, loaded, unloaded),
       journal: Array.isArray(result?.journal) ? result.journal : journal,
       memory: typeof result?.memory === "string" ? result.memory : memory,
+      plan,
     };
     if (!result || (result.status !== "error" && result.status !== "stopped" && result.status !== "done")) {
       return { ok: false, error: "循环没有留下结果。", ...carried };
@@ -551,6 +594,7 @@ export async function runDeskLoop(
       modules,
       journal,
       memory,
+      plan,
     };
   } finally {
     clearTimeout(timer);
@@ -625,16 +669,17 @@ function readRunId(input: unknown): { runId: string; after: number } {
   return { runId, after };
 }
 
-export type DeskLoad = { found: false } | { found: true; desk: PublicDesk; runs: RunRecord[] };
+export type DeskLoad = { found: false; durable: boolean } | { found: true; durable: boolean; desk: PublicDesk; runs: RunRecord[] };
 
 export const loadDesk = createServerFn({ method: "POST" })
   .validator(readDeskId)
   .handler(async ({ data }): Promise<DeskLoad> => {
     const store = await import("./store.server.ts");
+    const durable = store.isDurable();
     const desk = await store.readDesk(data.deskId);
-    if (!desk) return { found: false };
+    if (!desk) return { found: false, durable };
     const runs = await store.listRuns(data.deskId);
-    return { found: true, desk: publicDesk(desk), runs };
+    return { found: true, durable, desk: publicDesk(desk), runs };
   });
 
 export type DeskSaved = { ok: true; desk: PublicDesk } | { ok: false; error: string };
@@ -730,7 +775,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
     const events = runProgress.read(run.id).events;
     const rounds = events.reduce((max, event) => ("round" in event && event.round > max ? event.round : max), run.rounds);
     const touched = [...new Set(result.steps.filter((step) => state.files.some((file) => file.path === step.detail)).map((step) => step.detail))];
-    const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched };
+    const outcome: RunOutcome = { ok: result.ok && status !== "failed", answer: result.ok ? result.answer : result.error, steps: result.steps, touched, plan: result.plan };
     const saved = await store.writeDesk(desk.id, state);
     await store.finishRun(run.id, status, rounds, outcome);
     const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
@@ -740,7 +785,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
   };
   const state: DeskState = { files: desk.files, harnesses: desk.harnesses, modules: desk.modules, journal: desk.journal, memory: desk.memory };
   if (!apiKey) {
-    return finish("failed", { ok: false, error: "Grok 没有接上。", files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory }, state);
+    return finish("failed", { ok: false, error: "Grok 没有接上。", files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, plan: run.result?.plan ?? emptyPlan() }, state);
   }
   const started = Date.now();
   const { runCore, runPayload, verifyModuleSet } = await import("./ocaml-run.ts");
@@ -766,6 +811,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
       dropped: checked.dropped,
       roundBase: run.rounds,
       segment: run.segment,
+      plan: run.result?.plan,
     });
     await alive.stop();
     const events = runProgress.read(run.id).events;
@@ -773,7 +819,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord): Promise<RunReply> {
   } catch (err) {
     await alive.stop();
     const message = err instanceof Error ? err.message : "循环没有跑起来。";
-    return finish("failed", { ok: false, error: message, files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory }, state);
+    return finish("failed", { ok: false, error: message, files: desk.files, steps: [], modules: desk.modules, journal: desk.journal, memory: desk.memory, plan: run.result?.plan ?? emptyPlan() }, state);
   }
 }
 

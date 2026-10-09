@@ -1,9 +1,9 @@
 // Durable state for desks and runs (Postgres via @/lib/db: Neon when deployed,
 // embedded PGLite in the preview). Rows are unowned: a desk id is an
 // unguessable key the browser holds, and that key is the whole access model.
-import { getSql, type Sql } from "@/lib/db";
+import { dbSource, getSql, type Sql } from "@/lib/db";
 import { normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
-import type { AgentEvent } from "./progress.ts";
+import type { AgentEvent, PlanItem, PlanState } from "./progress.ts";
 import { safePath, type DeskFile, type JournalItem, type ToolStep } from "./workspace.ts";
 
 export type DeskState = { files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; journal: JournalItem[]; memory: string };
@@ -12,7 +12,12 @@ export type DeskRecord = DeskState & { id: string; revision: number; updatedAt: 
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
 
 // What a finished (or paused) run leaves behind besides its timeline.
-export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[] };
+export type RunOutcome = { ok: boolean; answer: string; steps: ToolStep[]; touched: string[]; plan?: PlanState };
+
+/** True when rows outlive this server instance (Neon), false on the embedded fallback. */
+export function isDurable(): boolean {
+  return dbSource === "neon";
+}
 
 export type RunRecord = {
   id: string;
@@ -102,7 +107,27 @@ function outcomeOf(raw: unknown): RunOutcome | null {
   if (!value || typeof value !== "object") return null;
   const item = value as Partial<RunOutcome>;
   if (typeof item.ok !== "boolean" || typeof item.answer !== "string") return null;
-  return { ok: item.ok, answer: item.answer, steps: Array.isArray(item.steps) ? item.steps : [], touched: Array.isArray(item.touched) ? item.touched : [] };
+  const outcome: RunOutcome = { ok: item.ok, answer: item.answer, steps: Array.isArray(item.steps) ? item.steps : [], touched: Array.isArray(item.touched) ? item.touched : [] };
+  const plan = planOf(item.plan);
+  if (plan) outcome.plan = plan;
+  return outcome;
+}
+
+function planOf(raw: unknown): PlanState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const value = raw as Partial<PlanState>;
+  const items: PlanItem[] = [];
+  for (const item of Array.isArray(value.items) ? value.items : []) {
+    if (!item || typeof item !== "object" || typeof (item as PlanItem).text !== "string") continue;
+    const it = item as Partial<PlanItem>;
+    items.push({ text: it.text ?? "", done: Boolean(it.done), note: typeof it.note === "string" ? it.note : "" });
+  }
+  return {
+    items,
+    checks: Number.isInteger(value.checks) ? (value.checks as number) : 0,
+    wrote: Boolean(value.wrote),
+    pending: typeof value.pending === "string" ? value.pending : null,
+  };
 }
 
 function statusOf(raw: string): RunStatus {

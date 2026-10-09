@@ -3,6 +3,7 @@ import { after, before, test } from "node:test";
 import { moduleNameFromUrl } from "./harness.ts";
 import { MAX_FILE_BYTES, mergeModules, parseDeskState, promptContext, runDeskLoop, type LoopDeps } from "./run.ts";
 import type { CoreJob, CoreResult, RunHooks } from "./ocaml-run.ts";
+import type { AgentEventBody } from "./progress.ts";
 
 const block = (text: string) => `${Buffer.byteLength(text)}\n${text}\n`;
 const okFrame = (reply: string, text: string, effects = "") => `ok\n${reply}\n${block(text)}${block("")}${block(effects)}0\n`;
@@ -246,4 +247,135 @@ test("a module unloaded by a step leaves the carried set; dropped modules are an
 test("mergeModules keeps verified loads, honours unloads", () => {
   const merged = mergeModules([{ name: "A", body: "old" }, { name: "B", body: "b" }], [{ name: "A", body: "new" }], ["B"]);
   assert.deepEqual(merged, [{ name: "A", body: "new" }]);
+});
+
+// A loop stand-in that honours the frame's reply: Done ends it, Continue asks again.
+function replyAwareCore(frames: string[], prompts: string[] = []) {
+  return async (job: CoreJob, handlers: Handlers): Promise<CoreResult> => {
+    let rounds = 0;
+    let answer = "";
+    while (rounds < frames.length + 2) {
+      rounds += 1;
+      const reply = await handlers.model("prompt");
+      if (reply.startsWith("error")) break;
+      prompts.push(reply);
+      const raw = await handlers.ocaml(`step\n${block("code")}0\n`);
+      const kind = raw.split("\n")[1];
+      answer = raw;
+      if (kind === "done" || kind === "partial" || kind === "ask") break;
+    }
+    return { status: "done", answer, files: job.files, modules: job.modules, steps: [], journal: job.journal, memory: job.memory };
+  };
+}
+
+test("Plan.set / Plan.tick become a checklist the next prompt sees, carried in the result", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    contexts.push(JSON.parse(String(init?.body)).input[0].content as string);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const frames = [
+    okFrame("continue", "planned", `Plan.set\t\t写 a.ml\u001f写 b.ml\u001f核对\nFiles.write_file\ta.ml\tOk\nPlan.tick\t1\ta.ml 12 行`),
+    okFrame("continue", "b", "Files.write_file\tb.ml\tOk\nPlan.tick\t2\tb.ml 写好"),
+    okFrame("done", "全部写好", "Files.read_file\ta.ml\tOk let x = 1\nPlan.tick\t3\t核对过"),
+    okFrame("done", "全部写好", ""),
+  ];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(
+      result.plan.items.map((item) => [item.text, item.done]),
+      [
+        ["写 a.ml", true],
+        ["写 b.ml", true],
+        ["核对", true],
+      ],
+    );
+    assert.equal(result.plan.items[0]?.note, "a.ml 12 行");
+    const todos = events.filter((event) => event.kind === "todo");
+    assert.equal(todos.length, 3);
+    // Plan effects are not shown as calls; the writes still are.
+    assert.ok(!events.some((event) => event.kind === "effect" && event.tool.startsWith("Plan.")));
+    assert.ok(events.some((event) => event.kind === "effect" && event.tool === "Files.write_file"));
+    assert.match(contexts[1] ?? "", /【计划 1\/3】[\s\S]*\[x\] 1\. 写 a\.ml — a\.ml 12 行[\s\S]*\[ \] 2\. 写 b\.ml/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("the first Done of a run that wrote files is held for one check round, the second goes through", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    contexts.push(JSON.parse(String(init?.body)).input[0].content as string);
+    return new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nx\n```" }] }] }), { status: 200 });
+  }) as typeof fetch;
+  const frames = [okFrame("done", "写好了 a.ml", "Files.write_file\ta.ml\tOk"), okFrame("done", "核对过，a.ml 没问题", "Files.read_file\ta.ml\tOk let x = 1")];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(i, 2, "two steps ran: the held Done, then the check");
+    const check = events.find((event) => event.kind === "check");
+    assert.ok(check && check.kind === "check" && check.answer === "写好了 a.ml");
+    const steps = events.filter((event) => event.kind === "step");
+    assert.deepEqual(
+      steps.map((event) => (event.kind === "step" ? event.reply : "")),
+      ["continue", "done"],
+    );
+    assert.match(contexts[1] ?? "", /【收尾前核对】你上一步想用这个答案结束：「写好了 a\.ml」/);
+    assert.equal(result.plan.checks, 1);
+    assert.equal(result.plan.pending, null);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a run that only looked things up is not held for a check", async () => {
+  const events: AgentEventBody[] = [];
+  const frames = [okFrame("done", "东京 18°C", "Trace.note\t\t已查")];
+  let i = 0;
+  const result = await runDeskLoop("key", "task", [], ["ocaml", "web"], [], [], "", {
+    runCore: replyAwareCore(frames),
+    runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+    emit: (event) => events.push(event),
+    budgetMs: 60_000,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(i, 1);
+  assert.ok(!events.some((event) => event.kind === "check"));
+  assert.equal(result.plan.checks, 0);
+});
+
+test("a continued segment inherits the plan and does not check twice", async () => {
+  const events: AgentEventBody[] = [];
+  const frames = [okFrame("done", "补完了", "Files.write_file\tb.ml\tOk\nPlan.tick\t2\tb.ml")];
+  let i = 0;
+  const result = await runDeskLoop("key", "task", [], ["ocaml", "files"], [], [], "", {
+    runCore: replyAwareCore(frames),
+    runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+    emit: (event) => events.push(event),
+    budgetMs: 60_000,
+    roundBase: 3,
+    segment: 2,
+    plan: { items: [{ text: "写 a.ml", done: true, note: "" }, { text: "写 b.ml", done: false, note: "" }], checks: 1, wrote: true, pending: null },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(i, 1, "the Done went straight through");
+  assert.ok(!events.some((event) => event.kind === "check"));
+  assert.deepEqual(result.plan.items.map((item) => item.done), [true, true]);
 });
