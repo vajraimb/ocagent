@@ -21,6 +21,7 @@ export function SidePanel({
   onReset,
   onClose,
   shareUrl,
+  durable,
   busy,
 }: {
   harnesses: HarnessId[];
@@ -36,6 +37,7 @@ export function SidePanel({
   onReset: () => void;
   onClose?: () => void;
   shareUrl: string;
+  durable: boolean;
   busy: boolean;
 }) {
   const file = files.find((item) => item.path === selected) ?? null;
@@ -171,6 +173,9 @@ export function SidePanel({
         </div>
       </div>
       {copied ? <p className="px-4 pb-2 text-xs text-muted">在别处打开这个链接，就是同一个工作区：文件、harness 和历史都在。</p> : null}
+      {!durable && import.meta.env.PROD ? (
+        <p className="mx-4 mb-3 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs leading-5 text-warn">还没接上数据库：文件和历史只暂存在当前这台服务器上，重启或换一台就没了。部署时配置数据库后才会长期保存。</p>
+      ) : null}
 
       <section className="px-4 pb-4">
         <h2 className="text-sm font-medium text-fg">能力</h2>

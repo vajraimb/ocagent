@@ -12,6 +12,7 @@ import {
   FolderOpen,
   Globe,
   Hammer,
+  ListChecks,
   LoaderCircle,
   PackagePlus,
   RotateCcw,
@@ -20,7 +21,7 @@ import {
   Trash2,
   TriangleAlert,
 } from "lucide-react";
-import { foldRounds, type AgentEvent, type Round } from "@/lib/agent/progress";
+import { foldRounds, latestPlan, type AgentEvent, type PlanItem, type Round } from "@/lib/agent/progress";
 import type { ToolStep } from "@/lib/agent/workspace";
 
 export type AgentStatus = "running" | "done" | "failed" | "stopped" | "paused";
@@ -39,6 +40,8 @@ export type AgentTurnData = {
   touched: string[];
   /** Rounds the run took, known even when its timeline has not been fetched. */
   rounds?: number;
+  /** The plan as the run left it, for a turn whose timeline is not loaded. */
+  plan?: PlanItem[];
 };
 
 function useNow(active: boolean): number {
@@ -79,6 +82,7 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
   };
   const elapsed = seconds(turn.at, running ? now : (turn.endedAt ?? turn.at));
   const current = rounds[rounds.length - 1];
+  const plan = latestPlan(turn.events) ?? turn.plan ?? null;
   const dropped = turn.events.flatMap((event) => (event.kind === "module_dropped" ? [event] : []));
   const lastTrouble = !running && turn.status !== "done" && turn.status !== "stopped" ? troubleOf(current) : "";
 
@@ -88,7 +92,7 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
         <span className={`inline-block h-2 w-2 rounded-full ${running ? "animate-pulse bg-accent" : turn.status === "failed" ? "bg-danger" : turn.status === "paused" ? "bg-warn" : "bg-muted"}`} />
         <span className="font-mono tracking-widest text-muted">OCAGENT</span>
         <span className="text-muted">·</span>
-        <span className="text-muted">{statusLine(turn.status, current, elapsed)}</span>
+        <span className="text-muted">{statusLine(turn.status, current, elapsed, plan)}</span>
       </header>
 
       <div className="mt-2 rounded-2xl border border-border bg-surface">
@@ -97,6 +101,11 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
             {dropped.map((gone) => (
               <Row key={gone.name} icon={<Blocks className="h-3.5 w-3.5" aria-hidden />} label={`这次没带上 ${gone.name}：它现在编译不过`} detail={gone.reason} tone="warn" />
             ))}
+          </div>
+        ) : null}
+        {plan && plan.length > 0 && (running || open) ? (
+          <div className="border-b border-border px-4 py-3">
+            <PlanView items={plan} running={running} />
           </div>
         ) : null}
         {hasProcess && showProcess ? (
@@ -134,7 +143,7 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
             {hasProcess ? (
               <button type="button" onClick={toggle} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 -ml-1 text-xs text-muted hover:text-fg">
                 {open ? <ChevronDown className="h-3.5 w-3.5" aria-hidden /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden />}
-                {rounds.length > 0 ? summaryLine(rounds.length, calls, loaded, elapsed) : unfetched ? `${turn.rounds} 轮 · ${elapsed}` : `${turn.steps.length} 步`}
+                {rounds.length > 0 ? summaryLine(rounds.length, calls, loaded, elapsed, plan) : unfetched ? `${turn.rounds} 轮 · ${elapsed}` : `${turn.steps.length} 步`}
               </button>
             ) : null}
             {turn.touched.map((path) => (
@@ -162,17 +171,19 @@ export function AgentTurn({ turn, onOpenFile, onContinue, onExpand }: { turn: Ag
   );
 }
 
-function summaryLine(roundCount: number, calls: number, loaded: string[], elapsed: string): string {
+function summaryLine(roundCount: number, calls: number, loaded: string[], elapsed: string, plan: PlanItem[] | null): string {
   const parts = [`${roundCount} 轮`, `${calls} 次调用`];
+  if (plan && plan.length) parts.push(`计划 ${plan.filter((item) => item.done).length}/${plan.length}`);
   if (loaded.length) parts.push(`装了 ${loaded.length} 个 module`);
   parts.push(elapsed);
   return parts.join(" · ");
 }
 
-function statusLine(status: AgentStatus, current: Round | undefined, elapsed: string): string {
+function statusLine(status: AgentStatus, current: Round | undefined, elapsed: string, plan: PlanItem[] | null): string {
   if (status === "running") {
     const round = current ? `第 ${current.round} 轮 · ` : "";
-    return `${round}${elapsed}`;
+    const progress = plan && plan.length ? `计划 ${plan.filter((item) => item.done).length}/${plan.length} · ` : "";
+    return `${round}${progress}${elapsed}`;
   }
   if (status === "failed") return "没做成";
   if (status === "stopped") return "已停下";
@@ -184,6 +195,36 @@ function statusLine(status: AgentStatus, current: Round | undefined, elapsed: st
 function troubleOf(current: Round | undefined): string {
   if (!current) return "";
   return (current.runnerError || current.compileError || current.modelError || "").trim().slice(0, 300);
+}
+
+function PlanView({ items, running }: { items: PlanItem[]; running: boolean }) {
+  const done = items.filter((item) => item.done).length;
+  // While running, the first open item is the one being worked on.
+  const activeIndex = running ? items.findIndex((item) => !item.done) : -1;
+  return (
+    <div>
+      <p className="flex items-center gap-1.5 text-xs text-muted">
+        <ListChecks className="h-3.5 w-3.5" aria-hidden />
+        计划 · {done}/{items.length}
+      </p>
+      <ol className="mt-1.5 flex flex-col gap-1">
+        {items.map((item, index) => {
+          const active = index === activeIndex;
+          return (
+            <li key={`${index}-${item.text}`} className="grid grid-cols-[1rem_minmax(0,1fr)] gap-x-2 text-sm">
+              <span className={`mt-1 flex h-3.5 w-3.5 items-center justify-center rounded-sm border ${item.done ? "border-accent bg-accent text-bg" : active ? "border-accent" : "border-border"}`}>
+                {item.done ? <Check className="h-2.5 w-2.5" strokeWidth={3} aria-hidden /> : active ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" /> : null}
+              </span>
+              <span className="min-w-0">
+                <span className={item.done ? "text-muted" : "text-fg"}>{item.text}</span>
+                {item.done && item.note ? <span className="ml-1.5 break-words font-mono text-xs text-muted">{item.note}</span> : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
 }
 
 function Timeline({ rounds, running }: { rounds: Round[]; running: boolean }) {
@@ -231,7 +272,8 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         {round.modules.map((mod) => (
           <ModuleRow key={mod.name} name={mod.name} exports={mod.exports} />
         ))}
-        {round.reply ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
+        {round.check ? <Row icon={<ListChecks className="h-3.5 w-3.5" aria-hidden />} label="想收尾了，先核对一遍再说" detail={round.check} tone="accent" /> : null}
+        {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
       </div>
     </li>
   );

@@ -140,6 +140,7 @@ function turnOf(run: RunRecord): AgentTurnData {
     steps: run.result?.steps ?? [],
     touched: run.result?.touched ?? [],
     rounds: run.rounds,
+    plan: run.result?.plan?.items,
   };
 }
 
@@ -210,6 +211,9 @@ export function Workbench() {
   const [panelOpen, setPanelOpen] = useState(false);
   const [examplesOpen, setExamplesOpen] = useState(false);
   const [notice, setNotice] = useState("");
+  // False when the server keeps desks only in its embedded database (no Neon):
+  // everything still works, but nothing outlives that instance.
+  const [durable, setDurable] = useState(true);
   // The run this page is driving (sending its segments and polling it).
   const [driving, setDriving] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -295,6 +299,7 @@ export function Workbench() {
       try {
         const loaded = await loadDesk({ data: { deskId } });
         if (cancelled) return;
+        setDurable(loaded.durable);
         if (!loaded.found) {
           synced.current = false;
           // Nothing stored yet: whatever the browser brought along becomes the desk.
@@ -586,6 +591,7 @@ export function Workbench() {
       onReset={() => void reset()}
       onClose={onClose}
       shareUrl={shareUrl}
+      durable={durable}
       busy={running}
     />
   );
