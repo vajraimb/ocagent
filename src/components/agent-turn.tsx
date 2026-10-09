@@ -256,7 +256,8 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         {round.thinking ? (
           <Row icon={<LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden />} label="正在想下一步" tone="muted" />
         ) : null}
-        {round.modelError ? <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label="模型没有回应" detail={round.modelError} tone="danger" /> : null}
+        {round.modelError && round.budgetCut ? <Row icon={<Clock className="h-3.5 w-3.5" aria-hidden />} label="这一段时间用完了，这轮没等到回复" detail={`下一段从这里重来${spanOf(round)}`} tone="muted" /> : null}
+        {round.modelError && !round.budgetCut ? <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label="模型没有回应" detail={`${round.modelError}${spanOf(round)}`} tone="danger" /> : null}
         {round.code ? (
           <div>
             <button type="button" onClick={() => setShowCode((value) => !value)} className="inline-flex min-h-6 items-center gap-1.5 rounded-md text-left text-sm text-fg hover:text-primary">
@@ -304,7 +305,7 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
             tone="accent"
           />
         ))}
-        {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
+        {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} span={spanOf(round)} /> : null}
       </div>
     </li>
   );
@@ -339,13 +340,23 @@ function ModuleRow({ name, exports }: { name: string; exports: string[] }) {
   );
 }
 
-function ReplyRow({ kind, live }: { kind: string; live: boolean }) {
+// How long a finished round took, as " · 38 秒", from its first event to its
+// last; nothing for a round still going or one under a second.
+function spanOf(round: Round): string {
+  const ms = round.endedAt - round.startedAt;
+  if (!round.startedAt || ms < 1_000) return "";
+  const seconds = Math.round(ms / 1000);
+  return seconds >= 60 ? ` · ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒` : ` · ${seconds} 秒`;
+}
+
+function ReplyRow({ kind, live, span }: { kind: string; live: boolean; span: string }) {
+  const detail = span ? span.replace(/^ · /, "") : undefined;
   if (kind === "continue") {
-    return <Row icon={<CornerDownRight className="h-3.5 w-3.5" aria-hidden />} label={live ? "还要再来一轮" : "继续下一轮"} tone="muted" />;
+    return <Row icon={<CornerDownRight className="h-3.5 w-3.5" aria-hidden />} label={live ? "还要再来一轮" : "继续下一轮"} detail={detail} tone="muted" />;
   }
-  if (kind === "done") return <Row icon={<Check className="h-3.5 w-3.5" aria-hidden />} label="做完了" tone="accent" />;
-  if (kind === "ask") return <Row icon={<CornerDownRight className="h-3.5 w-3.5" aria-hidden />} label="需要你回答" tone="fg" />;
-  return <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label="只做到一半" tone="warn" />;
+  if (kind === "done") return <Row icon={<Check className="h-3.5 w-3.5" aria-hidden />} label="做完了" detail={detail} tone="accent" />;
+  if (kind === "ask") return <Row icon={<CornerDownRight className="h-3.5 w-3.5" aria-hidden />} label="需要你回答" detail={detail} tone="fg" />;
+  return <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label="只做到一半" detail={detail} tone="warn" />;
 }
 
 function Row({ icon, label, detail, output, tone }: { icon: ReactNode; label: string; detail?: string; output?: string; tone: "muted" | "fg" | "accent" | "warn" | "danger" }) {

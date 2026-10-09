@@ -6,7 +6,7 @@ export type AgentEventBody =
   | { kind: "start"; task: string }
   | { kind: "think"; round: number }
   | { kind: "plan"; round: number; code: string }
-  | { kind: "model_error"; round: number; message: string }
+  | { kind: "model_error"; round: number; message: string; budget?: boolean }
   | { kind: "run"; round: number }
   | { kind: "call"; round: number; tool: string; detail: string }
   | { kind: "compile_failed"; round: number; message: string }
@@ -380,6 +380,11 @@ export type Round = {
   thinking: boolean;
   code: string;
   modelError: string;
+  /** The model error above is the segment's budget running out mid-call, not the model failing. */
+  budgetCut: boolean;
+  /** When the round's first and last events happened (ms); the page shows the span. */
+  startedAt: number;
+  endedAt: number;
   running: boolean;
   compileError: string;
   runnerError: string;
@@ -408,12 +413,17 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [], scheduled: [] };
+      found = { round, thinking: false, code: "", modelError: "", budgetCut: false, startedAt: 0, endedAt: 0, running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [], scheduled: [] };
       rounds.set(round, found);
     }
     return found;
   };
   for (const event of events) {
+    if ("round" in event) {
+      const round = at(event.round);
+      if (!round.startedAt) round.startedAt = event.at;
+      round.endedAt = event.at;
+    }
     switch (event.kind) {
       case "think":
         at(event.round).thinking = true;
@@ -428,6 +438,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         const round = at(event.round);
         round.thinking = false;
         round.modelError = event.message;
+        round.budgetCut = event.budget === true;
         break;
       }
       case "run":

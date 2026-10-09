@@ -378,6 +378,8 @@ export function promptContext(ctx: PromptContext): string {
     parts.push(`【上一步（第 ${last.round} 轮）执行了，返回 ${last.reply}${last.text.trim() ? `：${clip(last.text.trim(), 300)}` : ""}】\n${lines.length ? lines.join("\n") + extra : "（没有任何调用）"}${retreat}`);
   } else if (last?.kind === "runner_failed") {
     parts.push(`【上一步没有跑起来】\n${clip(last.message, 600)}`);
+  } else if (last?.kind === "model_error" && last.message === BUDGET_CUT_NOTE) {
+    parts.push("【上一轮没跑完】上一段的时间用完时你的回复还没到，那一轮作废了；工作区和计划都是上面这样，接着做就行。");
   } else if (last?.kind === "model_error") {
     parts.push(`【上一轮模型没有回应】\n${clip(last.message, 400)}`);
   }
@@ -535,11 +537,13 @@ async function askModel(apiKey: string, prompt: string, context: string, harness
       return `text\n${block("没有输出")}`;
     } catch (err: unknown) {
       const slow = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+      // The loop itself called the call off (budget, stop): nothing to retry.
+      if (signal?.aborted) return `error\n${block("这一步被叫停了。")}`;
       if (!slow && again) {
         await pause(MODEL_RETRY_MS[attempt] ?? 0, signal);
         continue;
       }
-      const message = slow ? "模型太慢，这一步停了。点继续可以接着做。" : err instanceof Error ? err.message : "模型没有回应";
+      const message = slow ? "模型太慢，这一步停了。点继续可以接着做。" : err instanceof Error ? err.message : `模型没有回应（${String(err)}）`;
       return `error\n${block(message)}`;
     }
   }
@@ -569,7 +573,15 @@ export function mergeModules(fromLoop: DeskModule[], loaded: DeskModule[], unloa
 export type HaltReason = "budget" | "compile_stall" | "idle_stall" | "runner";
 
 export const ROUND_BUDGET_MS = 70_000;
-const MIN_ROUND_MS = 12_000;
+// A round is not started with less than this left: a model call with
+// reasoning rarely answers faster, and one cut off at the budget is a round
+// paid for and thrown away.
+const MIN_ROUND_MS = 20_000;
+// When the budget runs out while a model call or a step is in flight, it is
+// given this much longer to finish rather than being killed on the spot; the
+// pause comes before the next round instead.
+export const BUDGET_GRACE_MS = 30_000;
+const BUDGET_CUT_NOTE = "这一段时间用完了，这轮没等到模型回复；下一段从这里重来。";
 const MAX_COMPILE_STALL = 4;
 const MAX_IDLE_STALL = 5;
 const MAX_RUNNER_STALL = 2;
@@ -714,6 +726,10 @@ export type LoopDeps = {
   signal?: AbortSignal;
   /** Wall-clock budget for this request; the loop pauses (resumably) when it runs out. */
   budgetMs?: number;
+  /** How long a model call or step already in flight at the deadline may go on (default BUDGET_GRACE_MS). */
+  graceMs?: number;
+  /** Least time left for a round to be started (default MIN_ROUND_MS; tests shorten it). */
+  minRoundMs?: number;
   /** Modules that failed the pre-flight compile and were left out of this run. */
   dropped?: { name: string; error: string }[];
   /** Rounds already done by earlier segments of this run; numbering continues from here. */
@@ -803,7 +819,19 @@ export async function runDeskLoop(
   const signal = deps.signal ? AbortSignal.any([deps.signal, halt.signal]) : halt.signal;
   const budgetMs = deps.budgetMs ?? runBudgetMs();
   const deadline = Date.now() + budgetMs;
-  const timer = setTimeout(() => cut("budget"), budgetMs);
+  // At the deadline, whatever is in flight gets the grace to finish; the
+  // next model call then pauses the segment. Only after the grace is the
+  // round cut off for real.
+  let budgetHit = false;
+  const grace = deps.graceMs ?? BUDGET_GRACE_MS;
+  // A short budget (tests, a tight deployment) still gets rounds.
+  const minRound = deps.minRoundMs ?? Math.min(MIN_ROUND_MS, Math.floor(budgetMs / 3));
+  const timer = setTimeout(() => {
+    budgetHit = true;
+    if (grace <= 0) cut("budget");
+    else graceTimer = setTimeout(() => cut("budget"), grace);
+  }, budgetMs);
+  let graceTimer: ReturnType<typeof setTimeout> | null = null;
   let compileStall = 0;
   let idleStall = 0;
   let runnerStall = 0;
@@ -815,7 +843,7 @@ export async function runDeskLoop(
       { task, harnesses, files, modules, journal, memory },
       {
         model: async (prompt) => {
-          if (deadline - Date.now() < MIN_ROUND_MS) {
+          if (budgetHit || deadline - Date.now() < minRound) {
             // Not enough time left for a round; pause now instead of leaving a
             // model call half-finished when the budget runs out.
             cut("budget");
@@ -855,7 +883,12 @@ export async function runDeskLoop(
             },
           });
           const reply = describeModelReply(raw);
-          if (reply?.kind === "error") {
+          if (reply?.kind === "error" && haltReason === "budget") {
+            // The grace ran out too: not the model's fault, and the next
+            // segment asks again from the same place.
+            emit({ kind: "model_error", round, message: BUDGET_CUT_NOTE, budget: true });
+            last = { kind: "model_error", message: BUDGET_CUT_NOTE };
+          } else if (reply?.kind === "error") {
             emit({ kind: "model_error", round, message: reply.message });
             last = { kind: "model_error", message: reply.message };
           } else if (reply?.kind === "text") {
@@ -1032,6 +1065,7 @@ export async function runDeskLoop(
     };
   } finally {
     clearTimeout(timer);
+    if (graceTimer) clearTimeout(graceTimer);
   }
 }
 

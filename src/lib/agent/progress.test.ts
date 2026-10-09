@@ -122,6 +122,23 @@ describe("timeline rounds", () => {
     assert.equal(rounds[0]?.compileError, "编译失败");
     assert.equal(rounds[0]?.running, false);
   });
+
+  it("spans each round from its first event to its last, and marks a budget cut apart from a model failure", () => {
+    const rounds = foldRounds([
+      { seq: 1, at: 1_000, kind: "start", task: "t" },
+      { seq: 2, at: 1_000, kind: "think", round: 1 },
+      { seq: 3, at: 21_000, kind: "plan", round: 1, code: "ok" },
+      { seq: 4, at: 24_500, kind: "step", round: 1, reply: "continue", text: "" },
+      { seq: 5, at: 25_000, kind: "think", round: 2 },
+      { seq: 6, at: 80_000, kind: "model_error", round: 2, message: "时间用完了", budget: true },
+      { seq: 7, at: 90_000, kind: "think", round: 3 },
+      { seq: 8, at: 91_000, kind: "model_error", round: 3, message: "模型没有接上（503）" },
+    ]);
+    assert.deepEqual(rounds.map((round) => round.endedAt - round.startedAt), [23_500, 55_000, 1_000]);
+    assert.equal(rounds[1]?.budgetCut, true);
+    assert.equal(rounds[2]?.budgetCut, false);
+    assert.equal(rounds[2]?.modelError, "模型没有接上（503）");
+  });
 });
 
 describe("desk notes", () => {

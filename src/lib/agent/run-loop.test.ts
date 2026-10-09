@@ -60,13 +60,75 @@ function deps(overrides: Partial<LoopDeps>, kinds: string[]): LoopDeps {
 test("the loop pauses, resumably, when the request's time budget runs out", async () => {
   const kinds: string[] = [];
   const started = Date.now();
-  // 15.5 s budget minus the 12 s a round needs: the cut comes after ~3.5 s.
-  const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", deps({ runCore: fakeCore(200), budgetMs: 15_500 }, kinds));
+  // 23.5 s budget minus the 20 s a round needs: the cut comes after ~3.5 s.
+  const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", deps({ runCore: fakeCore(200), budgetMs: 23_500 }, kinds));
   assert.equal(result.ok, true);
   assert.equal(result.paused, true);
   assert.ok(Date.now() - started < 8_000, "cut well before the budget itself");
   assert.match(result.ok ? result.answer : "", /时间用完了/);
   assert.ok(result.steps.length > 0, "work done so far is carried");
+});
+
+// A model that answers after `ms`, or rejects with the signal's reason when aborted first.
+function slowFetch(ms: number): typeof fetch {
+  return ((_input: unknown, init?: RequestInit) =>
+    new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response(JSON.stringify({ output: [{ type: "message", content: [{ text: "```ocaml\nmodule Step : STEP = struct let run () = Continue \"x\" end\n```" }] }] }), { status: 200 })), ms);
+      init?.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(init.signal?.reason as unknown);
+      });
+    })) as typeof fetch;
+}
+
+test("a model call in flight when the budget runs out gets the grace to finish; its step runs; the pause comes before the next round", async () => {
+  const events: AgentEventBody[] = [];
+  const fetchBefore = globalThis.fetch;
+  globalThis.fetch = slowFetch(2_000);
+  const started = Date.now();
+  try {
+    const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", {
+      runCore: fakeCore(5),
+      runPayload: async () => okFrame("continue", "x", "Files.write_file\tsrc/a.ml\tOk"),
+      emit: (event) => events.push(event),
+      budgetMs: 1_000,
+      graceMs: 5_000,
+      minRoundMs: 0,
+    });
+    assert.equal(result.ok && result.paused, true);
+    assert.ok(Date.now() - started >= 2_000 && Date.now() - started < 4_500, `took ${Date.now() - started} ms`);
+    assert.equal(events.filter((event) => event.kind === "model_error").length, 0, "the round was not cut");
+    assert.equal(events.filter((event) => event.kind === "step").length, 1, "the round's step ran");
+    assert.equal(events.filter((event) => event.kind === "think").length, 1, "no second round was started");
+  } finally {
+    globalThis.fetch = fetchBefore;
+  }
+});
+
+test("a model call that outlives the grace too is cut, said to be the budget's doing, and the next prompt says the round is to be redone", async () => {
+  const events: AgentEventBody[] = [];
+  const fetchBefore = globalThis.fetch;
+  globalThis.fetch = slowFetch(10_000);
+  const started = Date.now();
+  try {
+    const result = await runDeskLoop("key", "task", [], ["ocaml"], [], [], "", {
+      runCore: fakeCore(5),
+      runPayload: async () => okFrame("continue", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 500,
+      graceMs: 700,
+      minRoundMs: 0,
+    });
+    assert.equal(result.ok && result.paused, true);
+    assert.ok(Date.now() - started < 3_000, `took ${Date.now() - started} ms`);
+    const cut = events.find((event) => event.kind === "model_error");
+    assert.ok(cut && cut.kind === "model_error" && cut.budget === true, "the cut is marked as the budget's");
+    assert.match(cut && cut.kind === "model_error" ? cut.message : "", /这一段时间用完了/);
+    assert.equal(result.last?.kind, "model_error");
+    assert.match(promptContext({ round: 2, segment: 2, remainingMs: 60_000, files: [], last: result.last ?? null, plan: [], check: null, checkFailed: [], written: [], modules: [] }), /【上一轮没跑完】/);
+  } finally {
+    globalThis.fetch = fetchBefore;
+  }
 });
 
 test("four compile failures in a row stop the loop with the last error", async () => {
