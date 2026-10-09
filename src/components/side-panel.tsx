@@ -150,14 +150,27 @@ export function SidePanel({
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between px-4 pb-2 pt-4">
+      <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
         <p className="font-mono text-xs tracking-widest text-muted">工作区</p>
-        {onClose ? (
-          <button type="button" onClick={onClose} aria-label="收起工作区" className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-muted hover:text-fg">
-            <X className="h-4 w-4" aria-hidden />
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => void copyLink()}
+            disabled={!shareUrl}
+            title="复制这个工作区的链接，在别的设备或浏览器打开就是同一个工作区"
+            className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-border px-2.5 text-xs text-muted hover:border-fg/30 hover:text-fg disabled:opacity-50"
+          >
+            {copied ? <Check className="h-3.5 w-3.5 text-accent" aria-hidden /> : <Link2 className="h-3.5 w-3.5" aria-hidden />}
+            {copied ? "已复制" : "复制工作区链接"}
           </button>
-        ) : null}
+          {onClose ? (
+            <button type="button" onClick={onClose} aria-label="收起工作区" className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-muted hover:text-fg">
+              <X className="h-4 w-4" aria-hidden />
+            </button>
+          ) : null}
+        </div>
       </div>
+      {copied ? <p className="px-4 pb-2 text-xs text-muted">在别处打开这个链接，就是同一个工作区：文件、harness 和历史都在。</p> : null}
 
       <section className="px-4 pb-4">
         <h2 className="text-sm font-medium text-fg">能力</h2>
@@ -303,11 +316,7 @@ export function SidePanel({
         ) : null}
       </section>
 
-      <div className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-3">
-        <button type="button" onClick={() => void copyLink()} disabled={!shareUrl} className="inline-flex min-h-10 items-center gap-1.5 rounded-lg px-2 text-xs text-muted hover:text-fg disabled:opacity-50">
-          {copied ? <Check className="h-3.5 w-3.5 text-accent" aria-hidden /> : <Link2 className="h-3.5 w-3.5" aria-hidden />}
-          {copied ? "已复制，在别处打开就是这个工作区" : "复制工作区链接"}
-        </button>
+      <div className="sticky bottom-0 mt-auto flex items-center justify-end border-t border-border bg-bg px-4 py-2">
         <button type="button" onClick={onReset} disabled={busy} className="min-h-10 rounded-lg px-2 text-xs text-muted hover:text-danger disabled:opacity-50">
           清空对话和文件
         </button>
