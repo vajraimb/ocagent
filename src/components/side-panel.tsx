@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Blocks, Check, Download, FileText, Link2, LoaderCircle, PackagePlus, RefreshCw, Upload, X } from "lucide-react";
+import { Blocks, Check, Download, FilePlus, FileText, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import type { DeskFile } from "@/lib/agent/workspace";
 
@@ -23,6 +23,8 @@ export function SidePanel({
   shareUrl,
   durable,
   busy,
+  onAddFiles,
+  onRemoveFile,
 }: {
   harnesses: HarnessId[];
   setHarnesses: (next: HarnessId[]) => void;
@@ -39,7 +41,11 @@ export function SidePanel({
   shareUrl: string;
   durable: boolean;
   busy: boolean;
+  onAddFiles: (files: FileList | File[]) => void;
+  onRemoveFile: (path: string) => void;
 }) {
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
   const file = files.find((item) => item.path === selected) ?? null;
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<{ path: string; text: string } | null>(null);
@@ -275,12 +281,42 @@ export function SidePanel({
         ) : null}
       </section>
 
-      <section className="flex min-h-0 flex-1 flex-col px-4 pb-4">
-        <h2 className="text-sm font-medium text-fg">
-          文件
-          {files.length ? <span className="ml-1.5 font-mono text-xs text-muted">{files.length}</span> : null}
-        </h2>
-        {files.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">还没有文件。让它写一个，这里就会出现。</p> : null}
+      <section
+        className={`flex min-h-0 flex-1 flex-col px-4 pb-4 ${dragging ? "rounded-xl outline-2 outline-dashed outline-accent/60" : ""}`}
+        onDragOver={(event) => {
+          if (busy || !event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(event) => {
+          setDragging(false);
+          if (busy || event.dataTransfer.files.length === 0) return;
+          event.preventDefault();
+          onAddFiles(event.dataTransfer.files);
+        }}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm font-medium text-fg">
+            文件
+            {files.length ? <span className="ml-1.5 font-mono text-xs text-muted">{files.length}</span> : null}
+          </h2>
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              if (event.target.files?.length) onAddFiles(event.target.files);
+              event.target.value = "";
+            }}
+          />
+          <button type="button" disabled={busy} onClick={() => fileInput.current?.click()} className="inline-flex min-h-9 items-center gap-1.5 rounded-lg border border-border px-2.5 text-xs text-fg hover:border-accent hover:text-accent disabled:opacity-50">
+            <FilePlus className="h-3.5 w-3.5" aria-hidden />
+            添加文件
+          </button>
+        </div>
+        {files.length === 0 ? <p className="mt-2 text-xs leading-5 text-muted">{dragging ? "松手就放进工作区。" : "还没有文件。让它写一个，或把自己的文本文件拖到这里、点「添加文件」放进来，然后让它处理。"}</p> : null}
         {files.length > 0 ? (
           <ul className="mt-2 flex flex-col">
             {files.map((item) => {
@@ -317,6 +353,13 @@ export function SidePanel({
               </div>
             ) : null}
             <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-bg px-3 py-2 font-mono text-xs leading-5 text-fg">{file.content}</pre>
+            <div className="flex items-center justify-between gap-2 text-xs text-muted">
+              <span className="font-mono">{sizeLabel(file.content)}</span>
+              <button type="button" disabled={disabled} onClick={() => onRemoveFile(file.path)} className="inline-flex min-h-8 items-center gap-1 rounded-md px-1.5 text-xs text-muted hover:text-danger disabled:opacity-50">
+                <Trash2 className="h-3.5 w-3.5" aria-hidden />
+                删除这个文件
+              </button>
+            </div>
           </div>
         ) : null}
       </section>
@@ -328,6 +371,12 @@ export function SidePanel({
       </div>
     </div>
   );
+}
+
+function sizeLabel(content: string): string {
+  const bytes = new TextEncoder().encode(content).length;
+  const lines = content.split("\n").length;
+  return bytes < 1024 ? `${bytes} B · ${lines} 行` : `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB · ${lines} 行`;
 }
 
 function sourceLabel(source: string | undefined): string {

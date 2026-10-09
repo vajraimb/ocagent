@@ -5,6 +5,8 @@ import { SidePanel } from "@/components/side-panel";
 import { CATALOG, DEFAULT_HARNESSES, MAX_MODULES, checkModule, isHarnessId, moduleNameFor, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import type { AgentEvent } from "@/lib/agent/progress";
 import {
+  MAX_FILE_BYTES,
+  MAX_WORKSPACE_BYTES,
   clearDesk,
   continueRun,
   getRun,
@@ -20,7 +22,7 @@ import {
   type RunRecord,
   type RunReply,
 } from "@/lib/agent/run";
-import type { DeskFile } from "@/lib/agent/workspace";
+import { MAX_FILES, safePath, type DeskFile } from "@/lib/agent/workspace";
 
 // The browser keeps only the desk's key and a cache for the first paint; the
 // desk itself (files, harnesses, modules) and every run live on the server.
@@ -45,7 +47,7 @@ const EXAMPLES = [
 ];
 
 const ABILITIES = [
-  { icon: FilePen, title: "读写文件", body: "在工作区里新建、修改、查找文件。" },
+  { icon: FilePen, title: "读写文件", body: "读你放进工作区的文件；新建、修改、查找。" },
   { icon: Search, title: "搜索与请求", body: "查公开的事实，抓一个公网页面或接口。" },
   { icon: Play, title: "编译执行", body: "每一步写成 OCaml，编译通过才会跑。" },
   { icon: Blocks, title: "装 harness", body: "写好的 .ml 或网上的库，装上后每一步都能直接调用。" },
@@ -125,6 +127,13 @@ function chooseDeskId(): string {
   const fresh = uid("desk");
   localStorage.setItem(DESK_KEY, fresh);
   return fresh;
+}
+
+// The path a dropped or picked file gets: its folder path when a folder was
+// dropped, otherwise just the name; spaces become underscores.
+function filePathFor(item: File): string {
+  const rel = "webkitRelativePath" in item && typeof item.webkitRelativePath === "string" && item.webkitRelativePath ? item.webkitRelativePath : item.name;
+  return rel.replace(/\s+/g, "_");
 }
 
 function turnOf(run: RunRecord): AgentTurnData {
@@ -248,20 +257,27 @@ export function Workbench() {
   }, []);
 
   // Stores the page's settings on the server; creates the desk the first time.
+  const saveFailed = useRef(false);
   const sync = useCallback(async (): Promise<boolean> => {
     if (!deskId) return false;
     const snapshot = latest.current;
     try {
       const saved = await saveDesk({ data: { deskId, files: snapshot.files, harnesses: snapshot.harnesses, modules: snapshot.modules } });
       if (!saved.ok) {
+        saveFailed.current = true;
         setNotice(saved.error);
         return false;
       }
       synced.current = true;
       if (latest.current === snapshot) dirty.current = false;
-      setNotice("");
+      // Only a save error of our own is cleared here; other notices stay.
+      if (saveFailed.current) {
+        saveFailed.current = false;
+        setNotice("");
+      }
       return true;
     } catch (caught) {
+      saveFailed.current = true;
       setNotice(`工作区没有存上：${caught instanceof Error ? caught.message : "连不上服务器"}`);
       return false;
     }
@@ -533,6 +549,62 @@ export function Workbench() {
     markDirty();
   }
 
+  // Files the user brings in (picker or drop): text only, same caps as a run.
+  async function addFiles(list: FileList | File[]) {
+    if (running) {
+      setNotice("它还在做上一件事，做完再加文件。");
+      return;
+    }
+    const incoming = Array.from(list);
+    if (incoming.length === 0) return;
+    const refused: string[] = [];
+    const accepted: DeskFile[] = [];
+    for (const item of incoming) {
+      const path = filePathFor(item);
+      if (!safePath(path)) {
+        refused.push(`${item.name}：名字只能用字母、数字、点、下划线和横线`);
+        continue;
+      }
+      if (item.size > MAX_FILE_BYTES) {
+        refused.push(`${item.name}：${Math.round(item.size / 1024)} KB，单个最多 ${MAX_FILE_BYTES / 1024} KB`);
+        continue;
+      }
+      const content = await item.text();
+      if (content.includes("\u0000")) {
+        refused.push(`${item.name}：看起来是二进制文件，只收文本`);
+        continue;
+      }
+      accepted.push({ path, content });
+    }
+    const merged = [...files.filter((file) => !accepted.some((next) => next.path === file.path)), ...accepted];
+    const total = merged.reduce((sum, file) => sum + new TextEncoder().encode(file.content).length, 0);
+    if (merged.length > MAX_FILES) {
+      setNotice(`工作区最多 ${MAX_FILES} 个文件，现在会有 ${merged.length} 个；先删掉一些。`);
+      return;
+    }
+    if (total > MAX_WORKSPACE_BYTES) {
+      setNotice(`加上这些工作区会有 ${(total / 1024 / 1024).toFixed(1)} MB，最多 ${MAX_WORKSPACE_BYTES / 1024 / 1024} MB。`);
+      return;
+    }
+    if (accepted.length) {
+      setFiles(merged);
+      markDirty();
+      setSelected(accepted[accepted.length - 1]?.path ?? "");
+    }
+    const replaced = accepted.filter((next) => files.some((file) => file.path === next.path)).length;
+    const parts = [];
+    if (accepted.length) parts.push(`加了 ${accepted.length} 个文件${replaced ? `（覆盖 ${replaced} 个同名）` : ""}`);
+    if (refused.length) parts.push(`没收：${refused.join("；")}`);
+    setNotice(parts.join("。"));
+  }
+
+  function removeFile(path: string) {
+    if (running) return;
+    setFiles((current) => current.filter((file) => file.path !== path));
+    if (selected === path) setSelected("");
+    markDirty();
+  }
+
   function changeModules(next: DeskModule[]) {
     setModules(next);
     markDirty();
@@ -592,6 +664,8 @@ export function Workbench() {
       onClose={onClose}
       shareUrl={shareUrl}
       durable={durable}
+      onAddFiles={(list) => void addFiles(list)}
+      onRemoveFile={removeFile}
       busy={running}
     />
   );
