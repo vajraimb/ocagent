@@ -82,6 +82,7 @@ export function instructionsFor(harnesses: HarnessId[], modules: DeskModule[]): 
   end
 
 代码块之外不要写任何文字。想解释思路，写成 OCaml 注释 (* ... *)。
+多行、带引号或带反斜杠的文本（文件正文、长一点的答案）用 {|...|} 写，里面不用转义、可以直接换行；只要别在里面出现 |}。短的单行文本用普通 "..." 即可。
 
 【图片】
 用户放进工作区的图片会直接随每一轮的提示一起给你看（提示末尾列出它们的路径）。要描述、判断、读取图片里的内容，直接看图后把结论写进 Done；不要 Files.read_file 图片，那只会返回一长串编码。
@@ -184,10 +185,12 @@ end
 【示例：写完并结束】
 module Step : STEP = struct
   let run () =
-    let body = "let ring () = Sys.time ()\\n" in
+    let body = {|(* alarm.ml *)
+let ring name = Printf.sprintf "%s: ring!" name
+|} in
     match Files.write_file "alarm.ml" body with
     | Error e -> Partial ("写入失败：" ^ e)
-    | Ok () -> Done "已写下 alarm.ml。"
+    | Ok () -> Done "已写下 alarm.ml，里面有 ring。"
 end
 
 【示例：写一个 module 并装成 harness】

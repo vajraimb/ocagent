@@ -792,34 +792,41 @@ function startCoreBridge(handlers: {
   });
 }
 
-function shortenDiagnostic(raw: string): string {
+function shortenDiagnostic(raw: string, source = ""): string {
   const text = raw.replace(/\u001b\[[0-9;]*m/g, "");
   const spots = [...text.matchAll(/ocagent_step\.ml", line (\d+), characters (\d+)-(\d+)/g)];
   const actual = spots.at(-1);
+  // A syntax error in a step with quote-heavy lines is usually text that needed
+  // {|...|}: a quote inside a "..." literal. The parser blames the enclosing
+  // struct, so the whole source is looked at, not just the reported line.
+  const quoteTrouble = /Syntax error/.test(text) && source.split("\n").some((line) => (line.match(/"/g)?.length ?? 0) >= 3);
   const span = /ocagent_step\.ml", lines (\d+)-(\d+)/.exec(text);
   const where = actual
     ? `编译失败 (第 ${actual[1]} 行，第 ${actual[2]}-${actual[3]} 列)`
     : span
       ? `编译失败 (第 ${span[1]}-${span[2]} 行)`
       : "编译失败";
-  const pair = /Type "([^"]+)" is not compatible with type "([^"]+)"/.exec(text);
+  const pair = /Type "([^"]+)" is not compatible with type "([^"]+)"/.exec(text) ?? /has type "([^"]+)"\s+but an expression was expected of type\s+"([^"]+)"/.exec(text);
   const got = pair?.[1] ?? /has type ([^\n]+)/.exec(text)?.[1];
   const expected = pair?.[2] ?? /expected of type ([^\n]+)/.exec(text)?.[1];
   const pretty = (type: string) => type.replaceAll("(string, string) result", "string res").replaceAll("(unit, string) result", "unit res");
   const lines = [where];
   if (expected) lines.push(`这里期望: ${pretty(expected.trim())}`);
   if (got) lines.push(`实际是:   ${pretty(got.trim())}`);
+  if (!expected && !got) {
+    const err = /Error: ([^\n]+)/.exec(text);
+    if (err) lines.push(err[1].trim());
+  }
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Search、Net、Trace，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Search、Net、Trace、Clock、Harness、Plan、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+  } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
+    lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
     lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
   } else if (/Signature mismatch/.test(text)) {
     lines.push("提示: run 必须返回 Continue、Done、Ask 或 Partial。");
-  } else {
-    const err = /Error: ([^\n]+)/.exec(text);
-    if (err) lines.push(err[1].trim());
   }
   return lines.join("\n");
 }
@@ -1214,7 +1221,7 @@ export async function runStep(payload: string, harnesses: HarnessId[], apiKey: s
         const culprit = moduleAtLine(loaded, Number(broken[1]));
         return `fail\n${encodeBlock(`编译失败\n已加载的 module ${culprit ?? ""} 本身没有编译通过，这一步没有执行。先在工作区卸下它，或改好后重新 Harness.load。\n${moduleDiagnostic(ran.text, culprit ?? "?")}`)}`;
       }
-      return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过"))}`;
+      return `fail\n${encodeBlock(shortenDiagnostic(ran.text || "没有编译通过", source))}`;
     }
     const outcome = reader(await readFile(outPath));
     const kind = outcome.line();
