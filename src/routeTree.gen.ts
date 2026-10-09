@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiAgentContinueRouteImport } from './routes/api/agent/continue'
+import { Route as ApiAgentCronRouteImport } from './routes/api/agent/cron'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +23,40 @@ const ApiAgentContinueRoute = ApiAgentContinueRouteImport.update({
   path: '/api/agent/continue',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiAgentCronRoute = ApiAgentCronRouteImport.update({
+  id: '/api/agent/cron',
+  path: '/api/agent/cron',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/agent/continue': typeof ApiAgentContinueRoute
+  '/api/agent/cron': typeof ApiAgentCronRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/agent/continue': typeof ApiAgentContinueRoute
+  '/api/agent/cron': typeof ApiAgentCronRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/agent/continue': typeof ApiAgentContinueRoute
+  '/api/agent/cron': typeof ApiAgentCronRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/agent/continue'
+  fullPaths: '/' | '/api/agent/continue' | '/api/agent/cron'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/agent/continue'
-  id: '__root__' | '/' | '/api/agent/continue'
+  to: '/' | '/api/agent/continue' | '/api/agent/cron'
+  id: '__root__' | '/' | '/api/agent/continue' | '/api/agent/cron'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiAgentContinueRoute: typeof ApiAgentContinueRoute
+  ApiAgentCronRoute: typeof ApiAgentCronRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiAgentContinueRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/agent/cron': {
+      id: '/api/agent/cron'
+      path: '/api/agent/cron'
+      fullPath: '/api/agent/cron'
+      preLoaderRoute: typeof ApiAgentCronRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiAgentContinueRoute: ApiAgentContinueRoute,
+  ApiAgentCronRoute: ApiAgentCronRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

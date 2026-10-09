@@ -20,10 +20,14 @@ export function isDurable(): boolean {
   return dbSource === "neon";
 }
 
+export type RunTrigger = "user" | "schedule";
+
 export type RunRecord = {
   id: string;
   deskId: string;
   task: string;
+  /** Who started it: the user, or one of the desk's schedules. */
+  trigger: RunTrigger;
   status: RunStatus;
   segment: number;
   rounds: number;
@@ -52,6 +56,7 @@ type RunRow = {
   id: string;
   desk_id: string;
   task: string;
+  trigger?: string;
   status: string;
   segment: number;
   rounds: number;
@@ -187,6 +192,7 @@ function runOf(row: RunRow): RunRecord {
     id: row.id,
     deskId: row.desk_id,
     task: row.task,
+    trigger: row.trigger === "schedule" ? "schedule" : "user",
     status: statusOf(row.status),
     segment: Number(row.segment) || 1,
     rounds: Number(row.rounds) || 0,
@@ -231,14 +237,94 @@ export async function writeDeskSettings(id: string, patch: Partial<Pick<DeskStat
   return writeDesk(id, { ...current, ...patch });
 }
 
-export async function createRun(deskId: string, id: string, task: string): Promise<RunRecord> {
+export async function createRun(deskId: string, id: string, task: string, trigger: RunTrigger = "user"): Promise<RunRecord> {
   const sql = await getSql();
   const now = Date.now();
   const rows = await sql<RunRow>`
-    insert into runs (id, desk_id, task, status, segment, rounds, events, result, stop_requested, created_at, updated_at)
-    values (${id}, ${deskId}, ${task}, 'running', 1, 0, '[]'::jsonb, null, false, ${now}, ${now})
+    insert into runs (id, desk_id, task, trigger, status, segment, rounds, events, result, stop_requested, created_at, updated_at)
+    values (${id}, ${deskId}, ${task}, ${trigger}, 'running', 1, 0, '[]'::jsonb, null, false, ${now}, ${now})
     returning *`;
   return runOf(rows[0]!);
+}
+
+// ---------------------------------------------------------------------------
+// Schedules: "every day at this time, give the desk this task".
+
+export type ScheduleRecord = {
+  id: string;
+  deskId: string;
+  task: string;
+  time: string;
+  tz: string;
+  enabled: boolean;
+  nextAt: number;
+  lastAt: number | null;
+  lastRunId: string | null;
+  createdAt: number;
+};
+
+type ScheduleRow = { id: string; desk_id: string; task: string; at_time: string; tz: string; enabled: boolean; next_at: number; last_at: number | null; last_run_id: string | null; created_at: number };
+
+function scheduleOf(row: ScheduleRow): ScheduleRecord {
+  return {
+    id: row.id,
+    deskId: row.desk_id,
+    task: row.task,
+    time: row.at_time,
+    tz: row.tz,
+    enabled: Boolean(row.enabled),
+    nextAt: Number(row.next_at) || 0,
+    lastAt: row.last_at === null || row.last_at === undefined ? null : Number(row.last_at),
+    lastRunId: row.last_run_id ?? null,
+    createdAt: Number(row.created_at) || 0,
+  };
+}
+
+export async function listSchedules(deskId: string): Promise<ScheduleRecord[]> {
+  const sql = await getSql();
+  const rows = await sql<ScheduleRow>`select * from schedules where desk_id = ${deskId} order by created_at asc`;
+  return rows.map(scheduleOf);
+}
+
+// Adds a daily schedule; the same task at the same time is one schedule.
+export async function addSchedule(deskId: string, spec: { time: string; tz: string; task: string }, nextAt: number, max: number): Promise<{ ok: true; schedule: ScheduleRecord; existed: boolean } | { ok: false; error: string }> {
+  const sql = await getSql();
+  const existing = await listSchedules(deskId);
+  const same = existing.find((item) => item.time === spec.time && item.tz === spec.tz && item.task === spec.task);
+  if (same) return { ok: true, schedule: same, existed: true };
+  if (existing.length >= max) return { ok: false, error: `这个工作区已经有 ${existing.length} 个定时任务，最多 ${max} 个；先取消一个。` };
+  const now = Date.now();
+  const id = `sch-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const rows = await sql<ScheduleRow>`
+    insert into schedules (id, desk_id, task, at_time, tz, enabled, next_at, last_at, last_run_id, created_at, updated_at)
+    values (${id}, ${deskId}, ${spec.task}, ${spec.time}, ${spec.tz}, true, ${nextAt}, null, null, ${now}, ${now})
+    returning *`;
+  return { ok: true, schedule: scheduleOf(rows[0]!), existed: false };
+}
+
+export async function removeSchedule(deskId: string, id: string): Promise<boolean> {
+  const sql = await getSql();
+  const rows = await sql<{ id: string }>`delete from schedules where id = ${id} and desk_id = ${deskId} returning id`;
+  return rows.length > 0;
+}
+
+// Schedules whose time has come, oldest due first.
+export async function dueSchedules(now: number, limit: number): Promise<ScheduleRecord[]> {
+  const sql = await getSql();
+  const rows = await sql<ScheduleRow>`select * from schedules where enabled and next_at <= ${now} order by next_at asc limit ${limit}`;
+  return rows.map(scheduleOf);
+}
+
+// Takes a due schedule for one run: moves it to its next time so no other
+// instance starts the same occurrence. Null when someone else got it first.
+export async function claimSchedule(id: string, dueAt: number, nextAt: number, runId: string): Promise<ScheduleRecord | null> {
+  const sql = await getSql();
+  const now = Date.now();
+  const rows = await sql<ScheduleRow>`
+    update schedules set next_at = ${nextAt}, last_at = ${now}, last_run_id = ${runId}, updated_at = ${now}
+    where id = ${id} and enabled and next_at = ${dueAt}
+    returning *`;
+  return rows[0] ? scheduleOf(rows[0]) : null;
 }
 
 // A "running" row nobody has touched for a while is a dead segment: say so
@@ -327,5 +413,6 @@ export async function activeRun(deskId: string): Promise<RunRecord | null> {
 export async function clearDesk(id: string): Promise<void> {
   const sql = await getSql();
   await sql`delete from runs where desk_id = ${id} and status not in ('running')`;
+  await sql`delete from schedules where desk_id = ${id}`;
   await writeDesk(id, { files: [], harnesses: normalizeHarnesses(undefined), modules: [], journal: [], memory: "", notes: [] });
 }

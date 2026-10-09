@@ -28,15 +28,28 @@ export function originFor(host: string, forwardedProto: string | null | undefine
 }
 
 export async function selfContinue(runId: string, segment: number, origin: string | null): Promise<void> {
+  await selfRequest(origin, "/api/agent/continue", { runId, segment });
+}
+
+// A visit also wakes the schedules, so a due one starts within a minute of
+// someone opening a desk, between the once-a-day cron ticks. One wake-up a
+// minute per instance is plenty: the cron route claims each schedule once.
+const KICK_EVERY_MS = 60_000;
+let lastKick = 0;
+
+export async function kickSchedules(origin: string | null): Promise<void> {
+  const now = Date.now();
+  if (now - lastKick < KICK_EVERY_MS) return;
+  lastKick = now;
+  await selfRequest(origin, "/api/agent/cron", {}, process.env.CRON_SECRET ? { authorization: `Bearer ${process.env.CRON_SECRET}` } : {});
+}
+
+async function selfRequest(origin: string | null, path: string, body: Record<string, unknown>, extra: Record<string, string> = {}): Promise<void> {
   if (!origin) return;
-  const headers: Record<string, string> = { "content-type": "application/json" };
+  const headers: Record<string, string> = { "content-type": "application/json", ...extra };
   const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
   if (bypass) headers["x-vercel-protection-bypass"] = bypass;
-  const request = fetch(`${origin}/api/agent/continue`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ runId, segment }),
-  })
+  const request = fetch(`${origin}${path}`, { method: "POST", headers, body: JSON.stringify(body) })
     .then(() => undefined)
     .catch(() => undefined);
   try {

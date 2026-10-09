@@ -2,11 +2,12 @@ import { createServerFn } from "@tanstack/react-start";
 import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, normalizeModules, type DeskModule, type HarnessId } from "./harness.ts";
 import { holdDone, patchFrame, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, boundOrigin, checkVerdicts, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isCheckEffect, isMemoryEffect, isPlanEffect, MAX_WRITTEN_LISTED, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
-import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus } from "./store.server.ts";
+import { asksForSchedule, describeWhen, isScheduleEffect, MAX_SCHEDULES, nextOccurrence, scheduleChanges, type ScheduleSpec } from "./schedule.ts";
+import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus, ScheduleRecord } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
 export type { JournalItem };
-export type { RunOutcome, RunRecord, RunStatus };
+export type { RunOutcome, RunRecord, RunStatus, ScheduleRecord };
 
 type DeskCarried = { files: DeskFile[]; steps: ToolStep[]; modules: DeskModule[]; journal: JournalItem[]; memory: string; notes: string[]; plan: PlanState; stopped?: boolean; paused?: boolean; events?: AgentEvent[]; last?: LastOutcome };
 
@@ -15,8 +16,8 @@ export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: f
 /** The desk as the page sees it: the loop's journal and memory stay on the server. */
 export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number };
 
-/** One request's worth of a run, plus the desk as it left it. */
-export type RunReply = { run: RunRecord; desk: PublicDesk };
+/** One request's worth of a run, plus the desk as it left it (and its schedules, when the segment ended). */
+export type RunReply = { run: RunRecord; desk: PublicDesk; schedules?: ScheduleRecord[] };
 
 export type RunSnapshot = { found: boolean; done: boolean; events: AgentEvent[]; reply: RunReply | null };
 
@@ -91,11 +92,16 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 真的缺一个只有用户知道的信息（比如要写进文件的名字、二选一的偏好）才用 Ask 问一句；能合理假设的就先做，在 Done 里说明假设。
 任务里出现"我的名字""我的城市""我的……"这类只有用户知道、结果里又必须用到的内容，而【记住的】和【之前的对话】里都没有时，就 Ask 一句问清楚，不要用占位符、示例值或改成参数来绕过——那样做出来的不是用户要的。
 
+【定时：每天到点自动做一件事】
+用户要「每天 / 定时 / 到点」做某件事时，用 Schedule.daily "08:00" "一句话说清楚到时候要做什么" 登记（时间默认北京时间；别的时区写 "08:00 Asia/Tokyo"）。登记之后，服务器每天到点会把那句话当作一个新任务交给这个工作区跑一次，结果出现在对话里，用户能在面板里看到和取消。登记的那句话要能独立执行：写清楚城市、文件名、格式，到时候跑的是一个不记得这次对话的新任务（但记忆、工作区文件、已装的 module 都在）。
+做法：同一次任务里，先把现在这一次做出来（比如今天的汇总），再 Schedule.daily 登记，Done 里说明「已登记每天 08:00 ……」。提示里的【定时任务】列出已登记的，重复的不用再登记；要取消用 Schedule.cancel n。不要写"调度脚本"放进工作区——没有任何东西会执行它；只有 Schedule.daily 登记的才会真的到点跑，任务要定时却没登记的 Done 会被改成 Partial。
+准点程度：服务器每天北京时间 8 点前后检查一次，其他时间点要靠有人打开工作台或外部定时触发，可能晚一些；登记时如实告诉用户。
+
 【能力边界：做不到的事要直说】
-你只在用户说话时跑一次，步骤结束进程就没了。所以你做不到：定时 / 每天到点自动执行、过一会儿提醒、后台一直运行、发邮件 / 短信 / 微信 / 推送通知、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完（比如先把今天的汇总做出来），用 Partial 结束并写明「要每天得到它，到时候再对我说一句」。不要写一个"调度脚本""提醒脚本""发送脚本"放进工作区当作完成——没有任何东西会去执行它，那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
+你只在被叫到时跑一次，步骤结束进程就没了。除了上面的每日定时，你做不到：过一会儿提醒、后台一直运行或盯着什么、发邮件 / 短信 / 微信 / 推送通知、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完，用 Partial 结束并写明用户可以怎么拿到结果（比如「到时候对我说一句」）。不要写一个"提醒脚本""发送脚本"放进工作区当作完成——那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
 
 【你能用什么】
-只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
+只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
 Step 里不要调用 Unix、Sys，也不要直接打开文件。写了不会执行。
 要计时用 Clock.now () : float，单位是秒。
 
@@ -180,6 +186,11 @@ module Memory : sig
   val forget : int -> unit
 end
 
+module Schedule : sig
+  val daily : string -> string -> unit res
+  val cancel : int -> unit
+end
+
 type reply =
   | Continue of string
   | Done of string
@@ -231,6 +242,15 @@ module Step : STEP = struct
     | Ok _ -> Continue "notes.md 已退回开始时的版本，下一步只改第 2 节"
 end
 
+【示例：今天先做一次，再登记每天做】
+module Step : STEP = struct
+  let run () =
+    (* 上一步已经把今天的汇总写进 weather/summary.md 并核对过 *)
+    match Schedule.daily "08:00" "查北京、东京、新加坡、伦敦、上海的当前气温，按温度从高到低写进 weather/summary.md" with
+    | Error e -> Partial ("今天的汇总在 weather/summary.md；定时没登记上：" ^ e)
+    | Ok () -> Done "今天的汇总在 weather/summary.md。已登记每天 08:00（北京时间）自动再做一次，结果会出现在这里；面板里可以取消。"
+end
+
 【示例：写一个 module 并装成 harness】
 module Step : STEP = struct
   let run () =
@@ -279,6 +299,10 @@ export type PromptContext = {
   visionFailed?: boolean;
   history?: HistoryItem[];
   notes?: string[];
+  /** Daily schedules the desk already has, numbered for Schedule.cancel. */
+  schedules?: ScheduleSpec[];
+  /** This run was started by a schedule, not by the user typing. */
+  scheduled?: boolean;
 };
 
 export type FileEntry = { path: string; bytes: number; image?: boolean };
@@ -329,6 +353,12 @@ function effectLine(effect: { tool: string; detail: string; output: string }): s
 
 export function promptContext(ctx: PromptContext): string {
   const parts: string[] = [];
+  if (ctx.scheduled) {
+    parts.push("【这是定时任务】这一次不是用户刚刚说的，是之前登记的每日定时到点了，服务器自动把登记的那句话交给你。按那句话把事做完、写进文件、Done 里说清结果；不要再登记一遍，也不要问用户问题（没有人在等着回答）。");
+  }
+  if (ctx.schedules && ctx.schedules.length > 0) {
+    parts.push(`【定时任务】（已登记，到点服务器会自动跑；重复的不用再登记，Schedule.cancel n 取消第 n 条）\n${ctx.schedules.map((item, index) => `${index + 1}. ${describeWhen(item.time, item.tz)}：${clip(oneLine(item.task), 200)}`).join("\n")}`);
+  }
   if (ctx.notes && ctx.notes.length > 0) {
     parts.push(`【记住的】（你之前用 Memory.remember 记下的，对这个工作区一直有效）\n${ctx.notes.map((note, index) => `${index + 1}. ${note}`).join("\n")}`);
   }
@@ -625,24 +655,36 @@ export function missingInput(task: string, answer: string, written: { path: stri
 // an outbound message is a claim nothing will honour, so it becomes a Partial
 // that says what is missing.
 
-const CLOCKED = "(早上|上午|中午|下午|晚上|凌晨|\\d{1,2}\\s*[点:：时]|整点|准时|自动|帮我|给我|提醒|推送|发|跑|执行|汇总|更新|同步|检查|抓|查)";
 const BEYOND: { pattern: RegExp; what: string }[] = [
-  { pattern: new RegExp(`定时|到点|到时候自动|每(天|日|周|月|小时|分钟|隔\\s*\\S{1,6})\\s*(都\\s*)?${CLOCKED}|\\bcron\\b|schedule`, "i"), what: "定时或每天到点自动执行" },
   { pattern: /提醒我|过\s*\S{1,6}\s*(提醒|叫我|通知我)|闹钟/, what: "过一会儿提醒" },
   { pattern: /后台(一直|持续|常驻)|一直(跑|运行|盯着|监控)|持续(监控|运行)|常驻/, what: "后台一直运行" },
   { pattern: /发\s*(邮件|短信|微信|消息|通知)|推送(到|给)|邮件(发|通知)|email/i, what: "发邮件、短信或消息" },
 ];
 const BEYOND_NOTE = "我没有这个能力";
+const UNSCHEDULED_NOTE = "这不能算做成";
+const UNSCHEDULED_WHAT = "定时（没有用 Schedule.daily 登记）";
+const alreadyTold = (text: string) => text.includes(BEYOND_NOTE) || text.includes(UNSCHEDULED_NOTE);
 
 export type BeyondReach = { what: string; note: string };
 
-export function beyondReach(task: string, reply: string): BeyondReach | null {
+/**
+ * Why a Done cannot stand: the task asked for something no run can do, or
+ * asked for a schedule and none was registered (a "schedule script" in the
+ * workspace is not one). `scheduled` is whether this run registered one.
+ */
+export function beyondReach(task: string, reply: string, scheduled = false): BeyondReach | null {
   if (reply !== "done") return null;
+  if (asksForSchedule(task) && !scheduled) {
+    return {
+      what: UNSCHEDULED_WHAT,
+      note: `（${UNSCHEDULED_NOTE}：任务要的是定时，但这次没有登记定时任务。工作区里的脚本不会在到点时自己执行；只有用 Schedule.daily 登记的才会由服务器每天到点跑一次。上面是现在做到的部分；要定时，再对我说一句「每天几点做什么」。）`,
+    };
+  }
   const hit = BEYOND.find((item) => item.pattern.test(task));
   if (!hit) return null;
   return {
     what: hit.what,
-    note: `（${BEYOND_NOTE}：${hit.what}。我只在你说话时跑一次，工作区里的脚本不会在到点时自己执行，也发不出消息。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
+    note: `（${BEYOND_NOTE}：${hit.what}。我只在被叫到时跑一次，发不出消息，也不会一直等着。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
   };
 }
 
@@ -686,6 +728,12 @@ export type LoopDeps = {
   history?: HistoryItem[];
   /** What the agent remembered about this desk so far (Memory.remember). */
   notes?: string[];
+  /** Daily schedules the desk already has, for the prompt and Schedule.cancel numbering. */
+  schedules?: ScheduleSpec[];
+  /** Whether this run already registered a schedule in an earlier segment. */
+  scheduledBefore?: boolean;
+  /** This run was started by a schedule, not the user. */
+  scheduled?: boolean;
 };
 
 export async function runDeskLoop(
@@ -738,6 +786,9 @@ export async function runDeskLoop(
   const written = new Set<string>(plan.written);
   // What the user has already told the desk, for the placeholder check.
   const known = [task, ...notes, ...(deps.history ?? []).flatMap((item) => [item.task, item.answer])].join("\n");
+  // Daily schedules as the model sees them (numbered), and whether this run registered one.
+  const schedules: ScheduleSpec[] = [...(deps.schedules ?? [])];
+  let scheduled = deps.scheduledBefore ?? false;
   // The loop is cut (and resumed by the page) when the request's time budget
   // runs out, and stopped when it keeps failing to compile or doing nothing.
   const halt = new AbortController();
@@ -788,6 +839,8 @@ export async function runDeskLoop(
             visionFailed,
             history: deps.history,
             notes,
+            schedules,
+            scheduled: deps.scheduled,
           });
           plan.pending = null;
           plan.failed = [];
@@ -851,7 +904,17 @@ export async function runDeskLoop(
             } else if (frame?.kind === "ok") {
               if (applyPlanEffects(plan, frame.effects)) emit({ kind: "todo", round, items: plan.items.map((item) => ({ ...item })) });
               for (const change of applyMemoryEffects(notes, frame.effects)) emit({ kind: "remember", round, text: change.text, forgot: change.forgot });
-              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool));
+              for (const change of scheduleChanges(frame.effects)) {
+                if (change.kind === "daily") {
+                  if (!schedules.some((item) => item.time === change.spec.time && item.tz === change.spec.tz && item.task === change.spec.task)) schedules.push(change.spec);
+                  scheduled = true;
+                  emit({ kind: "schedule", round, ...change.spec });
+                } else if (change.n <= schedules.length) {
+                  const [gone] = schedules.splice(change.n - 1, 1);
+                  if (gone) emit({ kind: "unschedule", round, n: change.n, ...gone });
+                }
+              }
+              const effects = frame.effects.filter((effect) => !isPlanEffect(effect.tool) && !isMemoryEffect(effect.tool) && !(isScheduleEffect(effect.tool) && effect.output.startsWith("Ok")) && effect.tool !== "Schedule.cancel");
               for (const effect of effects) emit({ kind: "effect", round, ...effect });
               if (effects.some((effect) => WRITES.has(effect.tool) && effect.output.startsWith("Ok"))) plan.wrote = true;
               for (const effect of effects) if (FILE_WRITES.has(effect.tool) && effect.output.startsWith("Ok")) written.add(effect.detail);
@@ -912,8 +975,8 @@ export async function runDeskLoop(
               if (reply === "done") {
                 // A Done on a task that needs a schedule, a reminder or an
                 // outbound message claims something no one will carry out.
-                const beyond = beyondReach(task, reply);
-                const told = text.includes(BEYOND_NOTE) ? text : `${text.trim()}\n\n${beyond?.note ?? ""}`;
+                const beyond = deps.scheduled ? null : beyondReach(task, reply, scheduled);
+                const told = alreadyTold(text) ? text : `${text.trim()}\n\n${beyond?.note ?? ""}`;
                 const limited = beyond ? patchFrame(raw, { kind: "partial", text: told }) : null;
                 if (beyond && limited) {
                   raw = limited;
@@ -1047,7 +1110,7 @@ function readRunId(input: unknown): { runId: string; after: number } {
   return { runId, after };
 }
 
-export type DeskLoad = { found: false; durable: boolean } | { found: true; durable: boolean; desk: PublicDesk; runs: RunRecord[] };
+export type DeskLoad = { found: false; durable: boolean } | { found: true; durable: boolean; desk: PublicDesk; runs: RunRecord[]; schedules: ScheduleRecord[] };
 
 export const loadDesk = createServerFn({ method: "POST" })
   .validator(readDeskId)
@@ -1057,7 +1120,27 @@ export const loadDesk = createServerFn({ method: "POST" })
     const desk = await store.readDesk(data.deskId);
     if (!desk) return { found: false, durable };
     const runs = await store.listRuns(data.deskId);
-    return { found: true, durable, desk: publicDesk(desk), runs };
+    const schedules = await store.listSchedules(data.deskId);
+    // A visit is also a chance to start any schedule whose time has come.
+    const drive = await import("./drive.server.ts");
+    await drive.kickSchedules(drive.selfOrigin());
+    return { found: true, durable, desk: publicDesk(desk), runs, schedules };
+  });
+
+function readScheduleRemove(input: unknown): { deskId: string; scheduleId: string } {
+  const { deskId } = readDeskId(input);
+  const scheduleId = input && typeof input === "object" && "scheduleId" in input ? input.scheduleId : null;
+  if (typeof scheduleId !== "string" || !/^sch-[a-z0-9-]{4,48}$/.test(scheduleId)) throw new Error("定时任务编号不对。");
+  return { deskId, scheduleId };
+}
+
+// The page's 取消 on a schedule.
+export const removeSchedule = createServerFn({ method: "POST" })
+  .validator(readScheduleRemove)
+  .handler(async ({ data }): Promise<{ schedules: ScheduleRecord[] }> => {
+    const store = await import("./store.server.ts");
+    await store.removeSchedule(data.deskId, data.scheduleId);
+    return { schedules: await store.listSchedules(data.deskId) };
   });
 
 export type DeskSaved = { ok: true; revision: number; files: number } | { ok: false; error: string };
@@ -1199,6 +1282,55 @@ export function historyFor(runs: RunRecord[], currentId: string): HistoryItem[] 
     .map((run) => ({ task: run.task, answer: run.result?.answer ?? "", status: run.status, asked: run.result?.asked }));
 }
 
+// What a segment's Schedule.daily / Schedule.cancel steps did, written to the
+// desk's schedules once the segment is over, in the order they happened.
+async function applyScheduleEvents(deskId: string, events: AgentEvent[]): Promise<ScheduleRecord[]> {
+  const store = await import("./store.server.ts");
+  for (const event of events) {
+    if (event.kind === "schedule") {
+      const spec: ScheduleSpec = { time: event.time, tz: event.tz, task: event.task };
+      await store.addSchedule(deskId, spec, nextOccurrence(spec.time, spec.tz, Date.now()), MAX_SCHEDULES);
+    } else if (event.kind === "unschedule") {
+      const gone = (await store.listSchedules(deskId)).find((item) => item.time === event.time && item.tz === event.tz && item.task === event.task);
+      if (gone) await store.removeSchedule(deskId, gone.id);
+    }
+  }
+  return store.listSchedules(deskId);
+}
+
+/**
+ * Starts a run for each schedule whose time has come, up to `limit` of them,
+ * and runs their first segments here. Claiming a schedule moves it to its next
+ * day in one row update, so two callers (the daily cron, a visit's kick, an
+ * outside pinger) never start the same one twice. A desk that is busy with
+ * another run is skipped and tried again on the next call.
+ */
+export async function runDueSchedules(origin: string | null, limit = 2): Promise<{ started: string[]; skipped: number }> {
+  const store = await import("./store.server.ts");
+  const now = Date.now();
+  const started: string[] = [];
+  let skipped = 0;
+  for (const due of await store.dueSchedules(now, limit)) {
+    const desk = await store.readDesk(due.deskId);
+    if (!desk) {
+      await store.removeSchedule(due.deskId, due.id);
+      continue;
+    }
+    const live = await store.activeRun(due.deskId);
+    if (live?.status === "running") {
+      skipped += 1;
+      continue;
+    }
+    const runId = `run-sched-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const claimed = await store.claimSchedule(due.id, due.nextAt, nextOccurrence(due.time, due.tz, now), runId);
+    if (!claimed) continue;
+    const run = await store.createRun(due.deskId, runId, due.task, "schedule");
+    started.push(run.id);
+    await runSegment(run, { ...desk, journal: [], memory: "" }, origin);
+  }
+  return { started, skipped };
+}
+
 async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | null): Promise<RunReply> {
   const store = await import("./store.server.ts");
   const { runProgress } = await import("./progress.server.ts");
@@ -1216,8 +1348,9 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
     if (status === "paused" && result.last) outcome.last = result.last;
     const saved = await store.writeDesk(desk.id, state);
     await store.finishRun(run.id, status, rounds, outcome);
+    const schedules = await applyScheduleEvents(desk.id, events);
     const fresh = (await store.getRun(run.id)) ?? { ...run, status, rounds, result: outcome, events: [...run.events, ...events] };
-    const reply: RunReply = { run: fresh, desk: publicDesk(saved) };
+    const reply: RunReply = { run: fresh, desk: publicDesk(saved), schedules };
     runProgress.close(run.id, reply, outcome.ok);
     // Paused for time only: the server carries on by itself.
     if (status === "paused" && carriesOn(fresh)) await drive.selfContinue(fresh.id, fresh.segment, self);
@@ -1243,6 +1376,7 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
     const checked = desk.modules.length ? await verifyModuleSet(desk.modules) : { kept: desk.modules, dropped: [] };
     const budgetMs = Math.max(15_000, runBudgetMs() - (Date.now() - started));
     const history = historyFor(await store.listRuns(desk.id), run.id);
+    const schedules = await store.listSchedules(desk.id);
     const result = await runDeskLoop(apiKey, run.task, desk.files, desk.harnesses, checked.kept, desk.journal, desk.memory, {
       runCore,
       runPayload,
@@ -1256,6 +1390,9 @@ async function runSegment(run: RunRecord, desk: DeskRecord, origin?: string | nu
       last: run.result?.last ?? null,
       history,
       notes: desk.notes,
+      schedules: schedules.map((item) => ({ time: item.time, tz: item.tz, task: item.task })),
+      scheduledBefore: run.events.some((event) => event.kind === "schedule"),
+      scheduled: run.trigger === "schedule",
     });
     await alive.stop();
     const events = runProgress.read(run.id).events;

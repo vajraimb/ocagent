@@ -3,6 +3,7 @@ import {
   Blocks,
   Braces,
   Brain,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronRight,
@@ -27,6 +28,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { foldRounds, latestPlan, type AgentEvent, type PlanItem, type Round } from "@/lib/agent/progress";
+import { describeWhen } from "@/lib/agent/schedule";
 import type { ToolStep } from "@/lib/agent/workspace";
 
 export type AgentStatus = "running" | "done" | "failed" | "stopped" | "paused";
@@ -293,6 +295,15 @@ function RoundView({ round, last, running }: { round: Round; last: boolean; runn
         ) : null}
         {round.needInput ? <Row icon={<MessageCircleQuestion className="h-3.5 w-3.5" aria-hidden />} label={`结果里用了占位，缺${round.needInput.topics.map((topic) => `你的${topic}`).join("、")}，改成问你`} tone="fg" /> : null}
         {round.limit ? <Row icon={<TriangleAlert className="h-3.5 w-3.5" aria-hidden />} label={`任务要的「${round.limit}」它做不到，不能算完成，改成只做到一半`} tone="warn" /> : null}
+        {round.scheduled.map((item, index) => (
+          <Row
+            key={`${index}-${item.time}-${item.task}`}
+            icon={<CalendarClock className="h-3.5 w-3.5" aria-hidden />}
+            label={item.kind === "daily" ? `定下了：${describeWhen(item.time, item.tz)}，到点自动做` : `取消了定时：${describeWhen(item.time, item.tz)}`}
+            detail={item.task}
+            tone="accent"
+          />
+        ))}
         {round.reply && !round.check ? <ReplyRow kind={round.reply.kind} live={live} /> : null}
       </div>
     </li>

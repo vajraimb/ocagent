@@ -1,7 +1,9 @@
 import { useRef, useState } from "react";
-import { Blocks, Brain, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Blocks, Brain, CalendarClock, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
+import { describeWhen, stampIn } from "@/lib/agent/schedule";
+import type { ScheduleRecord } from "@/lib/agent/run";
 
 const FIXED: HarnessId[] = ["ocaml"];
 
@@ -27,6 +29,8 @@ export function SidePanel({
   onRemoveFile,
   notes,
   onForget,
+  schedules,
+  onUnschedule,
 }: {
   harnesses: HarnessId[];
   setHarnesses: (next: HarnessId[]) => void;
@@ -48,6 +52,9 @@ export function SidePanel({
   /** What the agent remembered about this desk; shown in every task's prompt. */
   notes: string[];
   onForget: (index: number) => void;
+  /** Daily tasks the server runs for this desk. */
+  schedules: ScheduleRecord[];
+  onUnschedule: (id: string) => void;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -299,6 +306,34 @@ export function SidePanel({
               <li key={`${index}-${note}`} className="group flex min-w-0 items-start gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs leading-5 text-fg">
                 <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">{note}</span>
                 <button type="button" disabled={disabled} onClick={() => onForget(index)} aria-label={`忘掉：${note}`} className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted hover:text-danger disabled:opacity-50">
+                  <X className="h-3.5 w-3.5" aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {schedules.length > 0 ? (
+        <section className="px-4 pb-4">
+          <h2 className="flex items-center gap-1.5 text-sm font-medium text-fg">
+            <CalendarClock className="h-4 w-4 text-muted" aria-hidden />
+            定时任务
+            <span className="font-mono text-xs text-muted">{schedules.length}</span>
+          </h2>
+          <p className="mt-1 text-xs leading-5 text-muted">到点服务器自动做，结果出现在这里的对话里；准点程度看服务器，可能晚一会儿。</p>
+          <ul className="mt-2 flex flex-col gap-1">
+            {schedules.map((item) => (
+              <li key={item.id} className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-bg px-2.5 py-1.5 text-xs leading-5 text-fg">
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium">{describeWhen(item.time, item.tz)}</p>
+                  <p className="break-words [overflow-wrap:anywhere] text-fg">{item.task}</p>
+                  <p className="text-muted">
+                    下次 {stampIn(item.nextAt, item.tz)}
+                    {item.lastAt ? ` · 上次 ${stampIn(item.lastAt, item.tz)}` : ""}
+                  </p>
+                </div>
+                <button type="button" disabled={disabled} onClick={() => onUnschedule(item.id)} aria-label={`取消定时：${item.task}`} className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted hover:text-danger disabled:opacity-50">
                   <X className="h-3.5 w-3.5" aria-hidden />
                 </button>
               </li>

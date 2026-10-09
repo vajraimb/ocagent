@@ -616,7 +616,7 @@ test("earlier exchanges in the desk are shown to the model, and a pending Ask is
 
 test("historyFor leaves out the current run, running runs and runs without a result; keeps the newest", () => {
   const run = (id: string, status: "done" | "running" | "failed", answer: string | null): RunRecord =>
-    ({ id, deskId: "desk-x", task: `t-${id}`, status, segment: 1, rounds: 1, events: [], result: answer === null ? null : { ok: true, answer, steps: [], touched: [] }, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null }) as RunRecord;
+    ({ id, deskId: "desk-x", task: `t-${id}`, trigger: "user", status, segment: 1, rounds: 1, events: [], result: answer === null ? null : { ok: true, answer, steps: [], touched: [] }, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null }) as RunRecord;
   const runs = [run("a", "done", "A"), run("b", "failed", "B"), run("c", "done", null), run("d", "running", "D"), run("me", "done", "ME")];
   const history = historyFor(runs, "me");
   assert.deepEqual(history.map((item) => item.task), ["t-a", "t-b"]);
@@ -802,17 +802,18 @@ test("a Partial that gives up on a Check.contains miss without reading the file 
   assert.deepEqual(blindMisses(effects("Check.contains\tnone.md 含 x\t没通过：没有这个文件\nCheck.that\t两行\t没通过")), []);
 });
 
-test("a Done on a task that needs a schedule, a reminder or an outbound message becomes a Partial that says so", async () => {
-  // The pure judgement: scheduling words with a time or an action, reminders, background jobs, messages.
-  assert.equal(beyondReach("定时北京时间每天早上8点把这5个城市天气预报汇总", "done")?.what, "定时或每天到点自动执行");
-  assert.equal(beyondReach("每天帮我查一次汇率", "done")?.what, "定时或每天到点自动执行");
+test("a Done on a task that asks for a schedule without registering one, or needs a reminder or a message, becomes a Partial that says so", async () => {
+  // The pure judgement: a schedule asked for and not registered; reminders, background jobs, messages.
+  assert.equal(beyondReach("定时北京时间每天早上8点把这5个城市天气预报汇总", "done")?.what, "定时（没有用 Schedule.daily 登记）");
+  assert.equal(beyondReach("每天帮我查一次汇率", "done")?.what, "定时（没有用 Schedule.daily 登记）");
+  assert.equal(beyondReach("每天帮我查一次汇率", "done", true), null, "registered: nothing is beyond reach");
   assert.equal(beyondReach("过十分钟提醒我开会", "done")?.what, "过一会儿提醒");
   assert.equal(beyondReach("后台一直盯着这个页面有没有更新", "done")?.what, "后台一直运行");
   assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发邮件、短信或消息");
   assert.equal(beyondReach("写一首关于每天早起的诗", "done"), null, "no schedule asked for");
   assert.equal(beyondReach("每天的天气都不一样，查一下今天的", "done"), null);
   assert.equal(beyondReach("定时北京时间每天早上8点汇总", "partial"), null, "a Partial already says it is not done");
-  // In the loop: the check round still happens; the Done that then goes through turns into a Partial with the note.
+  // In the loop: the Done that writes a "scheduler script" instead of registering turns into a Partial with the note.
   const events: AgentEventBody[] = [];
   const contexts: string[] = [];
   const realFetch = globalThis.fetch;
@@ -831,10 +832,76 @@ test("a Done on a task that needs a schedule, a reminder or an outbound message 
     const steps = events.filter((event) => event.kind === "step");
     assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["partial"]);
     const last = steps[0];
-    assert.match(last?.kind === "step" ? last.text : "", /已写下 run_daily\.ml[\s\S]*我没有这个能力：定时或每天到点自动执行[\s\S]*到时候对我说一句/);
+    assert.match(last?.kind === "step" ? last.text : "", /已写下 run_daily\.ml[\s\S]*这不能算做成[\s\S]*Schedule\.daily/);
     const limit = events.find((event) => event.kind === "limit");
-    assert.ok(limit && limit.kind === "limit" && limit.what === "定时或每天到点自动执行");
+    assert.ok(limit && limit.kind === "limit" && limit.what === "定时（没有用 Schedule.daily 登记）");
     assert.ok(result.ok);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("Schedule.daily in a step registers a schedule: a schedule event, the list in the next prompt, and a Done that stands", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  const frames = [
+    okFrame("continue", "今天的先做好了，登记每天的。", "Files.write_file\tweather/today.md\tOk\nSchedule.daily\t08:00\tOk 查 5 个城市天气，汇总写进 weather/today.md"),
+    okFrame("done", "每天 08:00 会自动汇总。", "Check.contains\tweather/today.md 含 北京\t通过"),
+  ];
+  let i = 0;
+  try {
+    const result = await runDeskLoop("key", "定时北京时间每天早上8点把这5个城市天气预报汇总", [], ["ocaml", "files"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+      schedules: [{ time: "21:30", tz: "Asia/Shanghai", task: "整理当天笔记" }],
+    });
+    const scheduled = events.find((event) => event.kind === "schedule");
+    assert.ok(scheduled && scheduled.kind === "schedule");
+    assert.equal(scheduled.time, "08:00");
+    assert.equal(scheduled.tz, "Asia/Shanghai");
+    assert.equal(scheduled.task, "查 5 个城市天气，汇总写进 weather/today.md");
+    assert.ok(!events.some((event) => event.kind === "effect" && event.tool === "Schedule.daily"), "the registration is its own event, not an effect line");
+    const steps = events.filter((event) => event.kind === "step");
+    assert.deepEqual(steps.map((event) => (event.kind === "step" ? event.reply : "")), ["continue", "done"]);
+    assert.ok(!events.some((event) => event.kind === "limit"), "registered: the Done stands");
+    assert.ok(result.ok);
+    // The prompt after the registration lists both schedules, numbered, with the existing one first.
+    const after = contexts.slice(1).join("\n");
+    assert.match(after, /【定时任务】[\s\S]*1\. 每天 21:30（北京时间）：整理当天笔记[\s\S]*2\. 每天 08:00（北京时间）：查 5 个城市天气/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("Schedule.cancel n drops the n-th listed schedule and says which; a run a schedule started is told so", async () => {
+  const events: AgentEventBody[] = [];
+  const contexts: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = capturing(contexts);
+  const frames = [okFrame("done", "取消了。", "Schedule.cancel\t2\t")];
+  let i = 0;
+  try {
+    await runDeskLoop("key", "把每天晚上整理笔记的定时取消", [], ["ocaml"], [], [], "", {
+      runCore: replyAwareCore(frames),
+      runPayload: async () => frames[i++] ?? okFrame("done", "x"),
+      emit: (event) => events.push(event),
+      budgetMs: 60_000,
+      schedules: [
+        { time: "08:00", tz: "Asia/Shanghai", task: "查天气" },
+        { time: "21:30", tz: "Asia/Shanghai", task: "整理当天笔记" },
+      ],
+      scheduled: true,
+    });
+    const gone = events.find((event) => event.kind === "unschedule");
+    assert.ok(gone && gone.kind === "unschedule");
+    assert.equal(gone.n, 2);
+    assert.equal(gone.task, "整理当天笔记");
+    assert.match(contexts[0] ?? "", /【这是定时任务】/);
+    assert.deepEqual(events.filter((event) => event.kind === "step").map((event) => (event.kind === "step" ? event.reply : "")), ["done"]);
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -914,6 +981,45 @@ end`;
   assert.deepEqual(seen, [["fresh.md", null], ["notes.md", "第一节\n改坏了\n"]]);
 });
 
+test("the real runner: Schedule.daily checks the time and the task, and logs what it registered", async () => {
+  const { runStep } = await import("./ocaml-run.ts");
+  const source = `module Step : STEP = struct
+  let run () =
+    let a = Schedule.daily "08:00" "查 5 个城市天气，汇总写进 weather/today.md" in
+    let b = Schedule.daily "8:30 Asia/Tokyo" "整理笔记" in
+    let c = Schedule.daily "早上八点" "查天气" in
+    let d = Schedule.daily "25:00" "查天气" in
+    let e = Schedule.daily "08:00" "   " in
+    let f = Schedule.daily "08:00" (String.make 400 'x') in
+    Schedule.cancel 2;
+    let show = function Ok () -> "ok" | Error m -> "err:" ^ m in
+    Continue (String.concat " | " (List.map show [a; b; c; d; e; f]))
+end`;
+  const raw = await runStep(`${block(source)}0\n`, ["ocaml"], undefined);
+  const { describeStepFrame } = await import("./progress.ts");
+  const frame = describeStepFrame(raw);
+  assert.ok(frame && frame.kind === "ok", raw.slice(0, 400));
+  if (!frame || frame.kind !== "ok") return;
+  assert.match(frame.text, /^ok \| ok \| err:时间要写成 08:00[^|]*\| err:时间要写成 08:00[^|]*\| err:要定时做的事是空的 \| err:要定时做的事太长了/);
+  const logged = frame.effects.filter((effect) => effect.tool.startsWith("Schedule.")).map((effect) => [effect.tool, effect.detail, effect.output]);
+  assert.equal(logged.length, 7);
+  assert.deepEqual(logged[0], ["Schedule.daily", "08:00", "Ok 查 5 个城市天气，汇总写进 weather/today.md"]);
+  assert.deepEqual(logged[1], ["Schedule.daily", "8:30 Asia/Tokyo", "Ok 整理笔记"]);
+  assert.deepEqual(logged.slice(2, 6).map((row) => [row[1], row[2]?.split("，")[0]]), [
+    ["早上八点", "Error 时间要写成 08:00（默认北京时间）"],
+    ["25:00", "Error 时间要写成 08:00（默认北京时间）"],
+    ["08:00", "Error 要定时做的事是空的"],
+    ["08:00", "Error 要定时做的事太长了"],
+  ]);
+  assert.deepEqual(logged[6], ["Schedule.cancel", "2", ""]);
+  const { scheduleChanges } = await import("./schedule.ts");
+  assert.deepEqual(scheduleChanges(frame.effects), [
+    { kind: "daily", spec: { time: "08:00", tz: "Asia/Shanghai", task: "查 5 个城市天气，汇总写进 weather/today.md" } },
+    { kind: "daily", spec: { time: "08:30", tz: "Asia/Tokyo", task: "整理笔记" } },
+    { kind: "cancel", n: 2 },
+  ]);
+});
+
 test("a task about 我的… answered with a placeholder becomes an Ask, unless the desk already knows the fact", async () => {
   const written = [{ path: "README.md", content: "# <名字> 的主页\n" }];
   const placeholder = okFrameWithFiles("done", "已写下 README.md，标题处留了名字的位置", "Files.write_file\tREADME.md\tOk\nCheck.contains\tREADME.md 含 主页\t通过", written);
@@ -956,7 +1062,7 @@ test("a task about 我的… answered with a placeholder becomes an Ask, unless 
 });
 
 test("carriesOn: a paused run continues by itself while it makes progress and has segments left", () => {
-  const base: RunRecord = { id: "run-aaaaaaaaaa", deskId: "desk-aaaaaaaaaa", task: "t", status: "paused", segment: 1, rounds: 3, events: [], result: null, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null };
+  const base: RunRecord = { id: "run-aaaaaaaaaa", deskId: "desk-aaaaaaaaaa", task: "t", trigger: "user", status: "paused", segment: 1, rounds: 3, events: [], result: null, stopRequested: false, createdAt: 0, updatedAt: 0, endedAt: null };
   const progressed: AgentEvent[] = [
     { kind: "start", task: "t", seq: 1, at: 0 },
     { kind: "step", round: 1, reply: "continue", text: "", seq: 2, at: 0 },

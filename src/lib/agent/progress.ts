@@ -20,6 +20,8 @@ export type AgentEventBody =
   | { kind: "limit"; round: number; what: string }
   | { kind: "need_input"; round: number; topics: string[]; question: string }
   | { kind: "remember"; round: number; text: string; forgot: boolean }
+  | { kind: "schedule"; round: number; time: string; tz: string; task: string }
+  | { kind: "unschedule"; round: number; n: number; time: string; tz: string; task: string }
   | { kind: "finish"; ok: boolean };
 
 export type AgentEvent = AgentEventBody & { seq: number; at: number };
@@ -397,6 +399,8 @@ export type Round = {
   limit: string;
   /** Notes remembered or forgotten in this round. */
   remembered: NoteChange[];
+  /** Daily schedules registered (Schedule.daily) or cancelled (n) in this round. */
+  scheduled: { kind: "daily" | "cancel"; time: string; tz: string; task: string }[];
 };
 
 export function foldRounds(events: AgentEvent[]): Round[] {
@@ -404,7 +408,7 @@ export function foldRounds(events: AgentEvent[]): Round[] {
   const at = (round: number): Round => {
     let found = rounds.get(round);
     if (!found) {
-      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [] };
+      found = { round, thinking: false, code: "", modelError: "", running: false, compileError: "", runnerError: "", calls: [], effects: [], modules: [], reply: null, check: "", checkFailed: [], checkGaveUp: false, needInput: null, limit: "", remembered: [], scheduled: [] };
       rounds.set(round, found);
     }
     return found;
@@ -469,6 +473,12 @@ export function foldRounds(events: AgentEvent[]): Round[] {
         break;
       case "limit":
         at(event.round).limit = event.what;
+        break;
+      case "schedule":
+        at(event.round).scheduled.push({ kind: "daily", time: event.time, tz: event.tz, task: event.task });
+        break;
+      case "unschedule":
+        at(event.round).scheduled.push({ kind: "cancel", time: event.time, tz: event.tz, task: event.task });
         break;
       case "remember":
         at(event.round).remembered.push({ text: event.text, forgot: event.forgot });

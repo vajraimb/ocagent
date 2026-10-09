@@ -166,7 +166,7 @@ export async function verifyModule(name: string, rawBody: string, context: DeskM
     if (!rawBody.trim()) return { ok: false, error: "文件是空的。" };
     const offending = bannedCall(rawBody);
     if (offending) return { ok: false, error: `${trimmed} 不能当 harness：里面用了 ${offending}，这类调用在 module 里是禁止的。` };
-    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Step 是保留名），换一个。` };
+    return { ok: false, error: `${trimmed} 这个名字被占用了（Net、Search、Files、Json、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Step 是保留名），换一个。` };
   }
   const banned = rejectedSource(stripped.body);
   if (banned) return { ok: false, error: banned.replace(/^编译失败\n/, "").replaceAll("Step 里", "module 里").replace(/写进文件的源码可以包含.*$/, "").trim() };
@@ -785,7 +785,7 @@ function shortenDiagnostic(raw: string, source = ""): string {
   if (/\b(res|result)\b/.test(`${got ?? ""}`) && /\breply\b/.test(`${expected ?? ""} ${text}`)) {
     lines.push("提示: Files、Search、Net 的函数返回 res，需要 match 处理 Ok 和 Error。");
   } else if (/Unbound value|Unbound module/.test(text)) {
-    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
+    lines.push("提示: 只能用 Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、已装上的 module，以及标准库里的纯计算。不要用 Unix 或 Sys。");
   } else if (quoteTrouble || /String literal not terminated|Illegal backslash escape|Illegal character/.test(text)) {
     lines.push("提示: 多行、带引号或带反斜杠的文本（文件正文、长答案）用 {|...|} 包起来写，里面不用转义。");
   } else if (/Unbound constructor/.test(text)) {
@@ -1353,6 +1353,34 @@ module Memory = struct
   let remember text = log_effect "Memory.remember" "" text
 
   let forget n = log_effect "Memory.forget" (string_of_int n) ""
+end
+
+(* Daily schedules: the line is the whole registration; the server validates
+   the zone, stores it with the desk and starts a run when it is due. *)
+module Schedule = struct
+  let is_digit c = c >= '0' && c <= '9'
+
+  let clock_ok s =
+    match String.index_opt s ':' with
+    | Some i when i >= 1 && i <= 2 && String.length s - i - 1 = 2 ->
+        let h = String.sub s 0 i and m = String.sub s (i + 1) 2 in
+        String.for_all is_digit h && String.for_all is_digit m
+        && int_of_string h <= 23 && int_of_string m <= 59
+    | _ -> false
+
+  let daily when_ task =
+    let when_ = String.trim when_ in
+    let clock = match String.index_opt when_ ' ' with Some i -> String.sub when_ 0 i | None -> when_ in
+    let result =
+      if not (clock_ok clock) then Error "时间要写成 08:00（默认北京时间），要别的时区就写 08:00 Asia/Tokyo"
+      else if String.trim task = "" then Error "要定时做的事是空的"
+      else if String.length task > 300 then Error "要定时做的事太长了，一句话说清楚（300 字以内）"
+      else Ok ()
+    in
+    log_effect "Schedule.daily" when_ (match result with Ok () -> "Ok " ^ task | Error e -> "Error " ^ e);
+    result
+
+  let cancel n = log_effect "Schedule.cancel" (string_of_int n) ""
 end
 
 module Harness = struct

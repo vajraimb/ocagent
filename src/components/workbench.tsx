@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { ArrowUp, Blocks, FilePen, Globe, PackagePlus, PanelRight, Play, Search, Square } from "lucide-react";
+import { ArrowUp, Blocks, CalendarClock, FilePen, Globe, PackagePlus, PanelRight, Play, Search, Square } from "lucide-react";
 import { AgentTurn, type AgentTurnData } from "@/components/agent-turn";
 import { SidePanel } from "@/components/side-panel";
 import { CATALOG, DEFAULT_HARNESSES, MAX_MODULES, checkModule, isHarnessId, moduleNameFor, type DeskModule, type HarnessId } from "@/lib/agent/harness";
@@ -15,6 +15,7 @@ import {
   installModule,
   loadDesk,
   pollRun,
+  removeSchedule,
   saveDesk,
   startRun,
   stopRun,
@@ -22,7 +23,9 @@ import {
   type PublicDesk,
   type RunRecord,
   type RunReply,
+  type ScheduleRecord,
 } from "@/lib/agent/run";
+import { describeWhen } from "@/lib/agent/schedule";
 import { MAX_FILES, batchPuts, fileDelta, isImageFile, isScratchFile, safePath, type DeskFile } from "@/lib/agent/workspace";
 
 // The browser keeps only the desk's key and a cache for the first paint; the
@@ -199,6 +202,13 @@ function turnOf(run: RunRecord): AgentTurnData {
 }
 
 // The newest run that stopped short of an answer gets a one-tap follow-up.
+// The badge over a run a schedule started: its time when the schedule is still
+// around, plainly "定时任务" once it has been cancelled.
+function scheduleLabel(run: RunRecord, schedules: ScheduleRecord[]): string {
+  const from = schedules.find((item) => item.lastRunId === run.id);
+  return from ? `定时任务 · ${describeWhen(from.time, from.tz)}` : "定时任务 · 到点自动开始";
+}
+
 function unfinished(run: RunRecord): boolean {
   if (run.status === "stopped" || run.status === "failed" || run.status === "paused") return true;
   const last = [...run.events].reverse().find((event) => event.kind === "step");
@@ -246,6 +256,7 @@ export function Workbench() {
   // What the agent has remembered about this desk (Memory.remember).
   const [notes, setNotes] = useState<string[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [schedules, setSchedules] = useState<ScheduleRecord[]>([]);
   const [selected, setSelected] = useState("");
   const [ready, setReady] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
@@ -395,6 +406,7 @@ export function Workbench() {
         }
         absorbDesk(loaded.desk);
         setRuns(loaded.runs);
+        setSchedules(loaded.schedules);
         const open = loaded.runs.find((run) => run.status === "running" || run.status === "paused");
         if (open?.status === "running") setDriving(open.id);
         else if (open && carriesOn(open)) {
@@ -409,6 +421,40 @@ export function Workbench() {
       cancelled = true;
     };
   }, [deskId, absorbDesk, sync]);
+
+  // A desk with schedules gets runs it did not start from this page: when one
+  // is due, and when the page comes back to the foreground, ask the server
+  // again so the new run (and the run it is in the middle of) shows up.
+  useEffect(() => {
+    if (!deskId || running || schedules.length === 0) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const loaded = await loadDesk({ data: { deskId } });
+        if (cancelled || !loaded.found) return;
+        setSchedules(loaded.schedules);
+        setRuns((current) => (loaded.runs.length >= current.length ? loaded.runs : current));
+        const open = loaded.runs.find((run) => run.status === "running");
+        if (open) setDriving(open.id);
+      } catch {
+        /* the next due time or visit tries again */
+      }
+    };
+    const soonest = Math.min(...schedules.map((item) => item.nextAt));
+    // A little after the due time, so the server's wake-up has started the run.
+    const overdue = Date.now() - soonest;
+    const wait = overdue > 600_000 ? 60_000 : Math.min(6 * 3_600_000, Math.max(5_000, 8_000 - overdue));
+    const timer = window.setTimeout(() => void refresh(), wait);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [deskId, running, schedules]);
 
   useEffect(() => {
     if (!ready || !deskId) return;
@@ -485,6 +531,7 @@ export function Workbench() {
       if (finished.current.has(key)) return;
       finished.current.add(key);
       absorbDesk(reply.desk);
+      if (reply.schedules) setSchedules(reply.schedules);
       recovering.current.delete(reply.run.id);
       // A segment that only paused is followed by the next one right away, so
       // the page keeps showing the run as live rather than flashing "没做完".
@@ -575,7 +622,7 @@ export function Workbench() {
       }
       const runId = uid("run");
       const now = Date.now();
-      setRuns((current) => [...current, { id: runId, deskId, task: text, status: "running", segment: 1, rounds: 0, events: [], result: null, stopRequested: false, createdAt: now, updatedAt: now, endedAt: null }]);
+      setRuns((current) => [...current, { id: runId, deskId, task: text, trigger: "user", status: "running", segment: 1, rounds: 0, events: [], result: null, stopRequested: false, createdAt: now, updatedAt: now, endedAt: null }]);
       setTask("");
       await drive(runId, () => startRun({ data: { deskId, runId, task: text } }));
     } finally {
@@ -756,6 +803,16 @@ export function Workbench() {
     setPanelOpen(false);
   }
 
+  async function unschedule(scheduleId: string) {
+    if (!deskId) return;
+    try {
+      const outcome = await removeSchedule({ data: { deskId, scheduleId } });
+      setSchedules(outcome.schedules);
+    } catch (caught) {
+      setNotice(`没取消：${caught instanceof Error ? caught.message : "连不上服务器"}`);
+    }
+  }
+
   function openFile(path: string) {
     setSelected(path);
     setPanelOpen(true);
@@ -796,6 +853,8 @@ export function Workbench() {
       onRemoveFile={removeFile}
       notes={notes}
       onForget={forgetNote}
+      schedules={schedules}
+      onUnschedule={(id) => void unschedule(id)}
       busy={running}
     />
   );
@@ -934,6 +993,12 @@ export function Workbench() {
           {[...runs].reverse().map((run) => (
             <div key={run.id} className="flex flex-col gap-5">
               <article className="ml-10 select-text self-end rounded-2xl bg-raised px-4 py-3">
+                {run.trigger === "schedule" ? (
+                  <p className="mb-1 flex items-center gap-1.5 font-mono text-[11px] tracking-wide text-muted">
+                    <CalendarClock className="h-3.5 w-3.5" aria-hidden />
+                    {scheduleLabel(run, schedules)}
+                  </p>
+                ) : null}
                 <p className="whitespace-pre-wrap text-[15px] leading-7 text-fg">{run.task}</p>
               </article>
               <AgentTurn
