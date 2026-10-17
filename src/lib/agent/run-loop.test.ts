@@ -871,8 +871,11 @@ test("a Done on a task that asks for a schedule without registering one, or need
   assert.equal(beyondReach("每天帮我查一次汇率", "done", true), null, "registered: nothing is beyond reach");
   assert.equal(beyondReach("过十分钟提醒我开会", "done")?.what, "过一会儿提醒");
   assert.equal(beyondReach("后台一直盯着这个页面有没有更新", "done")?.what, "后台一直运行");
-  assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发邮件或短信");
-  assert.equal(beyondReach("把结果发邮件给我", "done", { notify: "sent" })?.what, "发邮件或短信", "a notify address is not email");
+  assert.equal(beyondReach("把结果发邮件给我", "done")?.what, "发消息");
+  assert.match(beyondReach("把结果发邮件给我", "done")?.note ?? "", /填一个邮箱/);
+  assert.equal(beyondReach("把结果发邮件给我", "done", { notify: "sent" }), null, "mail goes through the desk's notify address");
+  assert.equal(beyondReach("把结果发短信给我", "done")?.what, "发短信");
+  assert.equal(beyondReach("把结果发短信给我", "done", { notify: "sent" })?.what, "发短信", "a notify address is not SMS");
   assert.equal(beyondReach("查完汇率发消息通知我", "done")?.what, "发消息");
   assert.equal(beyondReach("查完汇率发消息通知我", "done", { notify: "unused" })?.what, "发消息（没有用 Notify.send 发出去）");
   assert.match(beyondReach("查完汇率发消息通知我", "done", { notify: "none" })?.note ?? "", /面板「通知」/);

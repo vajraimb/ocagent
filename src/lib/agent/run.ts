@@ -3,7 +3,7 @@ import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, norm
 import { holdDone, patchFrame, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, boundOrigin, checkVerdicts, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isCheckEffect, isMemoryEffect, isPlanEffect, MAX_WRITTEN_LISTED, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { asksForSchedule, describeWhen, isScheduleEffect, MAX_SCHEDULES, nextOccurrence, scheduleChanges, type ScheduleSpec } from "./schedule.ts";
-import { checkNotifyUrl, notifyKind, notifyName, scheduleSummary, sendNotify, type NotifySent } from "./notify.ts";
+import { MAIL_UNSET, checkNotifyUrl, mailAddress, mailReady, notifyKind, notifyName, scheduleSummary, sendNotify, type NotifySent } from "./notify.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus, ScheduleRecord } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
@@ -16,7 +16,7 @@ export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: f
 
 /** The desk as the page sees it: the loop's journal and memory stay on the server. */
 /** The desk's notify address as the page sees it: which service, and enough of the address to recognise it. */
-export type NotifyInfo = { where: string; masked: string };
+export type NotifyInfo = { where: string; masked: string; warning?: string };
 
 export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number; notify: NotifyInfo | null };
 
@@ -101,11 +101,11 @@ Memory.remember "一句话" 把一件以后每次都用得上的事记下来：�
 做法：同一次任务里，先把现在这一次做出来（比如今天的汇总），再 Schedule.daily 登记，Done 里说明「已登记每天 08:00 ……」。提示里的【定时任务】列出已登记的，重复的不用再登记；要取消用 Schedule.cancel n。不要写"调度脚本"放进工作区——没有任何东西会执行它；只有 Schedule.daily 登记的才会真的到点跑，任务要定时却没登记的 Done 会被改成 Partial。
 准点程度：服务器每天北京时间 8 点前后检查一次，其他时间点要靠有人打开工作台或外部定时触发，可能晚一些；登记时如实告诉用户。
 
-【通知：把一句话发到用户的飞书 / 钉钉 / 企业微信 / Slack】
-提示里有【通知已接通】时，Notify.send "一句话" 会立刻发到用户在面板里填的那个地址（返回 Ok "已发到飞书" 这样的结果）。用户要「发给我 / 通知我 / 推送给我」时就用它：先把内容做出来，再 Notify.send 发摘要（1500 字以内），Done 里说明已发到哪里。没接通时 Notify.send 返回 Error；这时不要硬发，把要说的话写进 Done，并告诉用户可以在面板「通知」里填一个机器人 webhook 地址。定时任务做完服务器会自动发一条摘要过去，定时任务里不必再自己发。
+【通知：把一句话发到用户的邮箱、飞书 / 钉钉 / 企业微信 / Slack】
+提示里有【通知已接通】时，Notify.send "一句话" 会立刻发到用户在面板里填的那个地址——邮箱就是发一封邮件，第一行会成为邮件标题（返回 Ok "已发到邮箱" 这样的结果）。用户要「发给我 / 通知我 / 推送给我」时就用它：先把内容做出来，再 Notify.send 发摘要（1500 字以内），Done 里说明已发到哪里。没接通时 Notify.send 返回 Error；这时不要硬发，把要说的话写进 Done，并告诉用户可以在面板「通知」里填一个邮箱或机器人 webhook 地址。定时任务做完服务器会自动发一条摘要过去，定时任务里不必再自己发。
 
 【能力边界：做不到的事要直说】
-你只在被叫到时跑一次，步骤结束进程就没了。除了上面的每日定时和通知地址，你做不到：过一会儿提醒（非每天定时的）、后台一直运行或盯着什么、发邮件 / 短信 / 微信私聊、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完，用 Partial 结束并写明用户可以怎么拿到结果（比如「到时候对我说一句」，或「填个通知地址，每天到点我发给你」）。不要写一个"提醒脚本""发送脚本"放进工作区当作完成——那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
+你只在被叫到时跑一次，步骤结束进程就没了。除了上面的每日定时和通知地址（邮件只能发到那个地址，不能发给别人），你做不到：过一会儿提醒（非每天定时的）、后台一直运行或盯着什么、发短信 / 微信私聊、给任意地址发邮件、操作用户的设备或账号。任务要这类事时，第 1 轮就说明做不到，把现在能做的部分做完，用 Partial 结束并写明用户可以怎么拿到结果（比如「到时候对我说一句」，或「填个邮箱或通知地址，每天到点我发给你」）。不要写一个"提醒脚本""发送脚本"放进工作区当作完成——那是把没做成的说成做成了；这类任务的 Done 也会被改成 Partial。
 
 【你能用什么】
 只能使用下面的 module：Files、Json、Search、Net、Trace、Clock、Harness、Plan、Memory、Check、Schedule、Notify，已加载的自定义 module，以及 OCaml 标准库里纯计算的部分（List、String、Option、Result、Printf.sprintf 等）。
@@ -699,8 +699,8 @@ export function missingInput(task: string, answer: string, written: { path: stri
 const BEYOND: { pattern: RegExp; what: string; via?: "schedule" | "notify" }[] = [
   { pattern: /提醒我|过\s*\S{1,6}\s*(提醒|叫我|通知我)|闹钟/, what: "过一会儿提醒", via: "schedule" },
   { pattern: /后台(一直|持续|常驻)|一直(跑|运行|盯着|监控)|持续(监控|运行)|常驻/, what: "后台一直运行" },
-  { pattern: /发\s*(邮件|短信)|邮件(发|通知)|email|短信/i, what: "发邮件或短信" },
-  { pattern: /发\s*(微信|消息|通知)|推送(到|给)|通知我/, what: "发消息", via: "notify" },
+  { pattern: /发\s*短信|短信(发|通知)/i, what: "发短信" },
+  { pattern: /发\s*(邮件|微信|消息|通知)|邮件(发|通知)|email|推送(到|给)|通知我/i, what: "发消息", via: "notify" },
 ];
 const BEYOND_NOTE = "我没有这个能力";
 const UNSCHEDULED_NOTE = "这不能算做成";
@@ -735,11 +735,11 @@ export function beyondReach(task: string, reply: string, reach: Reach | boolean 
     if (notify === "unused") {
       return { what: UNSENT_WHAT, note: `（${UNSCHEDULED_NOTE}：任务要发消息，这个工作区接着通知地址，但这次没有用 Notify.send 发出去。上面是做到的部分；要发，再对我说一句。）` };
     }
-    return { what: hit.what, note: `（${BEYOND_NOTE}：${hit.what}。这个工作区还没有通知地址，我发不出消息。上面是现在能做到的部分；在面板「通知」里填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，之后对我说一句就能发到那里。）` };
+    return { what: hit.what, note: `（${BEYOND_NOTE}：${hit.what}。这个工作区还没有通知地址，我发不出消息。上面是现在能做到的部分；在面板「通知」里填一个邮箱，或飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，之后对我说一句就能发到那里。）` };
   }
   return {
     what: hit.what,
-    note: `（${BEYOND_NOTE}：${hit.what}。我只在被叫到时跑一次，发不出邮件和短信，也不会一直等着。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
+    note: `（${BEYOND_NOTE}：${hit.what}。我只在被叫到时跑一次，发不出短信，也不会一直等着。上面是现在能做到的部分；要再来一次，到时候对我说一句就行。）`,
   };
 }
 
@@ -1202,6 +1202,12 @@ export function isRunId(value: unknown): value is string {
 
 export function notifyInfo(url: string): NotifyInfo | null {
   if (!url) return null;
+  const address = mailAddress(url);
+  if (address) {
+    const at = address.lastIndexOf("@");
+    const masked = `${address.slice(0, Math.min(2, at))}…@${address.slice(at + 1)}`;
+    return mailReady() ? { where: "邮箱", masked } : { where: "邮箱", masked, warning: MAIL_UNSET };
+  }
   let masked = url;
   try {
     const parsed = new URL(url);
@@ -1283,8 +1289,9 @@ export const tryNotify = createServerFn({ method: "POST" })
     if (!desk?.notifyUrl) return { ok: false, error: "还没填通知地址。" };
     const drive = await import("./drive.server.ts");
     const origin = drive.selfOrigin();
-    const sent = await sendNotify(desk.notifyUrl, `【测试】这个工作区的通知已接通。定时任务做完、或你让它发消息时，会发到这里。${origin ? `\n工作区：${origin}/?desk=${desk.id}` : ""}`);
-    return sent.ok ? { ok: true, where: sent.where } : { ok: false, error: `${sent.where}没收到：${sent.error}` };
+    const sent = await sendNotify(desk.notifyUrl, `【测试】ocagent 的通知已接通\n定时任务做完、或你让它发消息时，会发到这里。${origin ? `\n工作区：${origin}/?desk=${desk.id}` : ""}`);
+    if (sent.ok) return { ok: true, where: sent.where };
+    return { ok: false, error: sent.error === MAIL_UNSET ? "邮箱没收到：发件邮箱还没配好，见上面的提示。" : `${sent.where}没收到：${sent.error}` };
   });
 
 function readScheduleRemove(input: unknown): { deskId: string; scheduleId: string } {

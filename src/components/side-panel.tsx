@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Bell, Blocks, Brain, CalendarClock, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, Upload, X } from "lucide-react";
+import { Bell, Blocks, Brain, CalendarClock, Check, Download, FilePlus, FileText, Image, Link2, LoaderCircle, PackagePlus, RefreshCw, Trash2, TriangleAlert, Upload, X } from "lucide-react";
 import { CATALOG, MAX_MODULES, moduleExports, moduleNameFor, moduleNameFromUrl, type DeskModule, type HarnessId } from "@/lib/agent/harness";
 import { imageBytes, isImageFile, type DeskFile } from "@/lib/agent/workspace";
 import { describeWhen, stampIn } from "@/lib/agent/schedule";
@@ -397,6 +397,12 @@ export function SidePanel({
                 {notify.masked}
               </span>
             </div>
+            {notify.warning ? (
+              <p className="mt-2 flex items-start gap-1.5 rounded-lg border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-xs leading-5 text-warn">
+                <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+                <span>{notify.warning}</span>
+              </p>
+            ) : null}
             <div className="mt-2 flex flex-wrap gap-1.5">
               <button type="button" disabled={notifyBusy} onClick={() => void tryNotify()} className="inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
                 {notifyBusy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <Bell className="h-3.5 w-3.5" aria-hidden />}
@@ -413,7 +419,7 @@ export function SidePanel({
         ) : null}
         {!notify && !notifyOpen ? (
           <>
-            <p className="mt-1 text-xs leading-5 text-muted">填一个飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，定时任务做完会把结果发过去；对它说「发给我」也能发。</p>
+            <p className="mt-1 text-xs leading-5 text-muted">填你的邮箱，或飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook 地址，定时任务做完会把结果发过去；对它说「发给我」也能发。</p>
             <button type="button" disabled={busy} onClick={() => setNotifyOpen(true)} className="mt-2 inline-flex min-h-8 items-center gap-1 rounded-md border border-border bg-bg px-2 text-xs text-fg hover:border-accent disabled:opacity-50">
               <Bell className="h-3.5 w-3.5" aria-hidden />
               填通知地址
@@ -429,7 +435,7 @@ export function SidePanel({
                 onChange={(event) => setNotifyText(event.target.value)}
                 rows={3}
                 disabled={notifyBusy}
-                placeholder={"机器人的 webhook 地址，例如\nhttps://open.feishu.cn/open-apis/bot/v2/hook/…\n钉钉机器人要在安全设置里加关键词「定时任务」或改成 IP/签名以外的方式。"}
+                placeholder={"你的邮箱，例如 name@gmail.com\n或机器人的 webhook 地址，例如 https://open.feishu.cn/open-apis/bot/v2/hook/…\n钉钉机器人要在安全设置里加关键词「定时任务」或改成 IP/签名以外的方式。"}
                 className="block w-full resize-none rounded-lg border border-border bg-bg px-2.5 py-2 font-mono text-[11px] leading-5 text-fg outline-none placeholder:text-muted focus:border-primary"
               />
             </label>

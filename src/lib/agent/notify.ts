@@ -1,14 +1,28 @@
 import { publicUrl } from "./net.ts";
 
-// Where a desk's messages go: one incoming-webhook address the user pastes in.
-// The common chat tools each want a different JSON shape, told apart by host.
+// Where a desk's messages go: one address the user pastes in — an incoming
+// webhook (the common chat tools each want a different JSON shape, told apart
+// by host) or a `mailto:` address, sent from the mailbox the server is
+// configured with.
 
-export type NotifyKind = "feishu" | "dingtalk" | "wecom" | "slack" | "discord" | "generic";
+export type NotifyKind = "feishu" | "dingtalk" | "wecom" | "slack" | "discord" | "generic" | "email";
 
 export const MAX_NOTIFY_TEXT = 1_500;
 export const MAX_NOTIFY_URL = 600;
+const MAX_MAIL_TEXT = 20_000;
+
+const EMAIL = /^[^\s@<>()[\],;:"]+@[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+/** The bare address of a `mailto:` notify target, or null for a webhook. */
+export function mailAddress(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!/^mailto:/i.test(trimmed)) return null;
+  const address = decodeURIComponent(trimmed.slice(7).split("?")[0] ?? "").trim();
+  return EMAIL.test(address) ? address : null;
+}
 
 export function notifyKind(raw: string): NotifyKind {
+  if (/^mailto:/i.test(raw.trim())) return "email";
   let host = "";
   try {
     host = new URL(raw).hostname.toLowerCase();
@@ -24,17 +38,86 @@ export function notifyKind(raw: string): NotifyKind {
 }
 
 export function notifyName(kind: NotifyKind): string {
-  return { feishu: "飞书", dingtalk: "钉钉", wecom: "企业微信", slack: "Slack", discord: "Discord", generic: "通知地址" }[kind];
+  return { feishu: "飞书", dingtalk: "钉钉", wecom: "企业微信", slack: "Slack", discord: "Discord", generic: "通知地址", email: "邮箱" }[kind];
 }
 
-/** Checks a pasted address: a public http(s) URL, nothing else. Empty clears. */
+/**
+ * Checks a pasted address: an email (bare or `mailto:`), or a public http(s)
+ * URL. Empty clears. Emails are stored as `mailto:user@host`.
+ */
 export function checkNotifyUrl(raw: string): { ok: true; url: string } | { ok: false; error: string } {
   const trimmed = raw.trim();
   if (!trimmed) return { ok: true, url: "" };
   if (trimmed.length > MAX_NOTIFY_URL) return { ok: false, error: "地址太长了。" };
+  const bare = trimmed.replace(/^mailto:/i, "").trim();
+  if (EMAIL.test(bare)) {
+    const at = bare.lastIndexOf("@");
+    return { ok: true, url: `mailto:${bare.slice(0, at)}@${bare.slice(at + 1).toLowerCase()}` };
+  }
+  if (/^mailto:/i.test(trimmed) || (bare.includes("@") && !/^https?:/i.test(trimmed))) return { ok: false, error: "邮箱地址不对，要像 name@gmail.com 这样。" };
   const url = publicUrl(trimmed);
-  if (!url) return { ok: false, error: "要一个 https:// 开头的公网地址（飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook）。" };
+  if (!url) return { ok: false, error: "要一个邮箱地址，或 https:// 开头的公网地址（飞书 / 钉钉 / 企业微信 / Slack 机器人的 webhook）。" };
   return { ok: true, url: url.toString() };
+}
+
+// ---------------------------------------------------------------------------
+// Mail. The server sends from one mailbox given in the environment — for
+// Gmail, the address plus an app password (not the login password). Nothing
+// about it is stored with a desk; a desk only names the recipient.
+
+export type MailConfig = { host: string; port: number; user: string; pass: string };
+
+export const MAIL_USER_VAR = "NOTIFY_MAIL_USER";
+export const MAIL_PASS_VAR = "NOTIFY_MAIL_PASS";
+
+export function mailConfig(env: Record<string, string | undefined> = typeof process === "undefined" ? {} : process.env): MailConfig | null {
+  const user = env[MAIL_USER_VAR]?.trim() ?? "";
+  // Google shows app passwords in groups of four with spaces; both forms work.
+  const pass = (env[MAIL_PASS_VAR] ?? "").replace(/\s+/g, "");
+  if (!user || !pass) return null;
+  const host = env.NOTIFY_MAIL_HOST?.trim() || "smtp.gmail.com";
+  const port = Number(env.NOTIFY_MAIL_PORT) || 465;
+  return { host, port, user, pass };
+}
+
+/** True when the server can send mail (the panel says so before a test send). */
+export function mailReady(): boolean {
+  return mailConfig() !== null;
+}
+
+export const MAIL_UNSET = `服务器还没配发件邮箱：在部署设置里加 ${MAIL_USER_VAR}（发件的 Gmail 地址）和 ${MAIL_PASS_VAR}（它的应用专用密码，不是登录密码），重新发布后就能发。`;
+
+export type MailMessage = { from: string; to: string; subject: string; text: string };
+export type MailTransport = (message: MailMessage) => Promise<void>;
+
+/** The subject line: the first line of the text, short. */
+export function mailSubject(text: string): string {
+  const first = text.split("\n").map((line) => line.trim()).find(Boolean) ?? "ocagent 的消息";
+  const subject = first.length > 80 ? `${first.slice(0, 79)}…` : first;
+  return /ocagent/i.test(subject) ? subject : `${subject} · ocagent`;
+}
+
+function mailError(err: unknown): string {
+  const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
+  const message = err instanceof Error ? err.message : String(err);
+  if (code === "EAUTH" || /535|Username and Password not accepted|Invalid login/i.test(message)) return "发件邮箱不接受这个账号或应用专用密码：确认两步验证已开、密码是 16 位应用专用密码。";
+  if (code === "ETIMEDOUT" || code === "ECONNECTION" || /timeout|ECONNREFUSED|ENOTFOUND/i.test(message)) return "连不上发件服务器。";
+  if (/5\d\d.*(recipient|address)/i.test(message)) return "收件地址被拒收。";
+  return `发不出去（${message.slice(0, 160)}）。`;
+}
+
+/** Sends one plain-text mail to `to` from the configured mailbox. Never throws. */
+export async function sendMail(to: string, text: string, config: MailConfig | null = mailConfig(), transport?: MailTransport): Promise<NotifySent> {
+  const where = notifyName("email");
+  if (!config) return { ok: false, where, error: MAIL_UNSET };
+  const body = text.length > MAX_MAIL_TEXT ? `${text.slice(0, MAX_MAIL_TEXT - 1)}…` : text;
+  try {
+    const send = transport ?? (await (await import("./mail.server.ts")).smtpTransport(config));
+    await send({ from: config.user, to, subject: mailSubject(body), text: body });
+    return { ok: true, where };
+  } catch (err) {
+    return { ok: false, where, error: mailError(err) };
+  }
 }
 
 /** The request body each service expects for a plain text message. */
@@ -79,10 +162,14 @@ export function notifyAccepted(status: number, body: string): { ok: true } | { o
 
 export type NotifySent = { ok: true; where: string } | { ok: false; where: string; error: string };
 
-/** POSTs one text message to the desk's address. Never throws. */
+/** Sends one text message to the desk's address — a webhook POST, or a mail. Never throws. */
 export async function sendNotify(url: string, text: string): Promise<NotifySent> {
   const kind = notifyKind(url);
   const where = notifyName(kind);
+  if (kind === "email") {
+    const to = mailAddress(url);
+    return to ? sendMail(to, text) : { ok: false, where, error: "邮箱地址不对。" };
+  }
   const target = publicUrl(url);
   if (!target) return { ok: false, where, error: "这个地址不能请求。" };
   try {

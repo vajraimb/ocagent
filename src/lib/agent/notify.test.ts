@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { checkNotifyUrl, notifyAccepted, notifyKind, notifyPayload, scheduleSummary } from "./notify.ts";
+import { createServer } from "node:net";
+import { MAIL_UNSET, checkNotifyUrl, mailAddress, mailConfig, mailSubject, notifyAccepted, notifyKind, notifyName, notifyPayload, scheduleSummary, sendMail, sendNotify, type MailMessage } from "./notify.ts";
 
 describe("notify", () => {
   it("tells the chat tools apart by host and shapes the body each expects", () => {
@@ -48,5 +49,93 @@ describe("notify", () => {
     const text = scheduleSummary({ when: "每天 08:00（北京时间）", task: "查 5 个城市天气，写进 weather/today.md", status: "done", answer: "今天最热的是新加坡 31°C。", link: "https://app.example/?desk=desk-1" });
     assert.equal(text, "【定时任务】每天 08:00（北京时间） · 做完了\n任务：查 5 个城市天气，写进 weather/today.md\n结果：今天最热的是新加坡 31°C。\n工作区：https://app.example/?desk=desk-1");
     assert.match(scheduleSummary({ when: "每天", task: "t", status: "failed", answer: "", link: "" }), /没做成/);
+  });
+
+  it("takes an email address, bare or mailto:, and stores it as mailto:", () => {
+    assert.deepEqual(checkNotifyUrl("Vajra@Gmail.com"), { ok: true, url: "mailto:Vajra@gmail.com" });
+    assert.deepEqual(checkNotifyUrl("  mailto:me@example.org "), { ok: true, url: "mailto:me@example.org" });
+    assert.equal(checkNotifyUrl("me@gmail").ok, false, "no dot in the domain");
+    assert.match((checkNotifyUrl("mailto:not an address") as { error: string }).error, /邮箱地址不对/);
+    assert.match((checkNotifyUrl("ftp://x.example/hook") as { error: string }).error, /邮箱地址，或 https/);
+    assert.equal(notifyKind("mailto:me@gmail.com"), "email");
+    assert.equal(notifyName("email"), "邮箱");
+    assert.equal(mailAddress("mailto:me@gmail.com?subject=x"), "me@gmail.com");
+    assert.equal(mailAddress("https://hooks.slack.com/x"), null);
+  });
+
+  it("reads the sending mailbox from the environment, Gmail by default, app password with or without spaces", () => {
+    assert.equal(mailConfig({}), null);
+    assert.equal(mailConfig({ NOTIFY_MAIL_USER: "me@gmail.com" }), null);
+    assert.deepEqual(mailConfig({ NOTIFY_MAIL_USER: " me@gmail.com ", NOTIFY_MAIL_PASS: "abcd efgh ijkl mnop" }), { host: "smtp.gmail.com", port: 465, user: "me@gmail.com", pass: "abcdefghijklmnop" });
+    assert.deepEqual(mailConfig({ NOTIFY_MAIL_USER: "u", NOTIFY_MAIL_PASS: "p", NOTIFY_MAIL_HOST: "smtp.example", NOTIFY_MAIL_PORT: "587" }), { host: "smtp.example", port: 587, user: "u", pass: "p" });
+  });
+
+  it("mails the text with the first line as the subject; without a mailbox it says what to configure", async () => {
+    const sent: MailMessage[] = [];
+    const config = { host: "h", port: 465, user: "me@gmail.com", pass: "p" };
+    const text = "【定时任务】每天 08:00 · 做完了\n任务：查天气\n结果：晴";
+    assert.deepEqual(await sendMail("you@gmail.com", text, config, async (message) => void sent.push(message)), { ok: true, where: "邮箱" });
+    assert.deepEqual(sent, [{ from: "me@gmail.com", to: "you@gmail.com", subject: "【定时任务】每天 08:00 · 做完了 · ocagent", text }]);
+    assert.equal(mailSubject("x".repeat(100)).length, 80 + " · ocagent".length);
+    assert.equal(mailSubject("【测试】ocagent 的通知已接通"), "【测试】ocagent 的通知已接通");
+    const unset = await sendMail("you@gmail.com", text, null);
+    assert.deepEqual(unset, { ok: false, where: "邮箱", error: MAIL_UNSET });
+    assert.match(MAIL_UNSET, /NOTIFY_MAIL_USER/);
+    const authFail = await sendMail("you@gmail.com", text, config, async () => {
+      throw Object.assign(new Error("Invalid login: 535-5.7.8 Username and Password not accepted"), { code: "EAUTH" });
+    });
+    assert.match(authFail.ok ? "" : authFail.error, /应用专用密码/);
+    assert.match((await sendNotify("mailto:you@gmail.com", text)).ok ? "" : (await sendNotify("mailto:you@gmail.com", text) as { error: string }).error, /发件邮箱/, "sendNotify routes mailto: to mail and reports the unset mailbox");
+  });
+
+  it("speaks SMTP for real against a local server: AUTH, the recipient and the body arrive", async () => {
+    const lines: string[] = [];
+    let data = "";
+    const server = createServer((socket) => {
+      socket.write("220 qa.local ESMTP\r\n");
+      let inData = false;
+      let buffer = "";
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString("utf8");
+        let at: number;
+        while ((at = buffer.indexOf("\r\n")) >= 0) {
+          const line = buffer.slice(0, at);
+          buffer = buffer.slice(at + 2);
+          if (inData) {
+            if (line === ".") {
+              inData = false;
+              socket.write("250 OK queued\r\n");
+            } else data += `${line}\n`;
+            continue;
+          }
+          lines.push(line);
+          const verb = line.split(" ")[0]?.toUpperCase();
+          if (verb === "EHLO") socket.write("250-qa.local\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n");
+          else if (verb === "AUTH") socket.write("235 ok\r\n");
+          else if (verb === "DATA") {
+            inData = true;
+            socket.write("354 go\r\n");
+          } else if (verb === "QUIT") {
+            socket.write("221 bye\r\n");
+            socket.end();
+          } else socket.write("250 OK\r\n");
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      const result = await sendMail("you@gmail.com", "标题行\n正文第二行", { host: "127.0.0.1", port, user: "me@gmail.com", pass: "abcdefghijklmnop" });
+      assert.deepEqual(result, { ok: true, where: "邮箱" });
+      const auth = lines.find((line) => /^AUTH PLAIN/i.test(line)) ?? "";
+      assert.equal(Buffer.from(auth.split(" ")[2] ?? "", "base64").toString("utf8"), "\0me@gmail.com\0abcdefghijklmnop");
+      assert.ok(lines.some((line) => /^RCPT TO:<you@gmail.com>/i.test(line)), lines.join(" | "));
+      assert.match(data, /^Subject: =\?UTF-8\?Q\?=E6=A0=87=E9=A2=98=E8=A1=8C/m, "the subject is the first line, MIME-encoded");
+      const body = data.split("\n\n")[1] ?? "";
+      assert.equal(Buffer.from(body.trim(), "base64").toString("utf8"), "标题行\n正文第二行");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
