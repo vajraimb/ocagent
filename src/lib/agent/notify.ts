@@ -71,18 +71,37 @@ export const MAIL_USER_VAR = "NOTIFY_MAIL_USER";
 export const MAIL_PASS_VAR = "NOTIFY_MAIL_PASS";
 
 export function mailConfig(env: Record<string, string | undefined> = typeof process === "undefined" ? {} : process.env): MailConfig | null {
-  const user = env[MAIL_USER_VAR]?.trim() ?? "";
-  // Google shows app passwords in groups of four with spaces; both forms work.
-  const pass = (env[MAIL_PASS_VAR] ?? "").replace(/\s+/g, "");
+  // Values pasted into a deploy UI sometimes keep their quotes; Google shows
+  // app passwords in groups of four with spaces. Both forms work.
+  const user = unquote(env[MAIL_USER_VAR] ?? "").trim();
+  const pass = unquote(env[MAIL_PASS_VAR] ?? "").replace(/\s+/g, "");
   if (!user || !pass) return null;
   const host = env.NOTIFY_MAIL_HOST?.trim() || "smtp.gmail.com";
   const port = Number(env.NOTIFY_MAIL_PORT) || 465;
   return { host, port, user, pass };
 }
 
+function unquote(value: string): string {
+  const trimmed = value.trim();
+  return /^(["']).*\1$/s.test(trimmed) ? trimmed.slice(1, -1) : trimmed;
+}
+
 /** True when the server can send mail (the panel says so before a test send). */
 export function mailReady(): boolean {
   return mailConfig() !== null;
+}
+
+/** The sending address with the local part shortened: `va…@gmail.com`. */
+export function maskAddress(address: string): string {
+  const at = address.lastIndexOf("@");
+  if (at < 0) return `${address.slice(0, 2)}…`;
+  return `${address.slice(0, Math.min(2, at))}…@${address.slice(at + 1)}`;
+}
+
+/** The configured sender, masked, so the panel can show which account the server will log in as. */
+export function mailSender(): string | null {
+  const config = mailConfig();
+  return config ? maskAddress(config.user) : null;
 }
 
 export const MAIL_UNSET = `服务器还没配发件邮箱：在部署设置里加 ${MAIL_USER_VAR}（发件的 Gmail 地址）和 ${MAIL_PASS_VAR}（它的应用专用密码，不是登录密码），重新发布后就能发。`;
@@ -97,10 +116,16 @@ export function mailSubject(text: string): string {
   return /ocagent/i.test(subject) ? subject : `${subject} · ocagent`;
 }
 
-function mailError(err: unknown): string {
+function mailError(err: unknown, config: MailConfig): string {
   const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
   const message = err instanceof Error ? err.message : String(err);
-  if (code === "EAUTH" || /535|Username and Password not accepted|Invalid login/i.test(message)) return "发件邮箱不接受这个账号或应用专用密码：确认两步验证已开、密码是 16 位应用专用密码。";
+  const sender = maskAddress(config.user);
+  // Gmail's auth replies tell the three cases apart; say exactly which one it is.
+  if (/5\.7\.9|Application-specific password required/i.test(message)) return `${sender} 收到的是登录密码，不是应用专用密码：到 Google 账号 → 安全 → 「应用专用密码」新建一个 16 位的，填进 ${MAIL_PASS_VAR}。`;
+  if (/5\.7\.14|log in via your web browser/i.test(message)) return `Google 暂时不让 ${sender} 从服务器登录：先在浏览器里登录一次这个账号，处理它弹出的安全提示，再试；账号开了「高级保护」或用 passkey 登录的无法用应用专用密码。`;
+  if (code === "EAUTH" || /535|Username and Password not accepted|Invalid login|Authentication failed/i.test(message)) {
+    return `Gmail 不接受发件账号 ${sender} 的密码：应用专用密码必须在这个账号里生成（不能是别的 Google 账号的）；${MAIL_USER_VAR} 要填完整的 Gmail 地址；重新复制一遍 16 位密码，不要带引号；改完要重新发布。`;
+  }
   if (code === "ETIMEDOUT" || code === "ECONNECTION" || /timeout|ECONNREFUSED|ENOTFOUND/i.test(message)) return "连不上发件服务器。";
   if (/5\d\d.*(recipient|address)/i.test(message)) return "收件地址被拒收。";
   return `发不出去（${message.slice(0, 160)}）。`;
@@ -116,7 +141,7 @@ export async function sendMail(to: string, text: string, config: MailConfig | nu
     await send({ from: config.user, to, subject: mailSubject(body), text: body });
     return { ok: true, where };
   } catch (err) {
-    return { ok: false, where, error: mailError(err) };
+    return { ok: false, where, error: mailError(err, config) };
   }
 }
 

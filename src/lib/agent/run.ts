@@ -3,7 +3,7 @@ import { MAX_MODULES, moduleExports, moduleNameFromUrl, normalizeHarnesses, norm
 import { holdDone, patchFrame, presentAnswer, rewriteStep } from "./present.ts";
 import { applyMemoryEffects, applyPlanEffects, boundOrigin, checkVerdicts, clip, describeModelReply, describeStepFrame, emptyPlan, extractCode, isCheckEffect, isMemoryEffect, isPlanEffect, MAX_WRITTEN_LISTED, normalizeNotes, type AgentEvent, type AgentEventBody, type PlanItem, type PlanState } from "./progress.ts";
 import { asksForSchedule, describeWhen, isScheduleEffect, MAX_SCHEDULES, nextOccurrence, scheduleChanges, type ScheduleSpec } from "./schedule.ts";
-import { MAIL_UNSET, checkNotifyUrl, mailAddress, mailReady, notifyKind, notifyName, scheduleSummary, sendNotify, type NotifySent } from "./notify.ts";
+import { MAIL_UNSET, checkNotifyUrl, mailAddress, mailSender, maskAddress, notifyKind, notifyName, scheduleSummary, sendNotify, type NotifySent } from "./notify.ts";
 import type { DeskRecord, DeskState, RunOutcome, RunRecord, RunStatus, ScheduleRecord } from "./store.server.ts";
 import { applyFileDelta, imageBytes, isImageFile, isScratchFile, safePath, type DeskFile, type JournalItem, type ToolStep, MAX_FILES } from "./workspace.ts";
 
@@ -16,7 +16,8 @@ export type DeskResult = ({ ok: true; answer: string } & DeskCarried) | ({ ok: f
 
 /** The desk as the page sees it: the loop's journal and memory stay on the server. */
 /** The desk's notify address as the page sees it: which service, and enough of the address to recognise it. */
-export type NotifyInfo = { where: string; masked: string; warning?: string };
+/** `from` is the server's sending mailbox, masked, so a wrong NOTIFY_MAIL_USER is visible in the panel. */
+export type NotifyInfo = { where: string; masked: string; from?: string; warning?: string };
 
 export type PublicDesk = { id: string; files: DeskFile[]; harnesses: HarnessId[]; modules: DeskModule[]; notes: string[]; revision: number; notify: NotifyInfo | null };
 
@@ -1204,9 +1205,9 @@ export function notifyInfo(url: string): NotifyInfo | null {
   if (!url) return null;
   const address = mailAddress(url);
   if (address) {
-    const at = address.lastIndexOf("@");
-    const masked = `${address.slice(0, Math.min(2, at))}…@${address.slice(at + 1)}`;
-    return mailReady() ? { where: "邮箱", masked } : { where: "邮箱", masked, warning: MAIL_UNSET };
+    const masked = maskAddress(address);
+    const from = mailSender();
+    return from ? { where: "邮箱", masked, from } : { where: "邮箱", masked, warning: MAIL_UNSET };
   }
   let masked = url;
   try {

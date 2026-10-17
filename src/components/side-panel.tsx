@@ -397,6 +397,11 @@ export function SidePanel({
                 {notify.masked}
               </span>
             </div>
+            {notify.from ? (
+              <p className="mt-1 text-xs leading-5 text-muted">
+                由 <span className="font-mono">{notify.from}</span> 发出（服务器配置的发件账号）；收不到时先确认应用专用密码是在这个账号里生成的。
+              </p>
+            ) : null}
             {notify.warning ? (
               <p className="mt-2 flex items-start gap-1.5 rounded-lg border border-warn/40 bg-warn/10 px-2.5 py-1.5 text-xs leading-5 text-warn">
                 <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
