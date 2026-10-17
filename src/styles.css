@@ -10,6 +10,8 @@
   --color-primary-fg: #141614;
   --color-danger: #c45c4a;
   --color-danger-fg: #1c100e;
+  --color-accent: #8fbf85;
+  --color-warn: #d2a756;
   --color-border: #2c322c;
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;

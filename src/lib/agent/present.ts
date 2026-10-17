@@ -114,7 +114,7 @@ function writeFrame(frame: { kind: string; text: string; traces: string; effects
 function effectOutputs(effects: string): string[] {
   return effects
     .split("\n")
-    .filter((line) => line.startsWith("Net.get\t") || line.startsWith("Search.query\t"))
+    .filter((line) => line.startsWith("Net.get\t") || line.startsWith("Net.post\t") || line.startsWith("Search.query\t"))
     .map((line) => line.split("\t").slice(2).join("\t"));
 }
 
@@ -148,6 +148,22 @@ function withNote(effects: string, note: string): string {
   const flat = note.replaceAll("\t", " ").replaceAll("\n", " ");
   const base = effects.replace(/\s*$/, "");
   return `${base}${base ? "\n" : ""}Trace.note\t\t${flat}`;
+}
+
+// Turns a step's Done into a Continue so the loop asks for one more round (the
+// pre-finish check); null when the frame is not a Done.
+export function holdDone(raw: string): string | null {
+  const frame = readFrame(raw);
+  if (!frame || frame.kind !== "done") return null;
+  return writeFrame({ ...frame, kind: "continue" });
+}
+
+// Rewrites a step frame's reply kind and/or text, keeping its effects and the
+// workspace it carries; null when the frame cannot be read.
+export function patchFrame(raw: string, patch: { kind?: string; text?: string }): string | null {
+  const frame = readFrame(raw);
+  if (!frame) return null;
+  return writeFrame({ ...frame, kind: patch.kind ?? frame.kind, text: patch.text ?? frame.text });
 }
 
 export function rewriteStep(raw: string, task: string, redirects: number): { raw: string; usedRedirect: boolean } {

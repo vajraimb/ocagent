@@ -1,3 +1,4 @@
 {
-  "installCommand": "npm install --omit=dev --no-audit --no-fund"
+  "installCommand": "npm install --omit=dev --no-audit --no-fund",
+  "crons": [{ "path": "/api/agent/cron", "schedule": "0 0 * * *" }]
 }
